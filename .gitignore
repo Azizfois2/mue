@@ -1,0 +1,17 @@
+# build outputs
+*.exe
+*.o
+*.obj
+*.bin
+/tmp/
+
+# emu8086 run artifacts
+*.list
+*.symbol
+*.debug
+*.~asm
+*.bin_
+*.com_
+*.exe_
+__pycache__/
+*.pyc
