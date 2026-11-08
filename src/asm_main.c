@@ -12,7 +12,7 @@ static void define_const(asm_t *a, const char *name, int v)
 {
     label_t *l = find_label(a, name);
     if (!l) add_label(a, name, (uint16_t)v, -1, 0);
-    else if (a->pass == 1) { l->value = (uint16_t)v; l->size = -1; }
+    else if (a->sizing) { l->value = (uint16_t)v; l->size = -1; }
 }
 
 static void lower_str(char *s)
@@ -27,6 +27,26 @@ static char *trim(char *s)
     e = s + strlen(s);
     while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) *--e = 0;
     return s;
+}
+
+/* True if this line closes a macro body.  Accepts both the bare form
+ * (`ENDM`) and the name-prefixed form emu8086.inc uses
+ * (`DEFINE_SCAN_NUM ENDM`). */
+static int is_endm(const char *s)
+{
+    const char *p = s;
+
+    while (*p == ' ' || *p == '\t') p++;
+    if (strncasecmp(p, "endm", 4) == 0) {
+        p += 4;
+        while (*p == ' ' || *p == '\t') p++;
+        return !*p;
+    }
+
+    /* skip a leading identifier, then look for ENDM as the next word */
+    while (*p && !isspace((unsigned char)*p)) p++;
+    while (*p == ' ' || *p == '\t') p++;
+    return strncasecmp(p, "endm", 4) == 0;
 }
 
 /* Strip a trailing comment, respecting quotes. */
@@ -376,7 +396,7 @@ static int encode_insn(asm_t *a, const char *mnem_in, char **ops, int nops)
             if (nops != 1) { asm_error(a, "jcc needs one target"); return 0; }
             v = eval_expr(a, ops[0], &ok);
             if (!ok) {
-                if (a->pass != 2) { emit8(a, (uint8_t)(0x70 + (cc ^ 1))); emit8(a, 3);
+                if (a->sizing) { emit8(a, (uint8_t)(0x70 + (cc ^ 1))); emit8(a, 3);
                                     emit8(a, 0xE9); emit16(a, 0); return 1; }
                 asm_error(a, "bad jump target '%s'", ops[0]);
                 return 0;
@@ -415,7 +435,7 @@ static int encode_insn(asm_t *a, const char *mnem_in, char **ops, int nops)
                 return 1;
             }
             /* forward label in pass 1: assume the wide form so offsets match */
-            if (a->pass != 2) {
+            if (a->sizing) {
                 emit8(a, (uint8_t)(m[0] == 'c' ? 0xE8 : 0xE9));
                 emit16(a, 0);
                 return 1;
@@ -443,7 +463,7 @@ static int encode_insn(asm_t *a, const char *mnem_in, char **ops, int nops)
         if (nops != 1) { asm_error(a, "%s needs a target", m); return 0; }
         v = eval_expr(a, ops[0], &ok);
         if (!ok) {
-            if (a->pass != 2) { emit8(a, oc); emit8(a, 0); return 1; }
+            if (a->sizing) { emit8(a, oc); emit8(a, 0); return 1; }
             asm_error(a, "bad target '%s'", ops[0]);
             return 0;
         }
@@ -742,6 +762,17 @@ static int starts_ci(const char *s, const char *kw)
 }
 
 /* substitute %1..%n / parameter names, then assemble each body line */
+/* LOCAL label suffixes must be reproducible: the sizing passes and the
+ * final emit pass each re-expand every macro, so the counter is reset at
+ * the start of every pass (otherwise pass 2 references ??l0003 while the
+ * label was defined as ??l0000, giving a bogus "bad target"). */
+static unsigned long macro_serial;
+
+static void asm_reset_macro_serial(void)
+{
+    macro_serial = 0;
+}
+
 static void expand_macro(asm_t *a, const macro_t *m, const char *args)
 {
     char av[ASM_MAX_MPARAM][64];
@@ -749,7 +780,6 @@ static void expand_macro(asm_t *a, const macro_t *m, const char *args)
     char luniq[ASM_MAX_MPARAM][32];
     int  na = 0, nl = 0, i, j;
     const char *p = args;
-    static unsigned long serial;
 
     while (*p && na < ASM_MAX_MPARAM) {
         int k = 0;
@@ -761,7 +791,10 @@ static void expand_macro(asm_t *a, const macro_t *m, const char *args)
         na++;
     }
 
-    /* "LOCAL a, b, c" makes each expansion's labels distinct */
+    /* "LOCAL a, b, c" makes each expansion's labels distinct.  A macro may
+     * declare locals over several LOCAL lines (emu8086.inc's
+     * DEFINE_SCAN_NUM uses four), so keep scanning rather than stopping at
+     * the first one. */
     for (i = 0; i < m->nlines; i++) {
         const char *q = m->body[i];
         if (strncasecmp(q, "local", 5) != 0) continue;
@@ -777,11 +810,11 @@ static void expand_macro(asm_t *a, const macro_t *m, const char *args)
             lname[nl][k] = 0;
             lower_str(lname[nl]);
             if (lname[nl][0]) {
-                snprintf(luniq[nl], sizeof(luniq[nl]), "??l%04lu", serial);
+                snprintf(luniq[nl], sizeof(luniq[nl]), "??l%04lu", macro_serial);
+                macro_serial++;      /* each LOCAL name needs its own tag */
                 nl++;
             }
         }
-        break;
     }
 
     for (i = 0; i < m->nlines; i++) {
@@ -839,7 +872,7 @@ static void expand_macro(asm_t *a, const macro_t *m, const char *args)
         line[o] = 0;
         process_line(a, line, a->errline);
     }
-    serial++;
+    /* the per-name increments above already advanced macro_serial */
 }
 
 void process_line(asm_t *a, char *raw, int lineno)
@@ -859,10 +892,11 @@ void process_line(asm_t *a, char *raw, int lineno)
 
     /* ---- macro collection / expansion ------------------------------- */
     if (a->in_macro) {
-        if (strncasecmp(trim(s), "endm", 4) == 0) {
+        /* ENDM may stand alone or carry the macro name in front of it
+         * (`DEFINE_SCAN_NUM ENDM`), which is how emu8086.inc writes it. */
+        if (is_endm(s)) {
             a->in_macro = 0;
-        } else if (a->nmac > 0 && a->mac[a->nmac - 1].nlines < ASM_MAX_MLINES) {
-            macro_t *m = &a->mac[a->nmac - 1];
+        } else if (a->nmac > 0 && a->mac[a->nmac - 1].nlines < ASM_MAX_MLINES) {            macro_t *m = &a->mac[a->nmac - 1];
             snprintf(m->body[m->nlines], ASM_MAX_LINE, "%s", s);
             m->nlines++;
         }
@@ -938,7 +972,7 @@ void process_line(asm_t *a, char *raw, int lineno)
             if (!ex) {
                 if (!add_label(a, label, (uint16_t)(a->ip), 0, 0))
                     asm_error(a, "too many labels");
-            } else if (a->pass == 1) {
+            } else if (a->sizing) {
                 ex->value = (uint16_t)(a->ip);
                 ex->pass  = 1;
             }
@@ -977,13 +1011,13 @@ void process_line(asm_t *a, char *raw, int lineno)
                 lower_str(word);
                 snprintf(a->last_label, sizeof(a->last_label), "%s", word);
                 if (!ex) add_label(a, word, (uint16_t)(a->ip), 0, 0);
-                else if (a->pass == 1) ex->value = (uint16_t)(a->ip);
+                else if (a->sizing) ex->value = (uint16_t)(a->ip);
                 if (!strcmp(nxt, "equ")) {
                     int ok, v = eval_expr(a, p, &ok);
                     if (ok) {
                         label_t *el = find_label(a, word);
                         if (!el) add_label(a, word, (uint16_t)v, -1, 0);
-                        else if (a->pass == 1) { el->value = (uint16_t)v; el->size = -1; }
+                        else if (a->sizing) { el->value = (uint16_t)v; el->size = -1; }
                     }
                     return;
                 }
@@ -991,7 +1025,7 @@ void process_line(asm_t *a, char *raw, int lineno)
                 if (!strcmp(nxt, "proc")) {
                     label_t *pe = find_label(a, word);
                     if (!pe) add_label(a, word, (uint16_t)(a->ip), 0, 1);
-                    else if (a->pass == 1) { pe->value = (uint16_t)(a->ip); pe->is_proc = 1; }
+                    else if (a->sizing) { pe->value = (uint16_t)(a->ip); pe->is_proc = 1; }
                     snprintf(a->last_label, sizeof(a->last_label), "%s", word);
                     return;
                 }
@@ -1022,7 +1056,7 @@ void process_line(asm_t *a, char *raw, int lineno)
         if (!strcmp(word, "proc")) {
             /* "main proc": register the entry label, no bytes emitted */
             label_t *ex = find_label(a, a->last_label);
-            if (ex && a->pass == 1) ex->is_proc = 1;
+            if (ex && a->sizing) ex->is_proc = 1;
             return;
         }
         if (!strcmp(word, "endp") || !strcmp(word, "ends")) return;
@@ -1134,6 +1168,7 @@ static int pass_over(asm_t *a, char **lines, int nlines)
     a->code_start = 0;
     a->nmac     = 0;          /* macros are re-collected every pass */
     a->in_macro = 0;
+    asm_reset_macro_serial(); /* LOCAL names must be identical every pass */
     a->outlen = 0;
     for (i = 0; i < nlines; i++) {
         char copy[ASM_MAX_LINE];
@@ -1143,14 +1178,112 @@ static int pass_over(asm_t *a, char **lines, int nlines)
     return a->errcount;
 }
 
+/* ---- source loading with `include` ---------------------------------- *
+ *
+ * emu8086 splices an included file in place of the `include` line, so the
+ * included macros are defined exactly as if they had been typed there.  Bare
+ * file names are resolved against the assembler's own inc\ directory.
+ */
+typedef struct {
+    char **line;
+    int    n;
+    int    cap;
+} srcbuf_t;
+
+static void sb_push(srcbuf_t *sb, const char *s)
+{
+    if (sb->n >= sb->cap) {
+        sb->cap = sb->cap ? sb->cap * 2 : 512;
+        sb->line = (char **)realloc(sb->line, sizeof(char *) * (size_t)sb->cap);
+    }
+    sb->line[sb->n] = (char *)malloc(strlen(s) + 1);
+    strcpy(sb->line[sb->n], s);
+    sb->n++;
+}
+
+/* Find `name`: as given, next to the including file, then inc\ folders. */
+static int resolve_include(const char *name, const char *cur_dir, char *out, int outsz)
+{
+    static const char *dirs[] = {
+        "", ".", "inc", "..\\inc", "C:\\emu8086\\inc", NULL
+    };
+    int i;
+    FILE *f;
+
+    for (i = 0; dirs[i]; i++) {
+        if (i == 0) snprintf(out, outsz, "%s", name);
+        else if (i == 1 && cur_dir && *cur_dir) snprintf(out, outsz, "%s/%s", cur_dir, name);
+        else snprintf(out, outsz, "%s/%s", dirs[i], name);
+        f = fopen(out, "r");
+        if (f) { fclose(f); return 1; }
+    }
+    return 0;
+}
+
+static void load_source(srcbuf_t *sb, const char *path, int depth)
+{
+    FILE *f;
+    char buf[ASM_MAX_LINE];
+    char cur_dir[512] = {0};
+    const char *slash;
+
+    if (depth > 8)                 /* guard against pathological recursion */
+        return;
+
+    slash = strrchr(path, '/');
+    if (!slash) slash = strrchr(path, '\\');
+    if (slash && (size_t)(slash - path) < sizeof(cur_dir)) {
+        memcpy(cur_dir, path, (size_t)(slash - path));
+        cur_dir[slash - path] = 0;
+    }
+
+    f = fopen(path, "r");
+    if (!f)
+        return;
+
+    while (fgets(buf, sizeof(buf), f)) {
+        size_t l = strlen(buf);
+        char probe[ASM_MAX_LINE];
+        char *p;
+
+        while (l && (buf[l - 1] == '\n' || buf[l - 1] == '\r')) buf[--l] = 0;
+
+        /* recognise `include "name"` / `include name` */
+        snprintf(probe, sizeof(probe), "%s", buf);
+        for (p = probe; *p; p++) *p = (char)tolower((unsigned char)*p);
+        p = probe;
+        while (*p == ' ' || *p == '\t') p++;
+
+        if (!strncmp(p, "include", 7) && (p[7] == ' ' || p[7] == '\t')) {
+            char name[512], full[512];
+            const char *q = p + 7;
+            int k = 0;
+            while (*q == ' ' || *q == '\t') q++;
+            if (*q == '"' || *q == '\'') {
+                char quote = *q++;
+                while (*q && *q != quote && k < (int)sizeof(name) - 1) name[k++] = *q++;
+            } else {
+                while (*q && *q != ' ' && *q != '\t' && k < (int)sizeof(name) - 1) name[k++] = *q++;
+            }
+            name[k] = 0;
+            if (k && resolve_include(name, cur_dir, full, sizeof(full))) {
+                load_source(sb, full, depth + 1);
+                continue;           /* the include line itself emits nothing */
+            }
+        }
+
+        sb_push(sb, buf);
+    }
+    fclose(f);
+}
+
 int asm_assemble_file(const char *path, int want_com, uint8_t **out, int *outlen,
                       char *errbuf, int errbufsz)
 {
     FILE *f = fopen(path, "r");
     static asm_t a;             /* large: keep it out of the stack */
     char **lines = NULL;
-    int nlines = 0, cap = 0;
-    char buf[ASM_MAX_LINE];
+    int nlines = 0;
 
     if (!f) { snprintf(errbuf, errbufsz, "cannot open %s", path); return 0; }
 
@@ -1158,15 +1291,17 @@ int asm_assemble_file(const char *path, int want_com, uint8_t **out, int *outlen
     a.org  = want_com ? 0x100 : 0;
     a.base = a.org;
 
-    while (fgets(buf, sizeof(buf), f)) {
-        size_t l = strlen(buf);
-        while (l && (buf[l - 1] == '\n' || buf[l - 1] == '\r')) buf[--l] = 0;
-        if (nlines >= cap) { cap = cap ? cap * 2 : 512; lines = (char **)realloc(lines, sizeof(char *) * (size_t)cap); }
-        lines[nlines] = (char *)malloc(l + 1);
-        memcpy(lines[nlines], buf, l + 1);
-        nlines++;
-    }
     fclose(f);
+
+    /* Splice every `include "file"` into the statement stream before any pass
+     * runs, so the sizing loop and the emit pass both see one merged source. */
+    {
+        srcbuf_t sb;
+        sb.line = NULL; sb.n = 0; sb.cap = 0;
+        load_source(&sb, path, 0);
+        lines  = sb.line;
+        nlines = sb.n;
+    }
 
     /* Decide the load origin up front: an MZ EXE (`.model` with no `org`) is
      * addressed from offset 0, while a .COM image starts at 0x100.  The
@@ -1192,30 +1327,35 @@ int asm_assemble_file(const char *path, int want_com, uint8_t **out, int *outlen
      * discovering.  Iterate the sizing pass until lengths stop changing,
      * then do the final emitting pass. */
     {
+        static uint8_t prev[1 << 20];
         int prev_len = -1, round;
-        for (round = 0; round < 8; round++) {
+        for (round = 0; round < 12; round++) {
             asm_saw_end = 0;
-            a.pass   = 1;
+            /* Size with the same rules the emit pass uses.  Sizing as "pass 1"
+             * made forward jumps take a fixed wide form, so pass 1 converged on
+             * a smaller image than pass 2 produced and labels ended up stale. */
+            a.pass   = (round == 0) ? 1 : 2;
+            a.sizing = 1;
             a.base   = want_com ? 0x100 : 0;
             a.ip     = 0;
             a.outlen = 0;
+            a.errcount = 0;
             pass_over(&a, lines, nlines);
-            if (a.outlen == prev_len) break;
+            if (a.outlen == prev_len &&
+                (a.outlen == 0 || memcmp(prev, a.out, (size_t)a.outlen) == 0))
+                break;
+            if (a.out) memcpy(prev, a.out, (size_t)a.outlen);
             prev_len = a.outlen;
         }
     }
 
-    /* final pass: emit */
-    asm_saw_end = 0;
-    a.pass    = 2;
-    a.base    = want_com ? 0x100 : 0;
-    a.ip      = 0;
-    a.outlen  = 0;
-    a.err[0]  = 0;
-    a.errcount = 0;
-    pass_over(&a, lines, nlines);
-
-    { int i; for (i = 0; i < nlines; i++) free(lines[i]); free(lines); }
+    /* The sizing loop has converged on a byte-identical image, so its buffer is
+     * the answer: there is no separate emit pass that could disagree with the
+     * labels it recorded.  (A distinct pass 2 used to emit 7 bytes more than
+     * the sizing pass on include.asm, leaving every label 7 bytes stale.) */
+    {
+        int i; for (i = 0; i < nlines; i++) free(lines[i]); free(lines);
+    }
 
     if (a.errcount) {
         snprintf(errbuf, errbufsz, "%s", a.err[0] ? a.err : "assembly failed");

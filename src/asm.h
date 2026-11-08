@@ -28,8 +28,8 @@ typedef struct {
 enum { LCODE = 0, LDATA = 1, LEXT = 2 };
 
 #define ASM_MAX_MACROS 64
-#define ASM_MAX_MPARAM 8
-#define ASM_MAX_MLINES 96
+#define ASM_MAX_MPARAM 32   /* macro params; also LOCAL names per expansion */
+#define ASM_MAX_MLINES 256  /* emu8086.inc's DEFINE_SCAN_NUM is 124 lines */
 
 typedef struct {
     char name[64];
@@ -51,6 +51,7 @@ typedef struct {
     int      base;          /* load base added to labels (== org) */
     int      ip;            /* location counter */
     int      pass;
+    int      sizing;        /* non-zero while measuring: labels may move */
     int      saw_org;      /* an ORG directive was seen      */
     int      saw_code;     /* ".code" already aligned the ip   */
     int      saw_model;    /* a .model directive was seen (EXE target) */

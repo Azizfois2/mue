@@ -609,3 +609,42 @@ only when it declares `.model` **and has no `org`** — `div.com_` has `.model` 
 - `.list` per-byte assembler comparison: **46 / 46 pass**
 - CPU self-test: **ALL PASS (0 failures)**
 - emu8086 examples assembling: **74 / 85**
+
+## 13. `include` AND THE PASS-MISMATCH BUGS (CONFIRMED)
+
+`include "file"` splices the file's lines into the statement stream before any pass
+runs, so included macros behave as if typed in place. Bare names resolve against the
+assembler's own `inc\` directory (`C:\emu8086\inc\emu8086.inc`).
+
+Getting `examples\include.asm` to work exposed five distinct bugs, in the order they
+surfaced:
+
+1. **`NAME ENDM` was not recognised.** emu8086.inc writes `DEFINE_SCAN_NUM ENDM`, with
+   the macro name in front of the terminator, on 7 of its 13 macros. Only bare `ENDM`
+   matched, so `in_macro` stayed set and swallowed the rest of the file. Now both forms
+   are accepted.
+2. **`LOCAL` stopped at the first line.** `DEFINE_SCAN_NUM` declares its locals over
+   four separate `LOCAL` lines (15 names). Only the first line was read.
+3. **`ASM_MAX_MLINES` was 96; the longest macro is 124 lines.** The body was silently
+   truncated, losing the jump target at the end. Raised to 256.
+4. **`LOCAL` names all shared one tag.** Every name in an expansion was substituted
+   with the same `??lNNNN`, so `LOCAL sk,d` made `sk` and `d` the same label and
+   `lea si,d` resolved to `sk`. The serial must advance per *name*, not per expansion.
+5. **The sizing pass and the emit pass disagreed.** Sizing used `pass=1` rules
+   (forward jumps always take the fixed wide form), so it converged on a 697-byte
+   image while the emit pass produced 704 bytes — leaving every label 7 bytes stale
+   and `jmp start` landing in the middle of a macro tail. Fixed by sizing with the
+   *same* rules as emit (converging, byte-for-byte, on the real image) and treating
+   that converged buffer as the output. There is no longer a separate emit pass that
+   can disagree with the labels it recorded.
+
+Note the local-name tag must be reset at the start of every pass, otherwise pass N+1
+references `??l0003` while the label was defined as `??l0000`.
+
+### Validation state after `include`
+- MZ/COM round-trip vs real emu8086 binaries: **44 / 44 byte-exact**
+- `.list` per-byte assembler comparison: **46 / 46 pass**
+- CPU self-test: **ALL PASS (0 failures)**
+- emu8086 examples assembling: **79 / 85** (was 74)
+- `examples\include.asm` runs correctly and prints its banner through the
+  emu8086.inc `putc` / `printn` / `print_string` macros.

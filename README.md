@@ -36,5 +36,5 @@ emu8086 itself produced next to it (`*.bin_`, `*.com_`, `*.exe_`):
 
 CPU self-test (`test_cpu.exe`): ALL PASS (0 failures).
 
-`C:\emu8086\Examples\*.asm`: 74 of 85 assemble (the rest use source-level
+`C:\emu8086\Examples\*.asm`: 79 of 85 assemble (the rest use source-level
 features such as `include` that are not yet implemented).
