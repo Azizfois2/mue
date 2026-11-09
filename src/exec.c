@@ -8,7 +8,7 @@
 #include <stdio.h>
 #include "cpu.h"
 #include "alu.h"
-#include "io.h"
+#include "ioport.h"
 #include "dos.h"
 
 /* ---- fetch ---------------------------------------------------------- */

@@ -8,7 +8,7 @@
 #include <string.h>
 #include "cpu.h"
 #include "alu.h"
-#include "io.h"
+#include "ioport.h"
 #include "asm.h"
 #include "exe.h"
 #include "dos.h"

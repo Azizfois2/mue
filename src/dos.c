@@ -6,9 +6,12 @@
  * register file and either service the call or forward it to the guest IVT.
  */
 #include <ctype.h>
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
 #include "cpu.h"
 #include "alu.h"
 #include "dos.h"
@@ -150,6 +153,156 @@ static int dos_slot_alloc(void)
     return -1;
 }
 
+/* ---- INT 21h find-first / find-next ---------------------------------- */
+/* The original keeps the DTA in one flat address (0x621C48), defaulting it to
+ * 0x7080 = its PSP alias 0x700:0x0080 (0x5E2532), and fills the DOS 2.x
+ * layout: +0x15 attribute, +0x16 time, +0x18 date, +0x1A size, +0x1E ASCIZ
+ * name (0x5E2A23-0x5E2B2C).  Same layout here, with the clone's PSP
+ * (0x0100:0x0080, see main.c) as the default. */
+#define DOS_NO_MORE_FILES 0x12
+static uint32_t dta;
+static int dta_valid;
+
+static uint32_t dta_addr(void)
+{
+    if (!dta_valid) {
+        dta = seg_off_to_phys(cpu.sr[DS], 0x80);   /* PSP default */
+        dta_valid = 1;
+    }
+    return dta;
+}
+
+static char find_dir[160];
+static char find_pat[12];                   /* 11-char 8.3, '?' wildcards */
+static int  find_attr, find_index;
+
+/* Expand a DOS wildcard to an 11-char 8.3 pattern.  '*' means "the rest of
+ * this field", so it becomes '?' padding rather than matching across the
+ * dot: `*.c` must not match `A.TXT`. */
+static void make_pattern(const char *spec, char out[12])
+{
+    char base[9], ext[4];
+    int i, f;
+
+    memset(base, ' ', 8);
+    memset(ext, ' ', 3);
+    for (i = 0; i < 8 && spec[i] && spec[i] != '.'; i++) base[i] = spec[i];
+    for (f = i; spec[f] && spec[f] != '.'; f++) ;
+    if (spec[f] == '.')
+        for (i = 0; i < 3 && spec[f + 1 + i]; i++) ext[i] = spec[f + 1 + i];
+    for (i = 0; i < 8; i++) base[i] = (char)toupper((unsigned char)base[i]);
+    for (i = 0; i < 3; i++) ext[i] = (char)toupper((unsigned char)ext[i]);
+    for (i = 0; i < 8; i++)
+        if (base[i] == '*') { for (f = i; f < 8; f++) base[f] = '?'; break; }
+    for (i = 0; i < 3; i++)
+        if (ext[i] == '*') { for (f = i; f < 3; f++) ext[f] = '?'; break; }
+    memcpy(out, base, 8);
+    memcpy(out + 8, ext, 3);
+    out[11] = 0;
+}
+
+/* 8.3 form of a host name, upper case, space padded. */
+static void to_83(const char *name, char out[12])
+{
+    int i, f;
+
+    memset(out, ' ', 11);
+    out[11] = 0;
+    for (i = 0; i < 8 && name[i] && name[i] != '.'; i++)
+        out[i] = (char)toupper((unsigned char)name[i]);
+    for (f = i; name[f] && name[f] != '.'; f++) ;
+    if (name[f] == '.')
+        for (i = 0; i < 3 && name[f + 1 + i]; i++)
+            out[8 + i] = (char)toupper((unsigned char)name[f + 1 + i]);
+}
+
+static int pat_match(const char *pat, const char *name)
+{
+    int i;
+    for (i = 0; i < 11; i++)
+        if (pat[i] != '?' && pat[i] != name[i]) return 0;
+    return 1;
+}
+
+/* Split `dir\*.c` into directory and pattern; a bare pattern means ".". */
+static void split_spec(const char *spec, char *dir, size_t dsz, char *pat)
+{
+    const char *slash = NULL, *p;
+
+    for (p = spec; *p; p++)
+        if (*p == '/' || *p == '\\') slash = p;
+    if (!slash) {
+        strcpy(dir, ".");
+        make_pattern(spec, pat);
+        return;
+    }
+    {
+        size_t n = (size_t)(slash - spec);
+        if (n >= dsz) n = dsz - 1;
+        memcpy(dir, spec, n);
+        dir[n] = 0;
+        if (n == 0) { dir[0] = '/'; dir[1] = 0; }
+    }
+    make_pattern(slash + 1, pat);
+}
+
+/* Fill the DTA for one match: attribute, packed time/date, size, name. */
+static void dta_fill(const char *name, const struct stat *st, int attr)
+{
+    uint32_t d = dta_addr();
+    const struct tm *tm = localtime(&st->st_mtime);
+    unsigned t = 0, dt = 0;
+    int i;
+
+    if (tm) {
+        t  = (unsigned)((tm->tm_hour << 11) | (tm->tm_min << 5) | (tm->tm_sec / 2));
+        dt = (unsigned)(((tm->tm_year + 1900 - 1980) << 9) |
+                        ((tm->tm_mon + 1) << 5) | tm->tm_mday);
+    }
+    poke8(d + 0x15, (uint8_t)attr);
+    poke16(d + 0x16, (uint16_t)t);
+    poke16(d + 0x18, (uint16_t)dt);
+    poke16(d + 0x1A, (uint16_t)((uint32_t)st->st_size & 0xFFFF));
+    poke16(d + 0x1C, (uint16_t)(((uint32_t)st->st_size >> 16) & 0xFFFF));
+    for (i = 0; i < 12 && name[i]; i++)
+        poke8(d + 0x1E + (uint32_t)i, (uint8_t)toupper((unsigned char)name[i]));
+    poke8(d + 0x1E + (uint32_t)i, 0);
+}
+
+/* Pick the find_index-th match in find_dir.  Returns 1 and fills the DTA. */
+static int find_match(void)
+{
+    DIR *dp = opendir(find_dir[0] ? find_dir : ".");
+    struct dirent *de;
+    int seen = 0, hit = 0;
+
+    if (!dp) return 0;
+    while (!hit && (de = readdir(dp)) != NULL) {
+        struct stat st;
+        char full[400], name83[12];
+        int isdir;
+
+        if (de->d_name[0] == '.' &&
+            (de->d_name[1] == 0 ||
+             (de->d_name[1] == '.' && de->d_name[2] == 0)))
+            continue;
+        to_83(de->d_name, name83);
+        if (!pat_match(find_pat, name83)) continue;
+        if (snprintf(full, sizeof full, "%s/%s", find_dir, de->d_name) >=
+            (int)sizeof full)
+            continue;
+        if (stat(full, &st) != 0) continue;
+        isdir = (st.st_mode & S_IFDIR) != 0;
+        if (isdir && !(find_attr & 0x10)) continue;   /* dirs need 0x10 */
+        if (!isdir && (find_attr & 0x08)) continue;   /* volume labels only */
+        if (seen++ < find_index) continue;
+        dta_fill(de->d_name, &st, isdir ? 0x10 : 0x20);
+        hit = 1;
+    }
+    closedir(dp);
+    return hit;
+}
+
 /* ---- INT 21h --------------------------------------------------------- */
 static void int21(void)
 {
@@ -208,6 +361,8 @@ static void int21(void)
         break;
 
     case 0x1A:                                  /* set DTA */
+        dta = seg_off_to_phys(cpu.sr[DS], cpu.r[DX]);
+        dta_valid = 1;
         break;
 
     case 0x25:                                  /* set interrupt vector */
@@ -368,10 +523,13 @@ static void int21(void)
         cpu.r[AX] = (uint16_t)(((uint32_t)pos >> 16) & 0xFFFF);
         break; }
 
-    case 0x41:                                  /* delete: not implemented */
-        setAX(0x0000);
-        cpu.flags |= F_CF;
-        break;
+    case 0x41: {                                /* delete file, DS:DX = name */
+        char name[128];
+
+        if (dos_guest_name(name, sizeof name) != 0) { dos_file_error(3); break; }
+        if (remove(name) != 0) { dos_file_error(2); break; }
+        cpu.flags &= ~F_CF;
+        break; }
 
     case 0x4C:                                  /* exit with code */
         dos_exit_requested = 1;
@@ -383,10 +541,28 @@ static void int21(void)
         setAX(0);
         break;
 
-    case 0x4E: case 0x4F:                       /* find first / next */
-        setAX(0x0012);                          /* no more files */
-        cpu.flags |= F_CF;
-        break;
+    case 0x4E: {                                /* find first */
+        char spec[160];
+
+        if (dos_guest_name(spec, sizeof spec) != 0) { dos_file_error(3); break; }
+        split_spec(spec, find_dir, sizeof find_dir, find_pat);
+        find_attr = cpu.r[CX];                  /* 0x10 = include directories */
+        find_index = 0;
+        if (!find_match()) { dos_file_error(DOS_NO_MORE_FILES); break; }
+        cpu.flags &= ~F_CF;
+        setAX(0);
+        break; }
+
+    case 0x4F: {                                /* find next */
+        find_index++;
+        if (!find_match()) {
+            if (find_index) find_index--;       /* stay on the last match */
+            dos_file_error(DOS_NO_MORE_FILES);
+            break;
+        }
+        cpu.flags &= ~F_CF;
+        setAX(0);
+        break; }
 
     default:
         break;

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""INT 21h file services regression: 3Ch/3Dh/3Eh/3Fh/40h/42h.
+"""INT 21h file services regression: 3Ch/3Dh/3Eh/3Fh/40h/41h/42h/4Eh/4Fh
+and 1Ah (DTA).
 
 Each guest runs in a scratch directory, so the files it creates are the
 oracle: the host reads them back.  Derived from FINDINGS 5.1 (3C/3D ->
@@ -196,6 +197,102 @@ fna db 'a.txt',0
 buf db 0,0,0,0,0
 """
 
+# b.txt rewritten as 'xyz' (3 bytes) so the find tests have a known size.
+T_TWO = PROLOG + """
+mov ah,3ch
+mov cx,0
+lea dx,fnb
+int 21h
+mov bx,ax
+mov ah,40h
+mov cx,3
+lea dx,msg
+int 21h
+mov ah,3eh
+int 21h
+ret
+fnb db 'b.txt',0
+msg db 'xyz'
+"""
+
+# 4Eh/4Fh over *.txt: DTA attribute at +0x15, name at +0x1E, and the third
+# call must report no more files (AX=12h, CF set).
+T_FIND = PROLOG + """
+mov ah,4eh
+mov cx,0
+lea dx,pat
+int 21h
+pushf
+pop di
+mov bx,0
+mov bl,[0095h]
+mov bh,[009eh]
+mov ah,4fh
+int 21h
+pushf
+pop si
+mov cl,[009eh]
+mov ah,4fh
+int 21h
+mov bp,ax
+pushf
+pop dx
+ret
+pat db '*.txt',0
+"""
+
+# A directory is only reported when CX asks for it (bit 10h).
+T_FINDDIR = PROLOG + """
+mov ah,4eh
+mov cx,10h
+lea dx,dpat
+int 21h
+mov bl,[0095h]
+pushf
+pop di
+mov ah,4eh
+mov cx,0
+lea dx,dpat
+int 21h
+mov bp,ax
+pushf
+pop si
+ret
+dpat db 'sub',0
+"""
+
+# 1Ah moves the DTA: the result must land at DS:0200, size at +0x1A.
+T_FINDDTA = PROLOG + """
+mov ah,1ah
+mov dx,200h
+int 21h
+mov ah,4eh
+mov cx,0
+lea dx,bpat
+int 21h
+mov bh,0
+mov bl,[021eh]
+mov bp,[021ah]
+ret
+bpat db 'b.txt',0
+"""
+
+# 41h deletes a.txt; deleting it again reports file not found.
+T_DEL = PROLOG + """
+mov ah,41h
+lea dx,fna
+int 21h
+pushf
+pop di
+mov ah,41h
+lea dx,fna
+int 21h
+pushf
+pop si
+ret
+fna db 'a.txt',0
+"""
+
 # Handle 1 is stdout: the bytes must reach the console, not a file.
 T_STDOUT = PROLOG + """
 mov ah,40h
@@ -261,6 +358,59 @@ def main():
         di = reg(out, "DI")
         check("read-at-eof-returns-zero", ax == 0, ax)
         check("read-at-eof-cf-clear", di is not None and not (di & 1), di)
+
+        rc, out = run(mue, T_TWO, d)
+        rc, out = run(mue, T_FIND, d)
+        di = reg(out, "DI")
+        si = reg(out, "SI")
+        bx = reg(out, "BX")
+        cx = reg(out, "CX")
+        bp = reg(out, "BP")
+        dx = reg(out, "DX")
+        check("find-first-succeeds", di is not None and not (di & 1), di)
+        # The guest puts the DTA attribute in BL and the name's first byte in
+        # BH, so BX reads as name<<8 | attribute.
+        check("find-first-file-attribute",
+              bx is not None and (bx & 0xFF) == 0x20,
+              hex(bx) if bx is not None else None)
+        check("find-first-name-in-dta",
+              bx is not None and (bx >> 8) in (ord("A"), ord("B")),
+              hex(bx) if bx is not None else None)
+        check("find-next-succeeds", si is not None and not (si & 1), si)
+        check("find-next-advances",
+              cx is not None and (cx & 0xFF) != ((bx or 0) >> 8),
+              hex(cx) if cx is not None else None)
+        check("find-next-ends-with-12h", bp == 0x12, bp)
+        check("find-next-ends-with-cf", dx is not None and (dx & 1), dx)
+
+        os.mkdir(os.path.join(d, "sub"))
+        rc, out = run(mue, T_FINDDIR, d)
+        bx = reg(out, "BX")
+        di = reg(out, "DI")
+        bp = reg(out, "BP")
+        si = reg(out, "SI")
+        check("find-directory-needs-10h", bx is not None and (bx & 0xFF) == 0x10,
+              hex(bx) if bx is not None else None)
+        check("find-directory-first-cf-clear",
+              di is not None and not (di & 1), di)
+        check("find-directory-without-10h-fails", bp == 0x12, bp)
+        check("find-directory-without-10h-cf", si is not None and (si & 1), si)
+
+        rc, out = run(mue, T_FINDDTA, d)
+        bx = reg(out, "BX")
+        bp = reg(out, "BP")
+        check("set-dta-redirects", bx is not None and (bx & 0xFF) == ord("B"),
+              hex(bx) if bx is not None else None)
+        check("find-reports-size", bp == 3, bp)
+
+        rc, out = run(mue, T_DEL, d)
+        di = reg(out, "DI")
+        si = reg(out, "SI")
+        ax = reg(out, "AX")
+        check("delete-removes-file", host("a.txt") is None, host("a.txt"))
+        check("delete-first-cf-clear", di is not None and not (di & 1), di)
+        check("delete-again-not-found", ax == 2, ax)
+        check("delete-again-cf", si is not None and (si & 1), si)
 
         rc, out = run(mue, T_STDOUT, d)
         txt = guest_text(out)

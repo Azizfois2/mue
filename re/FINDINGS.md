@@ -1317,10 +1317,10 @@ returns, so a reader that reopens the file sees them immediately.
 `AL` seek-origin constraint are read from the binary. The numbering and the
 `CF`/`AX` error convention are the documented DOS contract the original
 implements - they are asserted by the regression, not derived from the
-disassembly, and should be called INFERRED rather than CONFIRMED. `AH=41`
-(delete) is still unimplemented and still reports failure, as before.
+disassembly, and should be called INFERRED rather than CONFIRMED.
 Reading from handle 0 (stdin) is not modelled: the clone has no file handle
 for it, so it reports invalid handle rather than pretending to hit EOF.
+`AH=41` and `AH=4E`/`4F` are covered in 19.
 
 Regression `src/check_int21.py` (14 checks, wired into `make test`): each
 guest runs in a scratch directory and the host reads the files back, so the
@@ -1330,3 +1330,60 @@ host`, `read-roundtrip` (read into memory, write to a second file, compare),
 paths, EOF, and the stdout handle. Proved to bite: moving `DOS_FIRST_HANDLE`
 off 5 and zeroing the seek offset fails exactly `create-returns-handle-5`,
 `read-roundtrip` and `seek-read-from-offset`.
+
+## 19. INT 21h 41h/4Eh/4Fh + the DTA (IMPLEMENTED, layout CONFIRMED)
+
+`AH=41` and `AH=4E`/`4F` both just returned `CF=1, AX=0` before, so a
+directory-aware DOS program could not list or remove anything.
+
+**The DTA is real and its layout is confirmed from the binary.** The
+dispatcher stores the DTA in one flat global, `0x621C48`:
+
+- `0x5E225D`: `mov ds:0x621c48, eax` - the `AH=1A` arm (EA from `DS:DX`).
+- `0x5E2532`: `mov DWORD PTR ds:0x621c48, 0x7080` - the default DTA. `0x7080`
+  is `0x700:0x0080`, i.e. the PSP alias at offset 0x80, and 0x700 is the
+  segment emu8086 loads a guest at. The clone loads at `0x0100` (`main.c`), so
+  its default is `0x0100:0x0080` - same offset, its own PSP.
+- The find arm (`0x5E25E0`) then fills fixed offsets off that address:
+
+| offset | written at | field |
+|---|---|---|
+| `+0x15` | `0x5E2A23` (`add edx,0x15`) | attribute |
+| `+0x16` | `0x5E2A5B` | last-write time |
+| `+0x18` | `0x5E2A7A` | last-write date |
+| `+0x1A` | `0x5E2AB0` | size, low word |
+| `+0x1C` | `0x5E2ADB` | size, high word |
+| `+0x1E` | `0x5E2AFA`/`0x5E2B17` | ASCIZ filename |
+
+That is the DOS 2.x DTA, and it settles the "which DTA variant" question:
+this is not the DOS 3.1 extended layout.
+
+Implemented in `src/dos.c`:
+
+- `AH=1A` stores `DS:DX` as the DTA; until then the default is the PSP.
+- `AH=4E` parses the filespec (`dir\pattern`), converts the pattern to 8.3
+  with DOS wildcard rules (`*` fills the rest of *its own field*, so `*.c`
+  does not match `A.TXT`), and walks the host directory.
+- `AH=4F` advances to the next match. Matching is case-insensitive and names
+  are reported upper-case 8.3, as DOS does.
+- Attribute filter: directories are reported only when the search attribute
+  has bit `0x10`; a volume-label search (`0x08`) matches no files. Files
+  report `0x20`, directories `0x10`. `.`/`..` are skipped.
+- `AH=41` deletes via `remove()`; a second delete is file-not-found (2).
+- No match in either call is `AX=0x12, CF=1`, the "no more files" code.
+
+The clone reports size and mtime from `stat()`, so the packed time/date are
+real values rather than zeros.
+
+**Implementation note (repo).** `#include <dirent.h>` initially failed to
+compile: dirent.h includes `<io.h>`, and `-Isrc` made that resolve to the
+project's own `src/io.h`, leaving `struct _finddata_t` undefined. The project
+header is now `src/ioport.h` - a name that cannot shadow a system header.
+
+Regressions added to `src/check_int21.py` (30 checks total): find-first
+attribute/name, find-next advancing to a different name, the third call
+ending in `AX=0x12`+CF, directory visibility with and without `CX=0x10`,
+`AH=1A` redirecting the DTA to `DS:0200` (read back at `+0x1E`/`+0x1A`), size
+reporting, and delete succeeding once then failing. Proved to bite: dropping
+the `0x10` directory filter, ignoring the `AH=1A` address and stubbing
+`remove()` fails exactly the six affected checks.

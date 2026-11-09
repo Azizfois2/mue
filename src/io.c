@@ -5,7 +5,7 @@
  * which is enough for the emulator's own device model.
  */
 #include "cpu.h"
-#include "io.h"
+#include "ioport.h"
 
 uint8_t ioport[0x10000];
 
