@@ -31,6 +31,30 @@ It performs three independent checks, in order:
 Checks 2 and 3 read fixtures from `C:\emu8086`, so they need emu8086 installed;
 `make` alone never touches it.
 
+### Examples breadth
+
+    make examples
+
+Assembles all 85 programs in `C:\emu8086\examples` and prints the count plus the
+reason each remaining one fails. This is a breadth check, not a correctness
+oracle -- it catches a whole feature going missing (an operand form, a directive,
+a macro facility). It fails only if the count drops below the best known 79, so
+the six documented gaps below do not break the build.
+
+Currently failing, with the reason mue reports and the isolated root cause:
+
+| program | error | root cause |
+| --- | --- | --- |
+| `micro-os_kernel.asm` | bad target | far `jmp seg:off` is rejected (repro: `jmp 0ffffh:0000h`) |
+| `micro-os_loader.asm` | bad target | same |
+| `convert_to_upper_case.asm` | bad memory operand | bare `label+n` without brackets (repro: `lea si, b + 2`) |
+| `convert_string_number_to_binary.asm` | bad memory operand | same |
+| `bin2dec.asm` | loop out of range | a `LOOP` whose body exceeds 127 bytes is rejected rather than widened |
+| `writebin.asm` | loop out of range | same |
+
+Each of those is reproducible in a three-line file, so these are three distinct
+open bugs, not six independent ones. They are gaps, not accepted behaviour.
+
 ## Use
 
     mue <file.asm>            assemble and run (.COM)

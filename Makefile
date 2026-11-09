@@ -18,7 +18,7 @@ ASM     := src/asm_main.c src/asm_sup.c src/asm_ops.c src/exe.c
 
 HEADERS := $(wildcard src/*.h)
 
-.PHONY: all test clean
+.PHONY: all test examples clean
 
 all: $(BIN)
 
@@ -41,6 +41,12 @@ test: $(BIN) $(TBIN)
 	@cd src && python3 check_roundtrip.py
 	@echo
 	@echo "all checks passed"
+
+# Breadth check: does every shipped example still assemble?  Kept out of
+# `make test` because it reports a known non-zero failure set rather than
+# asserting exact correctness; it fails only if the count drops.
+examples: $(BIN)
+	@cd src && python3 check_examples.py -v
 
 clean:
 	rm -f $(BIN) $(TBIN)
