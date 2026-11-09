@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""INT 10h AH=13h regression: advance bit, attribute pairs, CX limit.
+"""INT 10h regression: AH=13h (advance, attributes, CX limit), cursor,
+cell buffer behind AH=08/09/0A, and AH=06 scroll.
 
 Builds tiny .asm guests, runs them with `mue`, and reads the results back out
 of the register dump. Derived from FINDINGS 5.2.
@@ -150,7 +151,62 @@ def main():
     check("set-read-cursor", dx == 0x0A14, hex(dx) if dx is not None else None)
     check("read-cursor-shape", cx == 0x0607, hex(cx) if cx is not None else None)
 
-    # 6. CX above 0x7D0 is refused and halts, as the original does
+    # 6. AH=09 writes char+attribute and AH=0A writes the character only, so
+    # AH=08 must report BL's attribute for 09 and the cell's existing one for
+    # 0A.  This is what the cell buffer is for: the attribute byte has nowhere
+    # to live on a stream console.
+    rc, out = run(mue, "mov ah,02h\nmov bh,0\nmov dx,050ah\nint 10h\n"
+                       "mov ah,09h\nmov al,'A'\nmov bh,0\nmov bl,1eh\n"
+                       "mov cx,1\nint 10h\n"
+                       "mov ah,08h\nmov bh,0\nint 10h\n"
+                       "mov bx,ax\nret\n")
+    bx = reg(out, "BX")
+    check("attr-write-read", bx == 0x1E41, hex(bx) if bx is not None else None)
+    rc, out = run(mue, "mov ah,02h\nmov bh,0\nmov dx,050ah\nint 10h\n"
+                       "mov ah,09h\nmov al,'A'\nmov bh,0\nmov bl,1eh\n"
+                       "mov cx,1\nint 10h\n"
+                       "mov ah,0ah\nmov al,'B'\nmov bh,0\nmov bl,0\n"
+                       "mov cx,1\nint 10h\n"
+                       "mov ah,08h\nmov bh,0\nint 10h\n"
+                       "mov bx,ax\nret\n")
+    bx = reg(out, "BX")
+    check("char-write-keeps-attr", bx == 0x1E42,
+          hex(bx) if bx is not None else None)
+
+    # 7. Everything else that reaches the screen fills a cell too: AH=0Eh uses
+    # attribute 0x07, AH=13h uses the attribute byte from its string, and a
+    # whole-screen AH=06 scroll blanks the window to (BH, space).
+    rc, out = run(mue, "mov ah,02h\nmov bh,0\nmov dx,0200h\nint 10h\n"
+                       "mov ah,0eh\nmov al,'Q'\nint 10h\n"
+                       "mov ah,02h\nmov bh,0\nmov dx,0200h\nint 10h\n"
+                       "mov ah,08h\nmov bh,0\nint 10h\n"
+                       "mov bx,ax\nret\n")
+    bx = reg(out, "BX")
+    check("teletype-fills-cell", bx == 0x0751,
+          hex(bx) if bx is not None else None)
+    rc, out = run(mue, PROLOG +
+                  "mov ah,13h\nmov al,2\nmov bh,0\nmov bl,0\n"
+                  "mov cx,2\nmov dx,0400h\nlea bp,cmsg\nint 10h\n"
+                  "mov ah,02h\nmov bh,0\nmov dx,0401h\nint 10h\n"
+                  "mov ah,08h\nmov bh,0\nint 10h\n"
+                  "mov bx,ax\nret\n"
+                  "cmsg db 'A',1eh,'B',4eh\n")
+    bx = reg(out, "BX")
+    check("string-attr-reaches-cell", bx == 0x4E42,
+          hex(bx) if bx is not None else None)
+    rc, out = run(mue, "mov ah,02h\nmov bh,0\nmov dx,0a0ah\nint 10h\n"
+                       "mov ah,09h\nmov al,'Z'\nmov bh,0\nmov bl,4eh\n"
+                       "mov cx,1\nint 10h\n"
+                       "mov ah,06h\nmov al,0\nmov bh,07h\n"
+                       "mov cx,0\nmov dx,184fh\nint 10h\n"
+                       "mov ah,02h\nmov bh,0\nmov dx,0a0ah\nint 10h\n"
+                       "mov ah,08h\nmov bh,0\nint 10h\n"
+                       "mov bx,ax\nret\n")
+    bx = reg(out, "BX")
+    check("scroll-blanks-cells", bx == 0x0720,
+          hex(bx) if bx is not None else None)
+
+    # 8. CX above 0x7D0 is refused and halts, as the original does
     # (0x522F70 -> log + [obj+0x7AC] halt).  Nothing is written, and the
     # marker after the call never runs.
     rc, out = run(mue, PROLOG +

@@ -571,16 +571,19 @@ behaviour:
   `exit_code = -5`, matching `0x522F70` -> log -> `[obj+0x7AC]` halt ->
   `WORD ds:0x62141C = 0xFFFF` (`0x52301E-0x523079`).
 
-Regressions: `src/check_int10.py`, 11 checks (advance, pairs, no-advance,
-AH=02/AH=03 round trip, CX limit), wired into `make test`. Verified to bite:
-forcing the pairs skip off and the advance unconditional makes exactly the
-three affected checks fail.
+Regressions: `src/check_int10.py`, 18 checks (advance, pairs, no-advance,
+AH=02/AH=03 round trip, teletype movement, cell reads/writes, scroll, CX
+limit), wired into `make test`. Verified to bite: forcing the pairs skip off
+and the advance unconditional makes exactly the three affected checks fail,
+and dropping the AH=09 attribute store fails `attr-write-read` and
+`char-write-keeps-attr`.
 
 Remaining differences, and why they are not defects:
 
-- BL's attribute and page BH produce no observable effect in a single-console
-  clone: attributes cannot be rendered and there is only page 0. They are
-  accepted and ignored, which is the only faithful option here.
+- BL's attribute and page BH cannot be *rendered* by a stream console, but the
+  attribute is no longer discarded: it is stored in the cell buffer (17) and
+  read back by AH=08. Page BH selects nothing because page 0 is the only page
+  the clone models, which the 80x25 mode it reports implies.
 - Wrapping at 80 columns / 25 rows is the clone's choice: the real wrap and
   scroll belong to the `frmScreen` OCX, which was not decoded. It matches the
   80x25 the clone already reports from AH=0F and uses in AH=06/07.
@@ -632,9 +635,10 @@ x 512 B (standard 1.44 MB floppy image; the file is the backing store the
 read/write arms address). `0x595E00/0x596370` internals NOT decoded this
 pass - only their call signatures (arg order/count) and sizes are claimed.
 
-Clone delta (`src/dos.c`): CLOSED this pass - `int13()` + `case 0x13` added
-(loads `FLOPPY_0` lazily, 80x2x18x512; `AH=00 -> CF=0,AH=0`; `AH=02/03 ->
-CHS decode, ES:BX copy, CF/AH errors`; else `CF=1,AH=1`). See 5.6.
+Clone delta (`src/dos.c`): CLOSED - `int13()` + `case 0x13` added (80x2x18x512
+geometry; `AH=00 -> CF=0,AH=0`; `AH=02/03 -> CHS decode, ES:BX copy, CF/AH
+errors`; else `CF=1,AH=1`), and since 15.5 the image is opened as
+`FLOPPY_<DL>`, one open per call, so writes persist. See 5.6.
 
 ### 5.4 INT 15h AH=86h BIOS wait  (CONFIRMED - objdump + REA bytes)
 
@@ -694,17 +698,22 @@ so the clone is unchanged - documented for completeness.
 
 `src/dos.c` now has `int13()` + `case 0x13`, derived from 5.3:
 
-- Image: `FLOPPY_0` loaded lazily (env `MUE_FLOPPY`, else
-  `C:/emu8086/FLOPPY_0`, `EMUB086_FLOPPY`, `./FLOPPY_0`); 1474560 bytes =
-  80 trk x 2 heads x 18 sec x 512 B; short reads zero-padded.
+- Image: `FLOPPY_<DL>`, the name the original builds from DL (env
+  `MUE_FLOPPY` overrides drive 0 only, then `C:/emu8086/FLOPPY_<n>`,
+  `EMUB086_FLOPPY`, then the relative name); 1474560 bytes = 80 trk x 2
+  heads x 18 sec x 512 B; short reads zero-padded, missing image -> `CF=1`.
+  The file is opened and closed inside the call, as in the original, so a
+  guest write is on disk when the interrupt returns (15.5).
 - `AH=00`: `CF=0, AH=0` (reset always succeeds).
 - `AH=02/03`: CHS decode `C=CH, H=DH, S=CL&0x3F`; reject `S==0`, `H>1`,
   `linear=(C*2+H)*18+(S-1) >= 2880`, or `ES:BX+AL*512` overflow past 1 MB;
   `02` copies image->memory, `03` memory->image; `CF=0, AH=0, AL=count`.
 - Else (incl. AH=`01` status): `CF=1, AH=1` mirroring the fail path.
-- Regression: `src/check_int13.py` exercises reset/read/read-write-readback/
-  bounds/else through `mue -r` scripts and asserts byte movement both
-  ways; `make test` runs it, `make examples` unaffected.
+- Regression: `src/check_int13.py` (12 checks) exercises reset/read/
+  read-write-readback/bounds/else through `mue -r` scripts, asserts byte
+  movement both ways, and now also asserts that the written sector reached
+  the host image file (`rw-persists-to-image`) and that a drive with no image
+  fails instead of silently reading drive 0 (`drive-1-missing-sets-cf`).
 
 **BUG FIXED (register-index slip).** `int13()` used `cpu.r[3]` for DH and
 `cpu.r[5]` for BX. With `enum { AX, CX, DX, BX, ... }` those are **BX** and
@@ -1109,16 +1118,26 @@ DL=1 addresses `FLOPPY_1`. Only `FLOPPY_0` ships in `C:\emu8086`, so any other
 drive reaches the FileOpen failure path (INFERRED - that path was not decoded).
 The clone ignores DL and always uses one image.
 
-Consequences for the clone (`src/dos.c`):
+Consequences for the clone (`src/dos.c`) - both were real deltas and both are
+now closed:
 
-1. **Writes are lost.** The clone keeps only the in-memory `floppy` array and
-   never writes it back. Guest-visible behaviour *within one run* is therefore
-   correct (later reads see the write), but the change disappears when the
-   process exits and is invisible to everything else. This is a proven
-   behavioural difference, not an open question.
-2. The clone **caches the image once**; the original re-reads the file on every
-   transfer, so a host-side change between two INT 13h calls would be visible
-   to the original and not to the clone. Narrow, but real.
+1. **Writes were lost.** The clone kept only an in-memory `floppy` array and
+   never wrote it back: later reads inside the run saw the write, but the
+   change vanished at exit. `int13()` now opens the image for `AH=03`, seeks
+   to `(C*36 + H*18 + S-1 + i) * 512` and writes, then closes - one open per
+   call, exactly as the original does. `rw-persists-to-image` asserts the
+   bytes reached the host file (proved to bite: opening read-only there makes
+   that check fail at offset 0).
+2. The clone **cached the image once**, so a host-side change between two
+   transfers was invisible. There is no cache any more; every read and write
+   goes to the file, matching the original's per-call `FileOpen`.
+
+Delivery detail: `DL` selects the file (`FLOPPY_<DL>`), with `MUE_FLOPPY`
+overriding drive 0 only so the regressions can drive a scratch copy. A drive
+with no image fails with `CF=1` instead of silently reading drive 0. Whether
+the original *creates* a missing image (VB `Open ... For Binary` would) could
+not be settled from the disassembly; the clone fails the transfer rather than
+inventing the file.
 3. The clone **synthesises a zero image** when the file is missing; the
    original's FileOpen would fail. Treat as INFERRED (error path not decoded).
 
@@ -1231,3 +1250,35 @@ asserts that a source assembles, not that the bytes are right.
 **Note for the INT 10h regression:** `src/check_int10.py` sets ES with
 `mov ax,cs` / `mov es,ax`. It could use the prologue now, but either is fine and
 the current form keeps that check independent of the segment push/pop path.
+
+## 17. INT 10h cell buffer: AH=08/09/0A and scroll (IMPLEMENTED)
+
+The clone renders through `dos_putc`, so before this pass a character's
+*attribute* had nowhere to live and AH=08 could only answer `' '`/`0x07`.
+That made three BIOS calls incoherent with each other. `src/dos.c` now keeps
+an 80x25 char+attribute array in CGA order (even byte = char, odd = attr),
+initialised to `0x20`/`0x07` - what mode 3 clears to.
+
+Implemented to the BIOS contract:
+
+| call | behaviour |
+|---|---|
+| `AH=08` | `AX = attr<<8 | char` from the cell at the cursor |
+| `AH=09` | `CX` cells rightwards from the cursor: char `AL`, attribute `BL`; cursor does not move |
+| `AH=0A` | same, but the cell keeps the attribute it already had (text mode), so `BL` is ignored |
+| `AH=06/07` | shift the window by `AL` rows (`0` = whole window), blanking with (`BH`, space); a whole-screen scroll still emits one newline to the console |
+| `AH=0E` | fills its cell with attribute `0x07` before advancing |
+| `AH=13h` | fills cells with the attribute bytes from the string, which are no longer discarded |
+
+`vram_cell()` clamps row/column: AH=02 accepts any position, so an
+out-of-range cursor must not index past the array.
+
+**Scope of the claim.** The original's screen is the `frmScreen` OCX, which was
+not decoded, so this is the clone's model of the documented BIOS contract, not
+a byte-for-byte mirror of the original's rendering. Its only job is to make
+AH=08/09/0A/06/07 self-consistent, and to stop throwing attributes away.
+
+Regressions in `src/check_int10.py`: `attr-write-read`,
+`char-write-keeps-attr`, `teletype-fills-cell`, `string-attr-reaches-cell`,
+`scroll-blanks-cells`. Proved to bite: removing the AH=09 attribute store
+fails `attr-write-read` (`0x741`) and `char-write-keeps-attr` (`0x742`).

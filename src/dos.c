@@ -228,10 +228,71 @@ static void int21(void)
 /* The clone renders through dos_putc, so the text cursor is bookkeeping
  * only.  It has to exist because AH=02/AH=03 expose it and AH=13h writes
  * relative to it and advances it (FINDINGS 5.2).  Only mode 3 is reported
- * (AH=0F below), i.e. 80x25. */
+ * (AH=0F below), i.e. 80x25.
+ *
+ * Behind it is a char+attribute cell buffer, because AH=08/09/0A read and
+ * write cells rather than print, and a character attribute has nowhere else
+ * to live on a stream console.  Everything that reaches the screen also
+ * updates its cell, so AH=08 reports what AH=09/0A/0E/13h put there. */
 #define VIDEO_COLS 80
 #define VIDEO_ROWS 25
 static int cur_row, cur_col;
+
+/* CGA order: even byte = character, odd byte = attribute. */
+static unsigned char vram[VIDEO_COLS * VIDEO_ROWS * 2];
+static int vram_ready;
+
+static void vram_init(void)
+{
+    int i;
+    if (vram_ready) return;
+    vram_ready = 1;
+    for (i = 0; i < VIDEO_COLS * VIDEO_ROWS; i++) {
+        vram[i * 2]     = ' ';              /* mode 3 clears to blank/0x07 */
+        vram[i * 2 + 1] = 0x07;
+    }
+}
+
+/* Cell at row/col.  A guest can set the cursor out of range through AH=02, so
+ * clamp rather than wander off the array. */
+static unsigned char *vram_cell(int row, int col)
+{
+    vram_init();
+    if (row < 0) row = 0; else if (row >= VIDEO_ROWS) row = VIDEO_ROWS - 1;
+    if (col < 0) col = 0; else if (col >= VIDEO_COLS) col = VIDEO_COLS - 1;
+    return &vram[(row * VIDEO_COLS + col) * 2];
+}
+
+/* AH=06/07: blank `lines` rows of the window (0 = all of it), shifting the
+ * rest up for AH=06 and down for AH=07. */
+static void vram_scroll(int top, int left, int bot, int right, int lines,
+                        int attr, int up)
+{
+    int r, c, t;
+    vram_init();
+    if (top > bot) { t = top; top = bot; bot = t; }
+    if (left > right) { t = left; left = right; right = t; }
+    if (top < 0) top = 0;
+    if (bot >= VIDEO_ROWS) bot = VIDEO_ROWS - 1;
+    if (left < 0) left = 0;
+    if (right >= VIDEO_COLS) right = VIDEO_COLS - 1;
+    if (lines <= 0 || lines > bot - top + 1) lines = bot - top + 1;
+    for (r = 0; r <= bot - top; r++) {
+        int dst = up ? top + r : bot - r;
+        int src = up ? top + r + lines : bot - r - lines;
+        for (c = left; c <= right; c++) {
+            unsigned char *d = vram_cell(dst, c);
+            if (src >= top && src <= bot) {
+                unsigned char *s = vram_cell(src, c);
+                d[0] = s[0];
+                d[1] = s[1];
+            } else {
+                d[0] = ' ';
+                d[1] = (unsigned char)attr;
+            }
+        }
+    }
+}
 
 /* Teletype output, shared with AH=13h (which prints its cells the same way). */
 static void video_putc(int c)
@@ -279,25 +340,50 @@ static void int10(void)
         cpu.r[CX] = 0x0607;
         cpu.r[DX] = (uint16_t)((cur_row << 8) | cur_col);
         break;
-    case 0x06: case 0x07:                       /* scroll */
-        if ((cpu.r[1] & 0xFF) == 0 && (cpu.r[1] >> 8) == 0 &&
-            (cpu.r[2] & 0xFF) == 79 && (cpu.r[2] >> 8) == 24) {
-            dos_putc('\n');
+    case 0x06: case 0x07:                       /* scroll up / down */
+        {
+            int lines = cpu.r[AX] & 0xFF;
+            int attr  = (cpu.r[BX] >> 8) & 0xFF;
+            int top   = (cpu.r[CX] >> 8) & 0xFF, left  = cpu.r[CX] & 0xFF;
+            int bot   = (cpu.r[DX] >> 8) & 0xFF, right = cpu.r[DX] & 0xFF;
+
+            vram_scroll(top, left, bot, right, lines, attr, ah == 0x06);
+            if (top == 0 && left == 0 && bot >= VIDEO_ROWS - 1 &&
+                right >= VIDEO_COLS - 1)
+                dos_putc('\n');         /* a scroll looks like a line here */
         }
         break;
     case 0x08:                                  /* read char/attr at cursor */
-        cpu.r[0] = (uint16_t)((cpu.r[0] & 0xFF00) | ' ');
-        break;
-    case 0x09: case 0x0A:                       /* write char/attr */
         {
-            int n = cpu.r[1] & 0xFF;
-            if (n <= 0) n = 1;
-            while (n--) dos_putc(cpu.r[0] & 0xFF);
+            unsigned char *cell = vram_cell(cur_row, cur_col);
+            cpu.r[AX] = (uint16_t)((cell[1] << 8) | cell[0]);
+        }
+        break;
+    case 0x09: case 0x0A:                       /* write char (+attr) */
+        {
+            int ch   = cpu.r[AX] & 0xFF;
+            int attr = cpu.r[BX] & 0xFF;        /* BL */
+            int n    = cpu.r[CX];
+            int i;
+
+            /* In text mode AH=0A writes the character only: the cell keeps
+             * the attribute it already had, and BL is ignored. */
+            for (i = 0; i < n && cur_col + i < VIDEO_COLS; i++) {
+                unsigned char *cell = vram_cell(cur_row, cur_col + i);
+                cell[0] = (unsigned char)ch;
+                if (ah == 0x09) cell[1] = (unsigned char)attr;
+                video_putc(ch);
+            }
         }
         break;
     case 0x0E:                                  /* teletype output */
         {
             int c = cpu.r[AX] & 0xFF;
+            if (c >= 0x20) {                    /* teletype draws, attr 0x07 */
+                unsigned char *cell = vram_cell(cur_row, cur_col);
+                cell[0] = (unsigned char)c;
+                cell[1] = 0x07;
+            }
             video_putc(c);
             /* Teletype moves the cursor: CR to column 0, LF down a row, BS
              * back one column, anything else one column forward. */
@@ -317,7 +403,6 @@ static void int10(void)
             int cells   = cpu.r[CX];            /* characters requested */
             int pairs   = (al & 0x02) != 0;     /* cell = char + attr byte */
             int advance = (al & 0x01) != 0;     /* move cursor afterwards */
-            int bytes   = pairs ? cells * 2 : cells;
             uint32_t p  = seg_off_to_phys(cpu.sr[ES], cpu.r[BP]);
             int i, ch, written = 0;
 
@@ -330,11 +415,16 @@ static void int10(void)
                     "CX value (string size) is above the allowed limit!");
                 break;
             }
-            for (i = 0; i < bytes; i++) {
+            for (i = 0; i < cells; i++) {
+                int attr = 0x07;
+                unsigned char *cell;
                 ch = peek8(p++);
-                /* With bit1 set every second byte is an attribute, which a
-                 * text console cannot render: consume it, do not print it. */
-                if (pairs && (i & 1)) continue;
+                /* With bit1 set every second byte is an attribute: consume it
+                 * and give it to the cell instead of printing it. */
+                if (pairs) attr = peek8(p++);
+                cell = vram_cell(cur_row, cur_col + written);
+                cell[0] = (unsigned char)ch;
+                cell[1] = (unsigned char)attr;
                 video_putc(ch);
                 written++;
             }
@@ -367,40 +457,36 @@ static void int16(void)
 }
 
 /* ---- INT 13h (floppy disk) -------------------------------------------- */
-/* Original: FUN_0051FF60 INT13 arm (FINDINGS 5.3): AH=00 reset writes
- * WORD [regblock+0x3A]=0xFFFF; AH=02/03 call 0x595E00/0x596370 with
- * (p_buf = ES: BX phys, CH, CL, DH, DL, AL); other AHs take the
- * "INT 13h, AH=0" fail path.  Clone uses the FLOPPY_0 image directly. */
+/* Original (FINDINGS 5.3, 15.5): AH=00 resets; AH=02/03 build "FLOPPY_" &
+ * DL, open it with a 512-byte record length, Get/Put record
+ * C*36 + H*18 + (S-1) + i for each sector, and close - all inside the one
+ * call.  The clone does the same, so a guest write reaches the image file
+ * before the interrupt returns. */
 #define FLOPPY_TRACKS 80
 #define FLOPPY_HEADS   2
 #define FLOPPY_SPT    18
 #define FLOPPY_BPS   512
-#define FLOPPY_TOTAL (FLOPPY_TRACKS * FLOPPY_HEADS * FLOPPY_SPT * FLOPPY_BPS)
-static unsigned char *floppy;
-static int floppy_loaded;
-static void floppy_load(void)
+#define FLOPPY_SECTORS (FLOPPY_TRACKS * FLOPPY_HEADS * FLOPPY_SPT)
+
+/* Open FLOPPY_<drive>, the name the original builds from DL.  MUE_FLOPPY
+ * overrides drive 0 so the regressions can drive a scratch copy. */
+static FILE *floppy_open(int drive, const char *mode)
 {
-    const char *paths[4];
-    int i;
     FILE *f;
-    if (floppy_loaded) return;
-    floppy_loaded = 1;
-    floppy = (unsigned char *)calloc(1, FLOPPY_TOTAL);
-    if (!floppy) return;
-    paths[0] = getenv("MUE_FLOPPY");
-    paths[1] = "C:/emu8086/FLOPPY_0";
-    paths[2] = getenv("EMUB086_FLOPPY");
-    paths[3] = "./FLOPPY_0";
-    for (i = 0; i < 4; i++) {
-        size_t n;
-        if (!paths[i] || !paths[i][0]) continue;
-        f = fopen(paths[i], "rb");
-        if (!f) continue;
-        n = fread(floppy, 1, FLOPPY_TOTAL, f);
-        fclose(f);
-        (void)n;                 /* short image: rest stays zero */
-        return;
+    char buf[64];
+
+    if (drive == 0) {
+        const char *env = getenv("MUE_FLOPPY");
+        if (env && env[0] && (f = fopen(env, mode)) != NULL) return f;
     }
+    snprintf(buf, sizeof buf, "C:/emu8086/FLOPPY_%d", drive);
+    if ((f = fopen(buf, mode)) != NULL) return f;
+    if (drive == 0) {
+        const char *env = getenv("EMUB086_FLOPPY");
+        if (env && env[0] && (f = fopen(env, mode)) != NULL) return f;
+    }
+    snprintf(buf, sizeof buf, "FLOPPY_%d", drive);   /* relative, as original */
+    return fopen(buf, mode);
 }
 static void int13(void)
 {
@@ -409,6 +495,7 @@ static void int13(void)
     int ch = (cpu.r[CX] >> 8) & 0xFF;
     int cl = cpu.r[CX] & 0xFF;
     int dh = (cpu.r[DX] >> 8) & 0xFF;
+    int dl = cpu.r[DX] & 0xFF;
     uint32_t p;
     long cyl, head, sec, linear, i;
     switch (ah) {
@@ -417,36 +504,43 @@ static void int13(void)
         setAThi(0);
         return;
     case 0x02: case 0x03: {                      /* read/write sectors */
+        unsigned char buf[FLOPPY_BPS];
+        FILE *f;
         if (al == 0) { cpu.flags &= ~F_CF; setAThi(0); return; }
-        floppy_load();
-        if (!floppy) { cpu.flags |= F_CF; setAThi(0xAA); return; }
         cyl = ch; head = dh; sec = cl & 0x3F;
-        if (sec == 0 || head >= FLOPPY_HEADS) {
+        if (sec == 0 || head >= FLOPPY_HEADS || cyl >= FLOPPY_TRACKS) {
             cpu.flags |= F_CF; setAThi(1); return;
         }
         linear = (cyl * FLOPPY_HEADS + head) * FLOPPY_SPT + (sec - 1);
-        if (linear < 0 ||
-            linear + al > FLOPPY_TRACKS * FLOPPY_HEADS * FLOPPY_SPT) {
+        if (linear < 0 || linear + al > FLOPPY_SECTORS) {
             cpu.flags |= F_CF; setAThi(1); return;
         }
         p = seg_off_to_phys(cpu.sr[ES], cpu.r[BX]);
         if (p + (uint32_t)al * FLOPPY_BPS > (uint32_t)0x100000) {
             cpu.flags |= F_CF; setAThi(1); return;
         }
+        /* One open per call, both directions: writes must exist to be
+         * written, reads zero-fill a short image. */
+        f = floppy_open(dl, ah == 0x02 ? "rb" : "r+b");
+        if (!f) { cpu.flags |= F_CF; setAThi(0xAA); return; }
         for (i = 0; i < al; i++) {
-            uint32_t img = (uint32_t)(linear + i) * FLOPPY_BPS;
+            long off = (long)(linear + i) * FLOPPY_BPS;
             uint32_t mem = p + (uint32_t)i * FLOPPY_BPS;
             int k;
-            if (ah == 0x02)
-                for (k = 0; k < FLOPPY_BPS; k++)
-                    poke8(mem + k, floppy[img + k]);
-            else
-                for (k = 0; k < FLOPPY_BPS; k++)
-                    floppy[img + k] = peek8(mem + k);
+            if (fseek(f, off, SEEK_SET) != 0) break;
+            if (ah == 0x02) {
+                size_t n = fread(buf, 1, FLOPPY_BPS, f);
+                for (; n < FLOPPY_BPS; n++) buf[n] = 0;
+                for (k = 0; k < FLOPPY_BPS; k++) poke8(mem + (uint32_t)k, buf[k]);
+            } else {
+                for (k = 0; k < FLOPPY_BPS; k++) buf[k] = peek8(mem + (uint32_t)k);
+                if (fwrite(buf, 1, FLOPPY_BPS, f) != FLOPPY_BPS) break;
+            }
         }
+        fclose(f);
+        if (i < al) { cpu.flags |= F_CF; setAThi(1); return; }
         cpu.flags &= ~F_CF;
-        setAThi(0);
-        cpu.r[AX] = (uint16_t)((0 << 8) | (al & 0xFF));
+        cpu.r[AX] = (uint16_t)(al & 0xFF);      /* AH=0, AL=sectors done */
         return; }
     default:
         cpu.flags |= F_CF;                      /* cf. fail path 5.3 */

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""INT 13h regression: reset / read / read-write-readback / bounds / else.
+"""INT 13h regression: reset / read / read-write-readback / persistence / DL.
 
 Builds tiny .asm guests, runs them with `mue -r`, and checks CF/AH and
 byte movement both ways. Derived from FINDINGS 5.3/5.6.
@@ -76,6 +76,13 @@ T_ELSE = ("mov ah,1\nint 13h\npushf\npop cx\nmov ax,0\nret\n")
 #   compare the two buffers byte by byte
 # Observations: DX low bit = CF of the first read, DH = last byte read,
 # AX = first two bytes read (AH,AL), BX = mismatch count, BL.
+# DL selects the image file (the original builds "FLOPPY_" & DL).  Drive 1
+# only exists if someone put a FLOPPY_1 next to the install, so the check
+# below asserts the failure only when it is absent.
+T_DRIVE1 = ("mov ax,1000h\nmov es,ax\nxor bx,bx\n"
+            "mov ah,2\nmov al,1\nmov ch,0\nmov cl,1\nmov dh,0\nmov dl,1\n"
+            "int 13h\npushf\npop cx\nmov ax,0\nret\n")
+
 T_RW = (
     "mov ax,1000h\nmov ds,ax\nmov es,ax\n"
     "mov ah,2\nmov al,1\nmov ch,79\nmov cl,18\nmov dh,1\nmov dl,0\n"
@@ -144,6 +151,8 @@ def main():
             f.write(data)
         os.environ["MUE_FLOPPY"] = img
         out = run(mue, T_RW)
+        with open(img, "rb") as f:
+            host = f.read(512)                 # what reached the file
 
     cx = reg(out, "CX")
     dx = reg(out, "DX")
@@ -160,6 +169,24 @@ def main():
     check("rw-write-readback", bx is not None and int(bx) == 0,
           "mismatches=%s" % (bx & 0xFF if bx is not None else None))
     check("rw-loop-ran", cx is not None and int(cx) == 0, cx)
+    # The original opens "FLOPPY_" & DL, Puts the sector and closes, so the
+    # bytes must be on disk; the host file is a valid oracle now.
+    check("rw-persists-to-image", host == pat,
+          "first-diff@%d" % next(
+              (i for i, (a, b) in enumerate(zip(host, pat)) if a != b), -1)
+          if len(host) == len(pat) else "len %d" % len(host))
+
+    # DL picks the file, so a drive with no image must fail rather than
+    # silently reading drive 0.
+    elsewhere = [os.path.join(os.path.dirname(FLOPPY), "FLOPPY_1"),
+                 "FLOPPY_1"]
+    if any(os.path.exists(p) for p in elsewhere):
+        print("SKIP drive-1-missing-sets-cf (a FLOPPY_1 is present)")
+    else:
+        out = run(mue, T_DRIVE1)
+        cx = reg(out, "CX")
+        check("drive-1-missing-sets-cf",
+              cx is not None and bool(int(cx) & 1), cx)
 
     print("INT13 %s (%d fail)" % ("PASS" if not fails else "FAIL", len(fails)))
     return 1 if fails else 0
