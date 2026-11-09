@@ -10,6 +10,46 @@ This is an independent project. It is not affiliated with, endorsed by, or
 supported by the authors of emu8086. The name is used only to say what the
 program is compatible with.
 
+## Quick start
+
+```console
+$ make
+$ ./src/mue.exe /c/emu8086/examples/Hello.asm
+assembled 39 bytes
+Hello, world!
+------------- REGISTERS -------------
+AX=0000  BX=0000  CX=0000  DX=0000
+SP=0000  BP=0000  SI=000D  DI=0000
+CS=0100  DS=0100  ES=0100  SS=0100  IP=0000
+FLAGS=0206 PF IF 
+instructions executed: 99
+```
+
+Assemble only, without running:
+
+```console
+$ ./src/mue.exe -a prog.asm prog.com     # flat .COM / .BIN
+$ ./src/mue.exe -a prog.asm prog.exe     # MZ .EXE if the source has
+                                         # .model and no ORG
+$ ./src/mue.exe -r prog.bin              # run a raw binary
+```
+
+### It produces the same bytes as emu8086
+
+The strongest evidence is that this assembler reproduces emu8086's own shipped
+output exactly. Given a source emu8086 itself built:
+
+```console
+$ ./src/mue.exe -a hi-world.com_.~asm out.com
+assembled 97 bytes -> out.com
+$ cmp out.com hi-world.com_ && echo identical
+identical
+```
+
+That holds for all 44 paired sources in emu8086's `MyBuild` directory,
+including the MZ EXE header, and for all 46 `.list` listings byte for byte.
+See [Verification](#verification).
+
 ## Build
 
     make                # -> src/mue.exe
@@ -67,13 +107,6 @@ All 85 now assemble. The last three gaps closed were:
 | far `jmp seg:off` rejected | emit `EA`/`9A` with offset then segment |
 | bare `label+n` without brackets | operand parser matched only the whole text against a label name, not its leading identifier |
 | `JCXZ` beyond 127 bytes rejected | rewrite as `OR CX,CX` / `JNZ +3` / `JMP target` (emu8086's documented expansion) |
-
-## Use
-
-    mue <file.asm>            assemble and run (.COM)
-    mue -a <file.asm> <out>   assemble only (MZ EXE if the source is
-                              `.model` without ORG, else flat binary)
-    mue -r <file.bin>         run a raw binary
 
 ## Verification
 
