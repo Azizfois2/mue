@@ -481,7 +481,7 @@ plus `INT %02X`-style templates at `0x447F78/0x44800C/0x448094`.
 | `10` | `00,01,02,03,05,06,07,08,09,0A,0C,0D,0E,0F,11,13,1003` (AX-full, BL=01 logged via template `0x447714` at `0x52360F`) | `AH=00` body at `0x520666`; `AH=13` ES:BP string loop at `0x522D0E` (`imul esi,esi,0x10` seg x16 + `0x4AD050` variant-to-int, branch-bit `AH&1` via `and cx,1`) |
 | `11` | - | `MOV AX,1` (`0x523B76`: `get_BYTE 0x410/0x411` -> AL `+0xBA` / AH `+0xBB`) |
 | `12` | - | same helper pair (`0x413/0x414`), memory-size AX |
-| `13` | AH=`00` (reset: `WORD [ecx+0x3A]=0xFFFF` at `0x523C76`), `02` (read), `03` (write via `0x4AD050` + phys x16) | fail template `0x447884` at `0x523E99` |
+| `13` | AH=`00` (reset), `02` (read via `0x595E00`), `03` (write via `0x596370`) | fail template `0x447884` at `0x523E99`; see 5.3 |
 | `15` | AH=`86` only (BIOS wait; `fmul [0x409828]` delay math) | fail template `0x4478E4` at `0x5245F4` |
 | `16` | AH=`00,01` | kb-buffer OCX vtable sink `+0x750/0x754`; fail template `0x4479B4` at `0x524BDF` |
 | `17` | - | direct `CALL 0x550B40` ("wrong parameter...") |
@@ -554,6 +554,51 @@ Clone delta (`src/dos.c` `case 0x13`): original writes through the
 char) and cursor-advance control (bit0); the clone emits CX raw bytes and
 ignores BL/attr/advance. Behaviour-identical only for the common
 `AL=0/1, CX<=0x7D0` text-mode demo path; DESIGN follow-up, not changed.
+
+### 5.3 INT 13h AH=00/02/03 floppy sector I/O  (CONFIRMED - objdump + file stat)
+
+Entry `0x523C49` (INT byte test `0x13`, slot copy `AH->[ebp-0x278]` at
+`0x523C50-0x523C59`). Three AH arms, all CONFIRMED:
+
+- AH=`00` reset (`0x523C66-0x523C86`): `WORD [regblock+0x3A] = 0xFFFF`
+  (drive-status word), then shared exit `0x5240EF -> jmp 0x52A934`.
+  CONFIRMED cell: reset needs no disk access; clone can match exactly.
+- AH=`02` read (`0x523C92-0x523D7B`): prologue copies BH/BL (`+0xBD/+0xBC`)
+  into `[ebp-0x248]` via the `[eax+0x76C]` accessor pair (same EA-getter
+  shape as INT 21h file `3C/3D` prologue `0x54A0C0+0x5DC410`), then
+  `p_buf = SI*0x10 + [ebp-0x248]` (`SI=+0xC4`, `0x4AD050` + `imul` + add
+  at `0x523D15-0x523D39`, stored `[ebp-0x24C]`) and
+  `CALL 0x595E00(p_buf, BL, CL, CH, DL, DH)` -
+  arg order pushed: `+0xBA(AL),+0xBF(CH),+0xBE(CL),+0xC1(DH),+0xC0(DL),buf`.
+  `FUN_00595E00` is 1011 B / 36 blocks (Ghidra `procedure_info`).
+- AH=`03` write (`0x523D80-0x523E88`): same shape, buffer physicalised as
+  `p_buf = [ebp-0x250](=SI field via 0x4AD050 at 0x523DA5)*0x10 +
+  [ebp-0x248]` (`0x523E20-0x523E44`), then
+  `CALL 0x596370(p_buf, ..., w_flag)` with an extra leading
+  `WORD [ebp-0x23C] = 0` argument slot (`0x523E20/0x523E4A`).
+  `FUN_00596370` is 1091 B / 38 blocks.
+- Fail path (`0x523E92-0x5240EF`, all other AHs): logs template
+  `"INT 13h, AH=0"` (`0x447884`) + `"h   "` (`0x4478A4`) +
+  `"- not supported yet."` (`0x4478B4`) + `"refer to the list of
+  supported i..."` (`0x44782C`) composed through `0x5F2380` + `0x547EC0`
+  (same log pipeline as the INT 10h fail paths), then forces the
+  `+0x7AC` halt call and sets `WORD [0x62141C] = 0xFFFF` before the shared
+  exit.
+
+Geometry ground truth (CONFIRMED by host file, not by REA):
+`C:\emu8086\FLOPPY_0` = 1474560 bytes = 80 tracks x 2 heads x 18 sectors
+x 512 B (standard 1.44 MB floppy image; the file is the backing store the
+read/write arms address). `0x595E00/0x596370` internals NOT decoded this
+pass - only their call signatures (arg order/count) and sizes are claimed.
+
+Clone delta (`src/dos.c`): `dos_interrupt` has NO `case 0x13` arm - INT 13h
+falls through to `return 0` (forward to IVT). To close the gap per this
+spec: add `case 0x13: int13(); return 1;` with `AH=00 -> clear CF + AH=00`
+(success); `AH=02/03 -> CHS decode (C=CH, H=DH, S=CL&0x3F), linear =
+(C*2+H)*18 + (S-1), file offset = linear*512 against the FLOPPY_0 image,
+memcpy to/from ES:BX (p_buf per above), set CF/AH on bounds errors; else
+CF=1, AH=1 (invalid function)` mirroring the fail path. DESIGN + behaviour
+change; NOT implemented this pass (docs only), so `make test` stays green.
 
 ### Supporting native routines  (CONFIRMED addresses)
 
