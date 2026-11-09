@@ -1,0 +1,40 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: build + self-test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # windows-latest has gcc and python but not `make` on PATH; the
+      # chocolatey package provides plain GNU make.
+      - name: Install make (Windows)
+        if: runner.os == 'Windows'
+        run: choco install make -y --no-progress
+
+      - name: Build and self-test
+        shell: bash
+        run: make test
+
+      # The two emu8086-dependent checks skip themselves on a machine with no
+      # C:\emu8086 (they exit 77, which `make test` treats as skipped, not
+      # passed). Say so plainly so a green run is not mistaken for full
+      # verification.
+      - name: State what was not verified
+        shell: bash
+        run: |
+          echo "::notice::The .list and byte round-trip checks need emu8086 fixtures,"
+          echo "::notice::which are not available on CI. They reported SKIP above."
+          echo "::notice::Locally, \`make test\` runs all four checks."

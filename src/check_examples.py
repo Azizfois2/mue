@@ -16,8 +16,14 @@ import subprocess
 import sys
 import tempfile
 
-BASE = "C:/emu8086/examples"
-MUE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mue.exe")
+BASE = os.environ.get("EMU8086_EXAMPLES", "C:/emu8086/examples")
+if not glob.glob(BASE + "/*.asm"):
+    # Exit 77 ("skipped") rather than 0: no fixtures must never look like a pass.
+    print("SKIP: no fixture sources under %s" % BASE)
+    sys.exit(77)
+_here = os.path.dirname(os.path.abspath(__file__))
+MUE = next((os.path.join(_here, n) for n in ("mue.exe", "mue")
+            if os.path.exists(os.path.join(_here, n))), os.path.join(_here, "mue"))
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--min", type=int, default=85,

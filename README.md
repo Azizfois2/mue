@@ -36,7 +36,20 @@ It performs three independent checks, in order:
    emu8086 itself produced, MZ EXE header included.
 
 Checks 2 and 3 read fixtures from `C:\emu8086`, so they need emu8086 installed;
-`make` alone never touches it.
+`make` alone never touches it. Where those fixtures are missing the two checks
+print `SKIP` and exit 77, which `make test` treats as skipped rather than
+passed -- so a machine without emu8086 gets a green run that never silently
+claims to have verified byte compatibility.
+
+Fixture locations can be overridden with `EMU8086_MYBUILD` and
+`EMU8086_EXAMPLES`.
+
+### Continuous integration
+
+`.github/workflows/build.yml` runs `make test` on Ubuntu and Windows for every
+push and pull request. CI has no emu8086, so it covers the build, the CPU
+self-test and the examples breadth check; the `.list` and round-trip checks
+report `SKIP`. Full byte-compatibility verification is local-only.
 
 ### Examples breadth
 

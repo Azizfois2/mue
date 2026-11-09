@@ -5,7 +5,13 @@ location the listing reports rather than by naive concatenation.
 """
 import re, subprocess, os, glob, sys
 
-base = "C:/emu8086/MyBuild"
+# Fixture directory: override with EMU8086_MYBUILD when emu8086 lives elsewhere.
+base = os.environ.get("EMU8086_MYBUILD", "C:/emu8086/MyBuild")
+if not glob.glob(base + "/*.list"):
+    # Exit 77 ("skipped") rather than 0: no fixtures must never look like a pass.
+    print("SKIP: no .list fixtures under %s" % base)
+    sys.exit(77)
+
 ok = fail = skip = 0
 fails = []
 
@@ -28,7 +34,10 @@ for lst in sorted(glob.glob(base + "/*.list")):
         continue
 
     out = "/tmp/out.bin"
-    r = subprocess.run(["./mue.exe", "-a", asm, out], capture_output=True, text=True)
+    _here = os.path.dirname(os.path.abspath(__file__))
+    _mue = next((os.path.join(_here, n) for n in ("mue.exe", "mue")
+                 if os.path.exists(os.path.join(_here, n))), os.path.join(_here, "mue"))
+    r = subprocess.run([_mue, "-a", asm, out], capture_output=True, text=True)
     if r.returncode != 0:
         fail += 1
         fails.append((os.path.basename(asm), "ASM ERR: " + r.stderr.strip()[:70]))
