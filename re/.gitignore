@@ -1,0 +1,7 @@
+# Raw extracts from emu8086.exe: a full disassembly and string/address dumps.
+# These reproduce substantial parts of a proprietary binary, so they are not
+# published. Regenerate locally from your own licensed copy if needed.
+disasm.txt
+utf16.txt
+methods.txt
+methods_dump.txt
