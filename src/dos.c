@@ -100,6 +100,56 @@ static void read_buffered(uint16_t buf_off)
     poke8(p + 2 + (uint32_t)i, '\r');
 }
 
+/* ---- INT 21h file handles -------------------------------------------- */
+/* The original routes 3C/3D into 0x5DDF80, 3E into 0x5DE530 and 42 into
+ * 0x5DED70, which are ordinary opens on host files and a DOS file table
+ * (FINDINGS 5.1).  The clone keeps the same guest-visible numbering: handles
+ * start at 5, because 0-4 are the character devices, and CF=1 carries a DOS
+ * error code in AX. */
+#define DOS_FILES        16
+#define DOS_FIRST_HANDLE  5
+static FILE *dos_files[DOS_FILES];
+static int   dos_fmode[DOS_FILES];       /* 0 read-only, 1 write-only, 2 both */
+
+static void dos_file_error(int code)
+{
+    cpu.flags |= F_CF;
+    setAX(code);
+}
+
+/* Copy the ASCIIZ name at DS:DX into out.  Returns 0 on success, -1 on an
+ * empty name or one longer than a DOS path can be. */
+static int dos_guest_name(char *out, size_t n)
+{
+    uint32_t p = seg_off_to_phys(cpu.sr[DS], cpu.r[DX]);
+    size_t i = 0;
+    for (;;) {
+        int c = peek8(p + (uint32_t)i);
+        if (c == 0) break;
+        if (i + 1 >= n) return -1;
+        out[i++] = (char)c;
+    }
+    out[i] = 0;
+    return i == 0 ? -1 : 0;
+}
+
+/* Open FILE for handle h, or NULL if h is not an open file. */
+static FILE *dos_slot_file(int h, int *idx)
+{
+    int i = h - DOS_FIRST_HANDLE;
+    if (h < DOS_FIRST_HANDLE || i >= DOS_FILES || !dos_files[i]) return NULL;
+    if (idx) *idx = i;
+    return dos_files[i];
+}
+
+static int dos_slot_alloc(void)
+{
+    int i;
+    for (i = 0; i < DOS_FILES; i++)
+        if (!dos_files[i]) return i;
+    return -1;
+}
+
 /* ---- INT 21h --------------------------------------------------------- */
 static void int21(void)
 {
@@ -198,8 +248,127 @@ static void int21(void)
         }
         break;
 
-    case 0x3C: case 0x3D: case 0x3E: case 0x3F: case 0x40: case 0x41: case 0x42:
-        /* file services: the original implements a vdrive; report failure */
+    case 0x3C: {                                /* create file, DS:DX = name */
+        char name[128];
+        FILE *f;
+        int i;
+
+        if (dos_guest_name(name, sizeof name) != 0) { dos_file_error(3); break; }
+        i = dos_slot_alloc();
+        if (i < 0) { dos_file_error(4); break; }
+        f = fopen(name, "wb+");                 /* DOS creates and truncates */
+        if (!f) { dos_file_error(5); break; }
+        dos_files[i] = f;
+        dos_fmode[i] = 2;
+        cpu.flags &= ~F_CF;
+        setAX(DOS_FIRST_HANDLE + i);
+        break; }
+
+    case 0x3D: {                                /* open file, AL = access */
+        char name[128];
+        FILE *f;
+        int i, mode = cpu.r[AX] & 0xFF;
+
+        if (mode > 2) { dos_file_error(1); break; }     /* invalid access */
+        if (dos_guest_name(name, sizeof name) != 0) { dos_file_error(3); break; }
+        i = dos_slot_alloc();
+        if (i < 0) { dos_file_error(4); break; }
+        f = fopen(name, mode == 0 ? "rb" : "r+b");     /* open never creates */
+        if (!f) { dos_file_error(2); break; }
+        dos_files[i] = f;
+        dos_fmode[i] = mode;
+        cpu.flags &= ~F_CF;
+        setAX(DOS_FIRST_HANDLE + i);
+        break; }
+
+    case 0x3E: {                                /* close handle BX */
+        int i;
+        FILE *f = dos_slot_file(cpu.r[BX], &i);
+
+        if (!f) { dos_file_error(6); break; }
+        fclose(f);
+        dos_files[i] = NULL;
+        cpu.flags &= ~F_CF;
+        break; }
+
+    case 0x3F: {                                /* read BX -> DS:DX, CX bytes */
+        unsigned char buf[512];
+        uint32_t p, n, done = 0;
+        int i, h = cpu.r[BX];
+        FILE *f;
+
+        f = dos_slot_file(h, &i);
+        if (!f) { dos_file_error(6); break; }   /* includes stdin: see below */
+        if (dos_fmode[i] == 1) { dos_file_error(5); break; }
+        p = seg_off_to_phys(cpu.sr[DS], cpu.r[DX]);
+        n = cpu.r[CX];
+        if (p + n > (uint32_t)0x100000) { dos_file_error(5); break; }
+        while (done < n) {
+            size_t want = n - done > sizeof buf ? sizeof buf : n - done;
+            size_t got = fread(buf, 1, want, f), k;
+            for (k = 0; k < got; k++) poke8(p + done + (uint32_t)k, buf[k]);
+            done += (uint32_t)got;
+            if (got < want) break;              /* EOF */
+        }
+        cpu.flags &= ~F_CF;
+        setAX((int)done);                       /* 0 means end of file */
+        break; }
+
+    case 0x40: {                                /* write DS:DX, CX -> BX */
+        unsigned char buf[512];
+        uint32_t p, n, done = 0, k;
+        int i, h = cpu.r[BX];
+        FILE *f;
+
+        p = seg_off_to_phys(cpu.sr[DS], cpu.r[DX]);
+        n = cpu.r[CX];
+        if (p + n > (uint32_t)0x100000) { dos_file_error(5); break; }
+        if (h == 1 || h == 2) {                 /* stdout / stderr */
+            for (k = 0; k < n; k++) dos_putc(peek8(p + k));
+            dos_flush(h == 1 ? stdout : stderr);
+            cpu.flags &= ~F_CF;
+            setAX((int)n);
+            break;
+        }
+        f = dos_slot_file(h, &i);
+        if (!f) { dos_file_error(6); break; }
+        if (dos_fmode[i] == 0) { dos_file_error(5); break; }
+        while (done < n) {
+            size_t want = n - done > sizeof buf ? sizeof buf : n - done;
+            size_t put;
+            for (put = 0; put < want; put++) buf[put] = peek8(p + done + (uint32_t)put);
+            put = fwrite(buf, 1, want, f);
+            done += (uint32_t)put;
+            if (put < want) break;              /* disk full */
+        }
+        fflush(f);                              /* visible to the next reader */
+        if (done < n) { dos_file_error(0); break; }
+        cpu.flags &= ~F_CF;
+        setAX((int)done);
+        break; }
+
+    case 0x42: {                                /* lseek BX, CX:DX from AL */
+        int i, whence = cpu.r[AX] & 0xFF;
+        uint32_t off;
+        long pos;
+        FILE *f = dos_slot_file(cpu.r[BX], &i);
+
+        if (!f) { dos_file_error(6); break; }
+        if (whence > 2) { dos_file_error(1); break; }   /* AL = 0/1/2 only */
+        off = ((uint32_t)cpu.r[CX] << 16) | cpu.r[DX];
+        if (fseek(f, (long)(int32_t)off,
+                  whence == 0 ? SEEK_SET : whence == 1 ? SEEK_CUR : SEEK_END)) {
+            dos_file_error(1);
+            break;
+        }
+        pos = ftell(f);
+        if (pos < 0) { dos_file_error(1); break; }
+        cpu.flags &= ~F_CF;
+        cpu.r[DX] = (uint16_t)((uint32_t)pos & 0xFFFF);
+        cpu.r[AX] = (uint16_t)(((uint32_t)pos >> 16) & 0xFFFF);
+        break; }
+
+    case 0x41:                                  /* delete: not implemented */
         setAX(0x0000);
         cpu.flags |= F_CF;
         break;

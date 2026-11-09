@@ -1282,3 +1282,51 @@ Regressions in `src/check_int10.py`: `attr-write-read`,
 `char-write-keeps-attr`, `teletype-fills-cell`, `string-attr-reaches-cell`,
 `scroll-blanks-cells`. Proved to bite: removing the AH=09 attribute store
 fails `attr-write-read` (`0x741`) and `char-write-keeps-attr` (`0x742`).
+
+## 18. INT 21h file services: 3C/3D/3E/3F/40/42 (IMPLEMENTED)
+
+Before this pass every one of these returned `CF=1, AX=0`, so a DOS program
+could not touch a file at all - the largest remaining behavioural hole once
+the disk and screen models were honest.
+
+Attribution is from 5.1 (CONFIRMED call targets in the dispatcher
+`0x51FF60`): `3C`/`3D` -> `0x5DDF80` (create/open), `3E` -> `0x5DE530`,
+`3F`/`40` -> `[eax+0x76C]`, `42` -> `0x5DED70` ("allowed values for AL =
+0/1/2"). They are ordinary host-file opens: `0x5DDF80` builds a path string
+and calls the VB file runtime, which is the same shape as the INT 13h
+`__vbaFileOpen`/`__vbaFileClose` path decoded in 15.5.
+
+Implemented in `src/dos.c`:
+
+| call | behaviour |
+|---|---|
+| `AH=3C` | create/truncate the ASCIIZ name at `DS:DX`, `CX` = attribute (kept but unused), `AX` = handle |
+| `AH=3D` | open with `AL` = 0 read / 1 write / 2 read+write; never creates; `AX` = handle |
+| `AH=3E` | close `BX` |
+| `AH=3F` | read `CX` bytes from `BX` into `DS:DX`, `AX` = bytes read, 0 = EOF |
+| `AH=40` | write `CX` bytes from `DS:DX` to `BX`, `AX` = bytes written; handles 1/2 are stdout/stderr |
+| `AH=42` | seek `BX` by the signed 32-bit `CX:DX` from `AL` = 0/1/2, `DX:AX` = new position |
+
+Handles are numbered from 5 like DOS (0-4 are the character devices), the
+table holds 16 open files, and failure is `CF=1` with a DOS code in `AX`:
+1 invalid function, 2 file not found, 3 path not found, 4 too many open
+files, 5 access denied, 6 invalid handle. Writes are flushed when the call
+returns, so a reader that reopens the file sees them immediately.
+
+**Scope of the claim.** The handler addresses, the host-file backing and the
+`AL` seek-origin constraint are read from the binary. The numbering and the
+`CF`/`AX` error convention are the documented DOS contract the original
+implements - they are asserted by the regression, not derived from the
+disassembly, and should be called INFERRED rather than CONFIRMED. `AH=41`
+(delete) is still unimplemented and still reports failure, as before.
+Reading from handle 0 (stdin) is not modelled: the clone has no file handle
+for it, so it reports invalid handle rather than pretending to hit EOF.
+
+Regression `src/check_int21.py` (14 checks, wired into `make test`): each
+guest runs in a scratch directory and the host reads the files back, so the
+oracle is the filesystem, not the emulator's own view - `create-write-hits-
+host`, `read-roundtrip` (read into memory, write to a second file, compare),
+`seek-read-from-offset` ('ell'), `seek-end-reports-size` (5), the two error
+paths, EOF, and the stdout handle. Proved to bite: moving `DOS_FIRST_HANDLE`
+off 5 and zeroing the seek offset fails exactly `create-returns-handle-5`,
+`read-roundtrip` and `seek-read-from-offset`.
