@@ -512,11 +512,48 @@ Video: `0x56BEC0`+ owns `set_VIDEO_MODE` strings; "unsupported video mode:"
 (`0x44AB08`) pushed at `0x56CA11`.
 
 Clone gaps this closes (DESIGN follow-ups, not behaviour changes): none -
-`src/dos.c` already implements every documented AH above. Two open deltas:
-INT 10h AH=`01/02/03/0C/0D` + `08/09/0A` attribute bytes (clone writes chars
-but drops page/attribute; original routes through `frmScreen` OCX + the
-`0x621C04`-guarded helpers), and INT 13h AH=`02/03` real sector I/O (clone
-returns success without touching `FLOPPY_0`).
+`src/dos.c` already implements every documented AH above. AH=13h decoded
+this pass (see 5.2); two deltas remain: INT 10h AH=`01/02/03/0C/0D` +
+`08/09/0A` attribute bytes (clone writes chars but drops page/attribute;
+original routes through `frmScreen` OCX + the `0x621C04`-guarded helpers),
+and INT 13h AH=`02/03` real sector I/O (clone returns success without
+touching `FLOPPY_0`).
+
+### 5.2 INT 10h AH=13h write-string loop  (CONFIRMED - objdump + REA bytes)
+
+Entry `0x522D0E` (`cmp AH-slot,al; jne 0x523577` fall-through). Preamble
+computes the ES:BP source address and decodes the two mode bits:
+
+- `0x522D2D-0x522D5D`: `p_src = ES*0x10 + BP` via two `0x4AD050`
+  variant-to-int calls + `imul esi,esi,0x10` (seg x16) + BP, stored to
+  `[ebp-0x24]`. CONFIRMED cell: `seg_off_to_phys` equivalent.
+- `0x522D67-0x522D7C`: `w0 = AL & 1` (bit0: advance-cursor flag) into
+  `[ebp-0x44]`; second decode `0x522E31-0x522E46`: `w1 = (AL & 2) != 0`
+  (bit1: per-char-attribute flag) into `[ebp-0x50]`.
+- Guard `0x522F70`: `if (CX > 0x7D0) fail` - new string is
+  `"CX value (string size) is above the allowed limit!"` (`0x447650`);
+  below it the low-memory pointer check `cmp [ebp-0x24],0x10FFF1; jle`
+  else new string `"CX is out of memory"` (`0x4476E8`), both logged with
+  template `"INT 10h, AH=13h - "` (`0x4476BC`) via `0x5F2380` + `0x547EC0`.
+- Length scaling `0x523085-0x5230A0`: `if (w1) CX *= 2` - each screen cell
+  consumes 2 bytes `[char,attr]` when the attribute flag is set.
+- Main loop `0x5230C4/0x5230D8/0x523328` (`for (i=1; i<=CX; i++)`):
+  per-cell body reads one byte via `CALL 0x571280` (same get_BYTE_at_EA
+  reader as the CPU core), converts it through the `0x401xxx` variant
+  helpers, and emits it through the OCX sinks (`[edx+0x760]` at
+  `0x5233B4`, `[ecx+0x714]` at `0x523491`, both under `0x621C04` guard).
+- Cursor `0x523311`: `test WORD [ecx+0x36],...; je continue; jmp 0x52ABDF`
+  - skips the tail call when the no-advance flag word is set.
+- Tail (shared exit `0x52ABDF` via `0x52333D/0x52331C`): mode-attr block
+  passes `BH(+0xBD)/DH(+0xC1)/DL(+0xC0)` to `[edx+0x760]`, then the
+  `+0x714` sink consumes `BL(+0xBC)`, `[ebp-0x30]` (w1-decoded word),
+  `[ebp-0x28]` (w0-decoded word), `BH`, and `p_src`.
+
+Clone delta (`src/dos.c` `case 0x13`): original writes through the
+`frmScreen` OCX with per-cell attributes (w1 doubles CX, attr byte follows
+char) and cursor-advance control (bit0); the clone emits CX raw bytes and
+ignores BL/attr/advance. Behaviour-identical only for the common
+`AL=0/1, CX<=0x7D0` text-mode demo path; DESIGN follow-up, not changed.
 
 ### Supporting native routines  (CONFIRMED addresses)
 
