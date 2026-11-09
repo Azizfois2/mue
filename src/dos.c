@@ -225,6 +225,33 @@ static void int21(void)
 }
 
 /* ---- INT 10h (video) ------------------------------------------------- */
+/* The clone renders through dos_putc, so the text cursor is bookkeeping
+ * only.  It has to exist because AH=02/AH=03 expose it and AH=13h writes
+ * relative to it and advances it (FINDINGS 5.2).  Only mode 3 is reported
+ * (AH=0F below), i.e. 80x25. */
+#define VIDEO_COLS 80
+#define VIDEO_ROWS 25
+static int cur_row, cur_col;
+
+/* Teletype output, shared with AH=13h (which prints its cells the same way). */
+static void video_putc(int c)
+{
+    if (c == 0x0D) dos_putc('\r');
+    else if (c == 0x0A) dos_putc('\n');
+    else if (c == 0x08) dos_putc('\b');
+    else dos_putc(c);
+}
+
+/* AH=13h size guard.  The original logs "INT 10h, AH=13h - " + message and
+ * then halts through [obj+0x7AC], setting the 0x62141C error flag
+ * (0x52301E-0x523079).  Same outcome here: diagnostic, then stop. */
+static void int10_write_string_fail(const char *why)
+{
+    fprintf(stderr, "INT 10h, AH=13h - %s\n", why);
+    cpu.halted = 1;
+    cpu.exit_code = -5;                 /* BIOS call rejected */
+}
+
 static void int10(void)
 {
     int ah = (cpu.r[0] >> 8) & 0xFF;
@@ -235,10 +262,12 @@ static void int10(void)
     case 0x01:                                  /* set cursor shape */
         break;
     case 0x02:                                  /* set cursor position */
+        cur_row = (cpu.r[DX] >> 8) & 0xFF;
+        cur_col = cpu.r[DX] & 0xFF;
         break;
     case 0x03:                                  /* read cursor position */
-        cpu.r[1] = 0x0607;
-        cpu.r[2] = 0x0000;
+        cpu.r[CX] = 0x0607;
+        cpu.r[DX] = (uint16_t)((cur_row << 8) | cur_col);
         break;
     case 0x06: case 0x07:                       /* scroll */
         if ((cpu.r[1] & 0xFF) == 0 && (cpu.r[1] >> 8) == 0 &&
@@ -257,23 +286,46 @@ static void int10(void)
         }
         break;
     case 0x0E:                                  /* teletype output */
-        {
-            int c = cpu.r[0] & 0xFF;
-            if (c == 0x0D) dos_putc('\r');
-            else if (c == 0x0A) dos_putc('\n');
-            else if (c == 0x08) dos_putc('\b');
-            else dos_putc(c);
-        }
+        video_putc(cpu.r[AX] & 0xFF);
         break;
     case 0x0F:                                  /* get video mode */
         cpu.r[0] = (uint16_t)((cpu.r[0] & 0x00FF) | (0x03 << 8));
         cpu.r[3] = 0;
         break;
-    case 0x13:                                  /* write string */
+    case 0x13:                                  /* write string at ES:BP */
         {
-            uint32_t p = seg_off_to_phys(cpu.sr[ES], cpu.r[5]);
-            int n = cpu.r[1];
-            while (n--) { dos_putc(peek8(p)); p++; }
+            int al      = cpu.r[AX] & 0xFF;
+            int cells   = cpu.r[CX];            /* characters requested */
+            int pairs   = (al & 0x02) != 0;     /* cell = char + attr byte */
+            int advance = (al & 0x01) != 0;     /* move cursor afterwards */
+            int bytes   = pairs ? cells * 2 : cells;
+            uint32_t p  = seg_off_to_phys(cpu.sr[ES], cpu.r[BP]);
+            int i, ch, written = 0;
+
+            /* DX is the starting position, as on the real BIOS. */
+            cur_row = (cpu.r[DX] >> 8) & 0xFF;
+            cur_col = cpu.r[DX] & 0xFF;
+
+            if (cells > 0x7D0) {                /* FINDINGS 5.2 guard */
+                int10_write_string_fail(
+                    "CX value (string size) is above the allowed limit!");
+                break;
+            }
+            for (i = 0; i < bytes; i++) {
+                ch = peek8(p++);
+                /* With bit1 set every second byte is an attribute, which a
+                 * text console cannot render: consume it, do not print it. */
+                if (pairs && (i & 1)) continue;
+                video_putc(ch);
+                written++;
+            }
+            if (advance) {
+                cur_col += written;
+                while (cur_col >= VIDEO_COLS) {
+                    cur_col -= VIDEO_COLS;
+                    cur_row  = (cur_row + 1) % VIDEO_ROWS;
+                }
+            }
         }
         break;
     default:
@@ -298,6 +350,95 @@ static void int16(void)
         else { cpu.flags |= F_ZF; cpu.r[0] = 0; }
         break;
     default: break;
+    }
+}
+
+/* ---- INT 13h (floppy disk) -------------------------------------------- */
+/* Original: FUN_0051FF60 INT13 arm (FINDINGS 5.3): AH=00 reset writes
+ * WORD [regblock+0x3A]=0xFFFF; AH=02/03 call 0x595E00/0x596370 with
+ * (p_buf = ES: BX phys, CH, CL, DH, DL, AL); other AHs take the
+ * "INT 13h, AH=0" fail path.  Clone uses the FLOPPY_0 image directly. */
+#define FLOPPY_TRACKS 80
+#define FLOPPY_HEADS   2
+#define FLOPPY_SPT    18
+#define FLOPPY_BPS   512
+#define FLOPPY_TOTAL (FLOPPY_TRACKS * FLOPPY_HEADS * FLOPPY_SPT * FLOPPY_BPS)
+static unsigned char *floppy;
+static int floppy_loaded;
+static void floppy_load(void)
+{
+    const char *paths[4];
+    int i;
+    FILE *f;
+    if (floppy_loaded) return;
+    floppy_loaded = 1;
+    floppy = (unsigned char *)calloc(1, FLOPPY_TOTAL);
+    if (!floppy) return;
+    paths[0] = getenv("MUE_FLOPPY");
+    paths[1] = "C:/emu8086/FLOPPY_0";
+    paths[2] = getenv("EMUB086_FLOPPY");
+    paths[3] = "./FLOPPY_0";
+    for (i = 0; i < 4; i++) {
+        size_t n;
+        if (!paths[i] || !paths[i][0]) continue;
+        f = fopen(paths[i], "rb");
+        if (!f) continue;
+        n = fread(floppy, 1, FLOPPY_TOTAL, f);
+        fclose(f);
+        (void)n;                 /* short image: rest stays zero */
+        return;
+    }
+}
+static void int13(void)
+{
+    int ah = (cpu.r[AX] >> 8) & 0xFF;
+    int al = cpu.r[AX] & 0xFF;
+    int ch = (cpu.r[CX] >> 8) & 0xFF;
+    int cl = cpu.r[CX] & 0xFF;
+    int dh = (cpu.r[DX] >> 8) & 0xFF;
+    uint32_t p;
+    long cyl, head, sec, linear, i;
+    switch (ah) {
+    case 0x00:                                  /* reset: success */
+        cpu.flags &= ~F_CF;
+        setAThi(0);
+        return;
+    case 0x02: case 0x03: {                      /* read/write sectors */
+        if (al == 0) { cpu.flags &= ~F_CF; setAThi(0); return; }
+        floppy_load();
+        if (!floppy) { cpu.flags |= F_CF; setAThi(0xAA); return; }
+        cyl = ch; head = dh; sec = cl & 0x3F;
+        if (sec == 0 || head >= FLOPPY_HEADS) {
+            cpu.flags |= F_CF; setAThi(1); return;
+        }
+        linear = (cyl * FLOPPY_HEADS + head) * FLOPPY_SPT + (sec - 1);
+        if (linear < 0 ||
+            linear + al > FLOPPY_TRACKS * FLOPPY_HEADS * FLOPPY_SPT) {
+            cpu.flags |= F_CF; setAThi(1); return;
+        }
+        p = seg_off_to_phys(cpu.sr[ES], cpu.r[BX]);
+        if (p + (uint32_t)al * FLOPPY_BPS > (uint32_t)0x100000) {
+            cpu.flags |= F_CF; setAThi(1); return;
+        }
+        for (i = 0; i < al; i++) {
+            uint32_t img = (uint32_t)(linear + i) * FLOPPY_BPS;
+            uint32_t mem = p + (uint32_t)i * FLOPPY_BPS;
+            int k;
+            if (ah == 0x02)
+                for (k = 0; k < FLOPPY_BPS; k++)
+                    poke8(mem + k, floppy[img + k]);
+            else
+                for (k = 0; k < FLOPPY_BPS; k++)
+                    floppy[img + k] = peek8(mem + k);
+        }
+        cpu.flags &= ~F_CF;
+        setAThi(0);
+        cpu.r[AX] = (uint16_t)((0 << 8) | (al & 0xFF));
+        return; }
+    default:
+        cpu.flags |= F_CF;                      /* cf. fail path 5.3 */
+        setAThi(1);
+        return;
     }
 }
 
@@ -339,6 +480,7 @@ int dos_interrupt(int n)
         cpu.halted = 1;
         return 1;
     case 0x21: int21(); return 1;
+    case 0x13: int13(); return 1;    /* floppy: FLOPPY_0 image */
     case 0x23: break;
     case 0x24: return 1;                /* critical error handler */
     case 0x28: return 1;                /* DOS idle */

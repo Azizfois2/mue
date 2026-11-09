@@ -464,8 +464,15 @@ Single function `FUN_0051FF60`, 43557 bytes, 947 blocks (ranges
 `0x51FF60-0x5235BA/0x5235C0-0x52A938/...`; tail `0x52A934` shared exit).
 Register-field block at `[ebp+8]` (CONFIRMED offsets, reused in every
 handler): `+0xBA`=AL, `+0xBB`=AH, `+0xBC`=BL, `+0xBD`=BH, `+0xBE`=CL,
-`+0xBF`=CH, `+0xC0`=DL, `+0xC1`=DH, `+0xC4`=SI / `+0xCA`=DI (x16 phys),
-`+0x4C`=carry flag word. `0x621218` = global carry mirror,
+`+0xBF`=CH, `+0xC0`=DL, `+0xC1`=DH, `+0x4C`=carry flag word.
+
+**High-register / segment fields (CORRECTED this pass; an earlier revision of
+this table said `+0xC4`=SI and `+0xCA`=DI, which is wrong):**
+`+0xC4`=**ES**, `+0xC6`=**SI**, `+0xC8`=**DI**, `+0xCA`=**BP**, `+0xCC`=CS,
+`+0xCE`=IP. Evidence is section 15.1: the `A4`/`A5` (MOVS) arm reads its
+*source* through `+0xC6` and writes its *destination* through
+`+0xC4 x16 + +0xC8`, and the INT 10h AH=13h arm physicalises its documented
+`ES:BP` source as `+0xC4 x16 + +0xCA`. `0x621218` = global carry mirror,
 `0x621C04` = global file-table guard.
 AH-byte test idiom: `MOV ECX,<AH>; CALL [0x401238] (__vbaUI1I2); CMP
 [ebp-<slot>],AL; JNZ next`.
@@ -482,10 +489,10 @@ plus `INT %02X`-style templates at `0x447F78/0x44800C/0x448094`.
 | `11` | - | `MOV AX,1` (`0x523B76`: `get_BYTE 0x410/0x411` -> AL `+0xBA` / AH `+0xBB`) |
 | `12` | - | same helper pair (`0x413/0x414`), memory-size AX |
 | `13` | AH=`00` (reset), `02` (read via `0x595E00`), `03` (write via `0x596370`) | fail template `0x447884` at `0x523E99`; see 5.3 |
-| `15` | AH=`86` only (BIOS wait; `fmul [0x409828]` delay math) | fail template `0x4478E4` at `0x5245F4` |
+| `15` | AH=`86` only (BIOS wait; interval `CX*0x10000+DX` scaled by `1/1000`, div-const `1000.0` at `0x409830`) | fail template `0x4478E4` at `0x5245F4`; see 5.4 |
 | `16` | AH=`00,01` | kb-buffer OCX vtable sink `+0x750/0x754`; fail template `0x4479B4` at `0x524BDF` |
 | `17` | - | direct `CALL 0x550B40` ("wrong parameter...") |
-| `1A` | AH=`00` (time; `fmul` + `0x4011`-scaled `rtcHexVarFromVar`) | fail template `0x4479D4` at `0x5252EE` |
+| `1A` | AH=`00` (time-of-day; host clock `fmul [0x409828]` -> `>>1` div-2 BCD chain -> CH/CL/DH/DL; CX/DX read-path variant) | fail template `0x4479D4` at `0x5252EE`; see 5.5 |
 | `19` | - | reboot: `[ecx+0x4C]=0xFFFF; [0x621218]=0xFFFF; CALL [eax+0x7AC]` |
 | `20` | - | terminate: same `0x4C/0x621218=0xFFFF` + `[eax+0x7AC]` halt |
 | `21` | 47 AHs: `00,01,02,05,06,07,08,09,0A,0B,0C,0D,0E,17,19,1A,1F,25,2A,2C,2E,30,35,36,39,3A,3B,47,3C,3D,3E,3F,40,41,42,4D,54,56,4C,4E,4F,57,23,33,48,49,4A` | doc lists 27; the other 20 (00,0D,17,1A,1F,23,2E,30,33,36,43,48,49,4A,4D,4E,4F,54,56,57) still have compare-and-handle bodies in the binary; fail template `0x447EB0` at `0x52A2D4`; shared exit `0x52A52A: jmp 0x52A934` |
@@ -511,13 +518,11 @@ at `0x5474DE` inside `0x547EC0` FPU step-back). Floppy: `0x595E00/0x596370`
 Video: `0x56BEC0`+ owns `set_VIDEO_MODE` strings; "unsupported video mode:"
 (`0x44AB08`) pushed at `0x56CA11`.
 
-Clone gaps this closes (DESIGN follow-ups, not behaviour changes): none -
-`src/dos.c` already implements every documented AH above. AH=13h decoded
-this pass (see 5.2); two deltas remain: INT 10h AH=`01/02/03/0C/0D` +
-`08/09/0A` attribute bytes (clone writes chars but drops page/attribute;
-original routes through `frmScreen` OCX + the `0x621C04`-guarded helpers),
-and INT 13h AH=`02/03` real sector I/O (clone returns success without
-touching `FLOPPY_0`).
+Clone gaps this closes: AH=13h decoded this pass (see 5.2); INT 13h `02/03`
+real sector I/O implemented this pass (see 5.6). Remaining delta: INT 10h
+AH=`01/02/03/0C/0D` + `08/09/0A` attribute bytes (clone writes chars but
+drops page/attribute; original routes through `frmScreen` OCX + the
+`0x621C04`-guarded helpers) - DESIGN follow-up, not changed.
 
 ### 5.2 INT 10h AH=13h write-string loop  (CONFIRMED - objdump + REA bytes)
 
@@ -549,11 +554,38 @@ computes the ES:BP source address and decodes the two mode bits:
   `+0x714` sink consumes `BL(+0xBC)`, `[ebp-0x30]` (w1-decoded word),
   `[ebp-0x28]` (w0-decoded word), `BH`, and `p_src`.
 
-Clone delta (`src/dos.c` `case 0x13`): original writes through the
-`frmScreen` OCX with per-cell attributes (w1 doubles CX, attr byte follows
-char) and cursor-advance control (bit0); the clone emits CX raw bytes and
-ignores BL/attr/advance. Behaviour-identical only for the common
-`AL=0/1, CX<=0x7D0` text-mode demo path; DESIGN follow-up, not changed.
+Clone delta (`src/dos.c` `case 0x13`) - **CLOSED**. The clone used to emit CX
+raw bytes and ignore BL/attributes/advance. It now mirrors the decoded
+behaviour:
+
+- source is `ES:BP`; `DX` is the starting position, stored into the modelled
+  cursor before anything is written.
+- `AL` bit 1: the source is CX `[char,attr]` pairs, so `2*CX` bytes are
+  consumed and the attribute byte is consumed but **not printed** (a text
+  console cannot render it; BL is likewise not renderable).
+- `AL` bit 0: the cursor advances over exactly the characters written and not
+  at all when the bit is clear. Before this change the clone had no cursor at
+  all - AH=02 was a no-op and AH=03 always returned 0,0.
+- `CX > 0x7D0` is refused: diagnostic on stderr, then halt with
+  `exit_code = -5`, matching `0x522F70` -> log -> `[obj+0x7AC]` halt ->
+  `WORD ds:0x62141C = 0xFFFF` (`0x52301E-0x523079`).
+
+Regressions: `src/check_int10.py`, 11 checks (advance, pairs, no-advance,
+AH=02/AH=03 round trip, CX limit), wired into `make test`. Verified to bite:
+forcing the pairs skip off and the advance unconditional makes exactly the
+three affected checks fail.
+
+Remaining differences, all deliberate:
+
+- BL's attribute and page BH are ignored (single console, mode 3 only).
+- Wrapping at 80 columns / 25 rows is the clone's choice: the real wrap and
+  scroll belong to the `frmScreen` OCX, which was not decoded.
+- The per-iteration `p_src > 0x10FFF1` guard (`0x5230EE`, "CX is out of
+  memory") is unreachable here - `seg_off_to_phys()` masks to 20 bits, so the
+  pointer can never exceed 0xFFFFF. Implemented as absent, not silently
+  approximated.
+- AH=0Eh teletype still does not move the modelled cursor; only AH=13h
+  advances it. Pre-existing, separate from this gap.
 
 ### 5.3 INT 13h AH=00/02/03 floppy sector I/O  (CONFIRMED - objdump + file stat)
 
@@ -566,16 +598,20 @@ Entry `0x523C49` (INT byte test `0x13`, slot copy `AH->[ebp-0x278]` at
 - AH=`02` read (`0x523C92-0x523D7B`): prologue copies BH/BL (`+0xBD/+0xBC`)
   into `[ebp-0x248]` via the `[eax+0x76C]` accessor pair (same EA-getter
   shape as INT 21h file `3C/3D` prologue `0x54A0C0+0x5DC410`), then
-  `p_buf = SI*0x10 + [ebp-0x248]` (`SI=+0xC4`, `0x4AD050` + `imul` + add
+  `p_buf = ES*0x10 + [ebp-0x248]` (`ES=+0xC4`, `0x4AD050` + `imul` + add
   at `0x523D15-0x523D39`, stored `[ebp-0x24C]`) and
   `CALL 0x595E00(p_buf, BL, CL, CH, DL, DH)` -
-  arg order pushed: `+0xBA(AL),+0xBF(CH),+0xBE(CL),+0xC1(DH),+0xC0(DL),buf`.
+  pushes in reverse order, so in cdecl argument order the call is
+  `(AL, CH, CL, DH, DL, p_buf)`: `+0xBA(AL)` last-pushed, then
+  `+0xBF(CH)`, `+0xBE(CL)`, `+0xC1(DH)`, `+0xC0(DL)`, then `&buf` at
+  `0x523D3F-0x523D76`.
   `FUN_00595E00` is 1011 B / 36 blocks (Ghidra `procedure_info`).
 - AH=`03` write (`0x523D80-0x523E88`): same shape, buffer physicalised as
-  `p_buf = [ebp-0x250](=SI field via 0x4AD050 at 0x523DA5)*0x10 +
+  `p_buf = [ebp-0x250](=ES field via 0x4AD050 at 0x523DA5)*0x10 +
   [ebp-0x248]` (`0x523E20-0x523E44`), then
   `CALL 0x596370(p_buf, ..., w_flag)` with an extra leading
-  `WORD [ebp-0x23C] = 0` argument slot (`0x523E20/0x523E4A`).
+  `WORD [ebp-0x23C] = 0` argument slot (`0x523E20/0x523E4A`) - in cdecl
+  order `(AL, CH, CL, DH, DL, p_buf, &zero_word)` per `0x523E4A-0x523E88`.
   `FUN_00596370` is 1091 B / 38 blocks.
 - Fail path (`0x523E92-0x5240EF`, all other AHs): logs template
   `"INT 13h, AH=0"` (`0x447884`) + `"h   "` (`0x4478A4`) +
@@ -591,14 +627,94 @@ x 512 B (standard 1.44 MB floppy image; the file is the backing store the
 read/write arms address). `0x595E00/0x596370` internals NOT decoded this
 pass - only their call signatures (arg order/count) and sizes are claimed.
 
-Clone delta (`src/dos.c`): `dos_interrupt` has NO `case 0x13` arm - INT 13h
-falls through to `return 0` (forward to IVT). To close the gap per this
-spec: add `case 0x13: int13(); return 1;` with `AH=00 -> clear CF + AH=00`
-(success); `AH=02/03 -> CHS decode (C=CH, H=DH, S=CL&0x3F), linear =
-(C*2+H)*18 + (S-1), file offset = linear*512 against the FLOPPY_0 image,
-memcpy to/from ES:BX (p_buf per above), set CF/AH on bounds errors; else
-CF=1, AH=1 (invalid function)` mirroring the fail path. DESIGN + behaviour
-change; NOT implemented this pass (docs only), so `make test` stays green.
+Clone delta (`src/dos.c`): CLOSED this pass - `int13()` + `case 0x13` added
+(loads `FLOPPY_0` lazily, 80x2x18x512; `AH=00 -> CF=0,AH=0`; `AH=02/03 ->
+CHS decode, ES:BX copy, CF/AH errors`; else `CF=1,AH=1`). See 5.6.
+
+### 5.4 INT 15h AH=86h BIOS wait  (CONFIRMED - objdump + REA bytes)
+
+Entry `0x524112` (INT byte `0x15`, slot `[ebp-0x27C]`, AH=`0x86` test at
+`0x52412F`). Single arm plus fail tail (`0x5245ED` template `0x4478E4`
+`"INT 15h, AH=0"`):
+
+- Interval build `0x5241B2-0x524235`: `ticks = DX + CX*0x10000`
+  (`imul eax,eax,0x10000` at `0x52421D`, `[ebp-0x4C4]`) lifted with
+  `fild/fstp` + `fdiv 1000.0` (`QWORD [0x409830] = 1000.0`, divided only
+  `if [0x621000]==0` else via `0x4199D4`), then `Sleep(ticks_ms)` through
+  the `[edx+0x64]` OCX sink and two `[eax+0x33c]/[ecx+0x33c]` acquire
+  calls. The `fmul [0x409828]` (multiplier `639.4603...`, bytes
+  `30478FDFDB343240` LE double) entry belongs to the INT 1Ah arm below -
+  the INT 15h arm divides, not multiplies. Earlier note corrected.
+- Gating: `if ([ebp-0x248] > 0) ticks &= ~[ebp-0x23C]` word-mask
+  (`0x524425-0x524440`), then a second wait iteration is entered only
+  `if (masked != 0)` (`0x524460-0x524469`); a zero tick count returns
+  through the shared exit without sleeping.
+
+Clone (`src/dos.c` `int15`): real `Sleep()` has no headless test oracle
+and the OCX acquire/wait sinks are GUI-thread machinery, so the clone
+keeps `AH=86h -> CF=0, AH=0` (success, no wait) exactly as before. No
+behaviour change; no new delta - documented for completeness.
+
+### 5.5 INT 1Ah AH=00 time-of-day  (CONFIRMED - objdump + REA bytes)
+
+Entry `0x524E7E` (INT byte `0x1A`, slot `[ebp-0x284]`, AH=`0x00` test at
+`0x524EB2`):
+
+- Host clock read `0x524EC6`: `call 0x4012D8` (VB Now) then
+  `fmul [0x409828]` with the LE-double bytes `30478FDFDB343240`
+  (= 639.4603...). Combined with the `0x4011`-scaled `rtcHexVarFromVar`
+  (`0x40132C`) conversions and the push-`1`/`0x401170` div-2 step at
+  `0x524FE1-0x524FF2`, followed by four BCD-split blocks each writing one
+  register byte: `CH <- +0xBF` (`0x525031`), `CL <- +0xBE` (`0x5250FE`),
+  `DH <- +0xC1` (`0x5251CB`), `DL <- +0xC0` (`0x525298`), then
+  `AL <- +0xBA` midnight flag (`0x5252D9-0x5252DC`) before the shared exit
+  `0x5252E2 -> jmp 0x525544`. So the arm writes CH/CL/DH/DL directly -
+  the earlier shorthand "+0xBB AH slot" does not apply here.
+- Rate check (CORRECTED): the sibling `0x4AD050`+`imul esi,esi,0x10`
+  fragment at `0x5270xx`-range belongs to the INT 1Ah AH=`02` (date)
+  sub-arm, not to AH=`00`: it physicalises the DS:DX return buffer while
+  AH=`00` returns the tick count in CX:DX and midnight flag in AL.
+- CX/DX read path (CONFIRMED): `mov WORD [ebp-0x23C],8` selector +
+  `0x4AA020` converter + push-`2`/`0x401344` splitter at
+  `0x524F18-0x524F74`, then the div-2/BCD chain above.
+- Fail path (`0x5252E7`): same 3-template + `0x5F2380` + `0x547EC0` log
+  pipeline with `"INT 1Ah, AH=0"` (`0x4479D4`) and
+  `"refer to the list of supported i..."` (`0x447904`).
+
+Clone (`src/dos.c` `int1a`): returns fixed demo values; the original reads
+the host clock. No headless oracle distinguishes them deterministically,
+so the clone is unchanged - documented for completeness.
+
+### 5.6 INT 13h clone implementation  (IMPLEMENTED + tested this pass)
+
+`src/dos.c` now has `int13()` + `case 0x13`, derived from 5.3:
+
+- Image: `FLOPPY_0` loaded lazily (env `MUE_FLOPPY`, else
+  `C:/emu8086/FLOPPY_0`, `EMUB086_FLOPPY`, `./FLOPPY_0`); 1474560 bytes =
+  80 trk x 2 heads x 18 sec x 512 B; short reads zero-padded.
+- `AH=00`: `CF=0, AH=0` (reset always succeeds).
+- `AH=02/03`: CHS decode `C=CH, H=DH, S=CL&0x3F`; reject `S==0`, `H>1`,
+  `linear=(C*2+H)*18+(S-1) >= 2880`, or `ES:BX+AL*512` overflow past 1 MB;
+  `02` copies image->memory, `03` memory->image; `CF=0, AH=0, AL=count`.
+- Else (incl. AH=`01` status): `CF=1, AH=1` mirroring the fail path.
+- Regression: `src/check_int13.py` exercises reset/read/read-write-readback/
+  bounds/else through `mue -r` scripts and asserts byte movement both
+  ways; `make test` runs it, `make examples` unaffected.
+
+**BUG FIXED (register-index slip).** `int13()` used `cpu.r[3]` for DH and
+`cpu.r[5]` for BX. With `enum { AX, CX, DX, BX, ... }` those are **BX** and
+**BP**, so the head came from BH (always 0 unless the guest set it) and the
+transfer buffer from BP. A guest reading CHS 79/1/18 therefore read 79/0/18.
+Now `cpu.r[DX]` / `cpu.r[BX]` via the enum names. The regression was rewritten
+because its old oracle - the host image file after a write - cannot work: the
+clone keeps the image in memory and never writes it back, so the old check
+compared two all-zero buffers. (The original *does* persist - see 15.5 - so
+the clone's missing write-back is a genuine gap, tracked there, but the test
+must not assume behaviour the clone lacks.) It now proves the round trip
+*inside* the guest: read a patterned head-1 sector, write it to sector 1, read
+sector 1 back, byte-compare, and report the first two / last bytes read. With
+`dh` restored to the BH read the two byte-value checks fail (`AX=0000`,
+`DX=0000`); with the fix all ten checks pass.
 
 ### Supporting native routines  (CONFIRMED addresses)
 
@@ -846,3 +962,219 @@ source exercises one.
 - `.list` per-byte assembler comparison: **46 / 46 pass**
 - CPU self-test: **ALL PASS (0 failures)**
 - emu8086 examples: **85 / 85 assemble**
+
+## 15. INT 13h CALL CHAIN VERIFIED AGAINST THE ORIGINAL (CONFIRMED)
+
+Prompted by a clone bug (DH read from BH), this pass went back to the original
+binary and re-derived the whole INT 13h path from disassembly, rather than
+trusting the summary in 5.3. Everything below is from `re/disasm.txt` and is
+independent of the clone.
+
+### 15.1 Register-field map correction (CONFIRMED)
+
+An earlier revision of 5.1 listed `+0xC4`=SI / `+0xCA`=DI. Both are wrong, and
+the error matters because 5.3 then described the INT 13h buffer as
+"`SI*0x10`". Two independent arms fix the map:
+
+- **`A4`/`A5` MOVS arm of the core (`0x4F527B`)**: source byte is fetched from
+  `0x4AD050(obj+0xC6)` added to a segment base, then `0x571280`
+  (`get_BYTE_at_EA`); destination is `0x4AD050(obj+0xC4)` `imul 0x10`
+  `+ 0x4AD050(obj+0xC8)`, stored and passed to `0x56FEE0`
+  (put-byte-at-EA). So the *source offset* is `+0xC6` and the
+  *destination segment/offset* pair is `+0xC4`/`+0xC8`.
+- **INT 10h AH=13h (`0x522D2D-0x522D5D`)**: `p_src = 0x4AD050(obj+0xC4) * 0x10
+  + 0x4AD050(obj+0xCA)`. 5.2 already established from the API contract that
+  this arm's source is `ES:BP`.
+
+Therefore `+0xC4`=ES, `+0xC6`=SI, `+0xC8`=DI, `+0xCA`=BP (and `+0xCC`=CS,
+`+0xCE`=IP as before). Section 5.1 has been corrected. Nothing else in this
+document depended on the old labels, but any future work that physicalises a
+guest pointer should use `+0xC4` for the ES base.
+
+### 15.2 Argument order and CHS math (CONFIRMED)
+
+Both sector arms push arguments in reverse, so the cdecl parameter order is:
+
+- AH=`02` (`0x523D3F-0x523D7B`) -> `FUN_00595E00(AL, CH, CL, DH, DL, p_buf)`
+- AH=`03` (`0x523E4A-0x523E88`) -> `FUN_00596370(AL, CH, CL, DH, DL, p_buf,
+  &zero_word)`
+
+where `p_buf = ES*0x10 + BX`, with BX produced by the `[eax+0x76C]` accessor
+pair (the same BL/BH getter shape as the INT 21h `3C/3D` prologue).
+**Head is `+0xC1` (DH)**, cylinder is CH, sector is CL, count is AL. That is
+exactly the 8086 contract, and it independently confirms that the clone's
+BH-for-DH read was the bug and not an emu8086 convention.
+
+`FUN_00596BB0` is the CHS->sector-index helper, and it is short enough to
+quote in full in effect (`0x596C0B-0x596C3A`):
+
+```
+cx = (u8)arg1 * 0x24      ; 36 = heads x sectors-per-track (2 x 18)
+cx += (u8)arg2 * 0x12     ; 18 = sectors per track
+cx += (u8)arg3            ; sector, 1-based
+cx -= 1                   ; -> 0-based index
+```
+
+So `linear = C*36 + H*18 + (S-1)`, i.e. `(C*2 + H)*18 + (S-1)`. This is
+byte-for-byte the formula the clone already used
+(`(cyl * FLOPPY_HEADS + head) * FLOPPY_SPT + (sec - 1)`), and it includes the
+head term - so a head mis-decode necessarily reads a different sector, as
+observed. The geometry constants 2x18 are hardcoded, matching the 1474560-byte
+`FLOPPY_0` (80 x 2 x 18 x 512).
+
+### 15.3 The transfer helpers reproduce 5.3's *inner* copy only
+
+Call inventory of **direct `call rel32`** inside each function:
+
+| function | direct calls |
+|---|---|
+| `0x595E00` read  | `0x596930`, `0x596BB0`, `0x547870`, `0x548350` |
+| `0x596370` write | `0x596A20`, `0x596BB0`, `0x56FEE0`, `0x571280`, `0x4ACC90`, `0x547870`, `0x548350`, `0x4199B0` |
+| `0x596930` (file->memory) | `0x56FEE0` with base `ds:0x621F0C`, length checked against `0x200` |
+| `0x596A20` (memory->file) | `0x571280` with base `ds:0x621F0C` |
+
+`0x56FEE0` is the same put-byte-at-EA primitive the MOVS opcode uses, and
+`0x571280` is the same fetch-byte primitive, so `0x596930`/`0x596A20` are the
+raw 512-byte emulated-memory <-> buffer copies. `ds:0x621F00` is the buffer
+descriptor and `ds:0x621F0C` its data pointer (INFERRED from use as a
+0x200-stride base).
+
+**A direct-call scan alone is not sufficient here** - see 15.5. The host file
+work in these two functions goes through `call DWORD PTR ds:0x401xxx` IAT
+thunks, which a `call rel32` sweep misses entirely. Any future "does the
+original touch a file?" question must include the thunk form.
+
+### 15.4 What this changes in the clone
+
+Only `src/dos.c int13()` (`cpu.r[DX]` for DH, `cpu.r[BX]` for the buffer, enum
+names instead of magic indices) and `src/check_int13.py` (oracle rewritten).
+The CHS formula, the ES:BX buffer, the CF/AH convention and the 80x2x18x512
+geometry all stand as they were - now with disassembly evidence instead of
+inference. Write persistence *is* a real delta; see 15.5.
+
+### 15.5 Host-file I/O is real, per call, and settles persistence (CONFIRMED)
+
+The `FLOPPY_<n>` image is opened, read/written and closed **inside every
+INT 13h AH=02/AH=03 call**. The runtime calls are IAT thunks, resolved against
+the single MSVBVM60 import descriptor (273 entries, IAT at RVA 0x1000):
+
+| IAT slot | import | role |
+|---|---|---|
+| `0x4012F8` | `__vbaFileOpen` | Open "FLOPPY_" & drive, record length `0x200` |
+| `0x4012CC` | `__vbaGetOwner4` | `Get #` - file -> buffer |
+| `0x4011BC` | `__vbaPutOwner4` | `Put #` - buffer -> file |
+| `0x401180` | `__vbaFileClose` | Close before returning |
+
+The other file-capable slots the binary imports are `__vbaGet3`/`__vbaPut3`
+(`0x40119C`/`0x401054`), `__vbaGetOwner3`/`__vbaPutOwner3`
+(`0x4012BC`/`0x4011A8`), `__vbaFileSeek` (`0x4012E0`),
+`__vbaLineInputStr` (`0x401040`) and `__vbaNameFile` (`0x4010AC`); neither
+sector path uses them.
+
+Read path `FUN_00595E00` (`0x596013-0x5960A5`, CONFIRMED instruction by
+instruction):
+
+```
+name = "FLOPPY_" & CStr(DL)            ; 0x445C14 is a UTF-16 "FLOPPY_"
+__vbaFileOpen(0x4004, 0x200, chan, name)      ; 0x596018-0x596022
+lin  = CHS(CH, DH, CL)                        ; 0x596034 -> FUN_00596BB0
+for (i = 1; i <= AL; i++) {                   ; 0x59604A-0x5960A3
+    rec = lin + i                             ; 0x59605C-0x596069
+    __vbaGetOwner4(0x44C0E4, 0x621F00, rec, chan)   ; 0x59606C-0x596077
+    copy 512 bytes buffer -> emulated memory  ; 0x59607D -> 0x596930
+    buffer += 0x200                           ; 0x596085-0x596091
+}
+__vbaFileClose(chan)                          ; 0x5960A5
+```
+
+Write path `FUN_00596370` is symmetric: `0x5965C7` FileOpen, loop
+`0x596601-0x596638` with `__vbaPutOwner4` at `0x596632` after the same
+`lin + i` record build, `__vbaFileClose` at `0x59664B` (and again on the error
+branch at `0x596790`).
+
+**Answers the persistence question:** there is no "flush on exit". Record
+numbering is 1-based (`lin + i`, and `lin` already holds `S-1`), with a
+512-byte record length, so the byte offset is `lin*512` - the same place the
+clone's memory image keeps it. Because the file is opened from disk at the
+start of each transfer and closed before the INT returns, a guest write is on
+disk by the time AH=03 returns.
+
+Note also that `DL` is not ignored: it is concatenated into the filename, so
+DL=1 addresses `FLOPPY_1`. Only `FLOPPY_0` ships in `C:\emu8086`, so any other
+drive reaches the FileOpen failure path (INFERRED - that path was not decoded).
+The clone ignores DL and always uses one image.
+
+Consequences for the clone (`src/dos.c`):
+
+1. **Writes are lost.** The clone keeps only the in-memory `floppy` array and
+   never writes it back. Guest-visible behaviour *within one run* is therefore
+   correct (later reads see the write), but the change disappears when the
+   process exits and is invisible to everything else. This is a proven
+   behavioural difference, not an open question.
+2. The clone **caches the image once**; the original re-reads the file on every
+   transfer, so a host-side change between two INT 13h calls would be visible
+   to the original and not to the clone. Narrow, but real.
+3. The clone **synthesises a zero image** when the file is missing; the
+   original's FileOpen would fail. Treat as INFERRED (error path not decoded).
+
+`src/check_int13.py` was still rewritten to verify the round trip inside the
+guest: it must not depend on persistence that the clone does not implement,
+and it now fails correctly if the clone's head decode regresses (see 5.6).
+
+## 16. OPEN DEFECT FOUND: `push`/`pop` of a segment register (NOT fixed)
+
+Found while validating 5.2 against the shipped `examples\int10_13.asm`, which
+starts with the standard `push cs` / `pop es` idiom. Not fixed here: it is a
+separate assembler defect, outside the INT 10h change.
+
+**Symptom (CONFIRMED).** `push cs` is emitted as three bytes, and the register
+index leaks into the stream:
+
+Measured one instruction per assembly (`mue -a`, single-line sources):
+
+```
+source      clone emits          correct (8086)
+push cs     06 0F 01             0E
+pop  es     07                   07
+push ds     06 0F 03             1E
+pop  ds     07 0F 03             1F
+push es     06                   06
+pop  cs     07 0F 01             0F
+push ss     06 0F 02             16
+pop  ss     07 0F 02             17
+```
+
+Only the ES forms come out right, by accident: `ES` is index 0, so the
+`if (d.reg)` guard below skips the bogus tail for it. Everything else is
+one byte too long.
+
+Consequence: `examples\int10_13.asm` assembles "successfully" but its first two
+instructions become `push es` + `pop cs`, so it halts immediately - `mue` reports
+`instructions executed: 0`, `IP=0101`. The same applies to any DOS program using
+this idiom, which is most of them.
+
+**Root cause (CONFIRMED).** `src/asm_main.c`, push/pop arm:
+
+```c
+if (d.kind == OP_SREG) {
+    emit8(a, (uint8_t)(ispop ? 0x07 : 0x06));
+    if (d.reg) { emit8(a, 0x0F); emit8(a, (uint8_t)d.reg); }  /* cs/ds/ss */
+    return 1;
+}
+```
+
+The 8086 encodes all eight forms as one byte, `(ispop ? 0x07 : 0x06) + (sreg << 3)`,
+with ES=0, CS=1, SS=2, DS=3. That is exactly the numbering the parser already
+produces: `SR[4] = { "es","cs","ss","ds" }` and `sreg_index()` returns the index
+into it. So the fix is to drop the trailing `0x0F` pair and fold the index into
+the opcode; `0x0F` is not part of any 8086 form (it is `POP CS` on the 8086 and
+the 386 escape prefix).
+
+**Why the gate misses it (CONFIRMED, negative).** No fixture under
+`C:\emu8086\MyBuild` uses push/pop of a segment register - `grep -i "push *\(cs\|ds\|es\|ss\)" *.~asm` returns nothing. The 46/46 `.list` comparison and the
+44/44 byte round-trip therefore never cover it, and `check_examples.py` only
+asserts that a source assembles, not that the bytes are right. A one-line
+fixture would close that hole.
+
+**Workaround used by the new INT 10h regression:** set ES with `mov ax,cs` /
+`mov es,ax` (that path is encoded correctly) instead of `push cs` / `pop es`.
