@@ -648,3 +648,48 @@ references `??l0003` while the label was defined as `??l0000`.
 - emu8086 examples assembling: **79 / 85** (was 74)
 - `examples\include.asm` runs correctly and prints its banner through the
   emu8086.inc `putc` / `printn` / `print_string` macros.
+
+## 14. THREE OPERAND/BRANCH GAPS CLOSED (CONFIRMED)
+
+All 85 shipped examples now assemble. Each gap was reproduced in a three-line
+file before being fixed, and each fix was checked against emu8086's own
+documentation or listings rather than invented.
+
+**1. Far `jmp seg:off` / `call seg:off`.** `eval_expr` rejected `0ffffh:0000h`
+because a colon is not an operator. `:` is now recognised first and emits `EA`
+(jmp far) / `9A` (call far) with *offset then segment* — the order that starts
+with the offset, not the segment.
+
+**2. Bare `label+n` without brackets** (`lea si, buf + 2`). The operand parser
+tested the *whole* operand text against a label name, and `"buf + 2"` is not a
+label, so it fell through to OP_IMM. It now matches the leading identifier, but
+only when the remainder is a pure +/- displacement: `count*2` must stay an
+immediate. Getting this wrong once cost four previously-working programs
+(Calculator, float, matrix, timer), so the "pure displacement" restriction is
+load-bearing, not defensive.
+
+**3. `JCXZ` beyond +-127 bytes.** emu8086 documents its own expansion in
+`examples\writebin.asm` ("this instruction is assembled into OR CX, CX and two
+JMPs") and `asm_tutorial_07.html` gives the equivalence `JCXZ = OR CX,CX and
+JNZ`. The rewrite is 8 bytes and target-independent:
+
+    OR  CX, CX        0B C9     ZF = (CX == 0)
+    JNZ short $+3     75 03     skip the jump when CX != 0
+    JMP target        E9 lo hi  reached only when CX == 0
+
+The condition must be **JNZ, not JZ**: with JZ the jump is taken on both paths.
+That inversion was written, looked plausible, and was only caught by running a
+program with CX=5 and CX=0 and checking AL — the encoding was right in shape
+and wrong in sense. Sizing cannot defer the displacement here either, because
+there is no separate emit pass any more; a "sizing placeholder" of 0 would be
+what finally ships.
+
+Only JCXZ has a documented rewrite. An over-long LOOP/LOOPE/LOOPNE still
+reports `target too far` rather than receiving invented bytes; no shipped
+source exercises one.
+
+### Validation state
+- MZ/COM round-trip vs real emu8086 binaries: **44 / 44 byte-exact**
+- `.list` per-byte assembler comparison: **46 / 46 pass**
+- CPU self-test: **ALL PASS (0 failures)**
+- emu8086 examples: **85 / 85 assemble**

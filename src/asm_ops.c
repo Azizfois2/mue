@@ -234,10 +234,33 @@ int parse_operand(asm_t *a, const char *text, operand_t *op)
         int ok;
         int v = eval_expr(a, rest, &ok);
         if (ok) {
-            /* a plain code/data label used alone is a memory operand,
-             * but an "equ" constant is a value */
-            label_t *l = find_label(a, rest);
-            if (l && l->size >= 0) {
+            /* A symbol used alone is a memory operand, but an "equ" constant
+             * and an immediate expression are values.  `rest` may carry a
+             * displacement ("buf+2"), so match its leading identifier --
+             * but only when the operand is exactly that symbol plus a
+             * displacement, never for a plain arithmetic expression. */
+            char lead[256];
+            size_t k = 0;
+            while (rest[k] && (isalnum((unsigned char)rest[k]) || rest[k] == '_' ||
+                               rest[k] == '@' || rest[k] == '$' || rest[k] == '?') &&
+                   k < sizeof(lead) - 1)
+                lead[k] = rest[k], k++;
+            lead[k] = 0;
+
+            label_t *l = k ? find_label(a, lead) : NULL;
+            /* Only treat it as an address when the rest of the operand is a
+             * pure +/- displacement.  "count*2" must stay an immediate. */
+            int only_disp = 0;
+            if (l) {
+                const char *q = rest + k;
+                only_disp = 1;
+                while (*q) {
+                    if (isspace((unsigned char)*q) || *q == '+' || *q == '-' ||
+                        isalnum((unsigned char)*q) || *q == '_') q++;
+                    else { only_disp = 0; break; }
+                }
+            }
+            if (l && l->size >= 0 && only_disp) {
                 op->kind = OP_MEM;
                 op->disp = v;
                 op->has_disp = 1;

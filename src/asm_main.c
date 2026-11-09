@@ -94,6 +94,29 @@ static void emit_seg_prefix(asm_t *a, const operand_t *op)
 }
 
 /* ---- ModRM + displacement ------------------------------------------- */
+
+/* Does this operand text begin with a defined label name?
+ *
+ * Operands like "buf+2" or "str - 1" are not label names themselves, so a
+ * plain find_label() on the whole string misses them.  Returns the label when
+ * the leading identifier names one, NULL otherwise.
+ */
+static label_t *starts_with_label(asm_t *a, const char *text)
+{
+    char lead[256];
+    size_t k = 0;
+    if (!text) return NULL;
+    while (isspace((unsigned char)*text)) text++;
+    while (text[k] && (isalnum((unsigned char)text[k]) || text[k] == '_' ||
+                       text[k] == '@' || text[k] == '$' || text[k] == '?') &&
+           k < sizeof(lead) - 1)
+        lead[k] = text[k], k++;
+    lead[k] = 0;
+    if (!k) return NULL;
+    lower_str(lead);
+    return find_label(a, lead);
+}
+
 static int emit_modrm(asm_t *a, const operand_t *rm, int regf, int w)
 {
     int b[8], n = 0;
@@ -423,6 +446,38 @@ static int encode_insn(asm_t *a, const char *mnem_in, char **ops, int nops)
     if (!strcmp(m, "jmp") || !strcmp(m, "call")) {
         int ok, v;
         if (nops != 1) { asm_error(a, "%s needs one target", m); return 0; }
+
+        /* far jump/call: `jmp seg:off` / `call seg:off` -> EA/9A, offset then
+         * segment.  A COLON is not an operator, so this must be recognised
+         * before eval_expr() tries to evaluate the operand. */
+        {
+            const char *colon = strchr(ops[0], ':');
+            if (colon) {
+                char segpart[128];
+                int okc, okd;
+                size_t sl = (size_t)(colon - ops[0]);
+                uint16_t segv, offv;
+                if (sl >= sizeof(segpart)) sl = sizeof(segpart) - 1;
+                memcpy(segpart, ops[0], sl);
+                segpart[sl] = 0;
+                segv = (uint16_t)eval_expr(a, segpart, &okc);
+                offv = (uint16_t)eval_expr(a, colon + 1, &okd);
+                if (!okc || !okd) {
+                    if (a->sizing) {
+                        emit8(a, (uint8_t)(m[0] == 'c' ? 0x9A : 0xEA));
+                        emit16(a, 0); emit16(a, 0);
+                        return 1;
+                    }
+                    asm_error(a, "bad far target '%s'", ops[0]);
+                    return 0;
+                }
+                emit8(a, (uint8_t)(m[0] == 'c' ? 0x9A : 0xEA));
+                emit16(a, offv);
+                emit16(a, segv);
+                return 1;
+            }
+        }
+
         v = eval_expr(a, ops[0], &ok);
         if (!ok) {
             operand_t t;
@@ -468,7 +523,42 @@ static int encode_insn(asm_t *a, const char *mnem_in, char **ops, int nops)
             return 0;
         }
         d16 = v - (a->ip + 2);
-        if (d16 < -128 || d16 > 127) { asm_error(a, "loop out of range"); return 0; }
+        if (d16 < -128 || d16 > 127) {
+            /* The rel8 forms only reach +-127 bytes.  emu8086 documents the
+             * rewrite it uses for an over-long JCXZ -- its own writebin.asm
+             * says "this instruction is assembled into OR CX, CX and two
+             * JMPs", and asm_tutorial_07.html gives the equivalence
+             * "JCXZ = OR CX,CX and JNZ".  So emit:
+             *
+             *     OR  CX, CX          2 bytes, ZF = (CX == 0)
+             *     JNZ short $+3       2 bytes, skip the jump when CX != 0
+             *     JMP target          3 bytes, reached only when CX == 0
+             *
+             * That is exactly "jump to target when CX is zero" and is 8 bytes
+             * wide, so it is stable across sizing passes.  The condition must
+             * be JNZ: with JZ the jump would be taken on both paths.
+             *
+             * Only JCXZ has a documented rewrite; an over-long LOOP/
+             * LOOPE/LOOPNE has no published expansion and no shipped listing
+             * exercises one, so those keep reporting the problem rather than
+             * receiving invented bytes. */
+            if (oc == 0xE3) {                       /* jcxz */
+                int jd;
+                /* Fixed 8-byte rewrite: or cx,cx (2) / jnz +3 (2) / jmp (3).
+                 * The width does not depend on the target, so the real
+                 * displacement can be written immediately -- there is no
+                 * separate emit pass, so a "sizing" placeholder would be
+                 * what finally ships. */
+                emit8(a, 0x0B); emit8(a, 0xC9);         /* or  cx,cx  (ZF=1 iff CX==0) */
+                emit8(a, 0x75); emit8(a, 0x03);         /* jnz short +3: skip jmp */
+                jd = v - (a->ip + 3);                   /* jmp is 3 bytes */
+                emit8(a, 0xE9);
+                emit16(a, (uint16_t)jd);
+                return 1;
+            }
+            asm_error(a, "%s target too far (%d bytes, limit 127)", m, d16);
+            return 0;
+        }
         emit8(a, oc);
         emit8(a, (uint8_t)(d16 & 0xFF));
         return 1;
@@ -512,12 +602,13 @@ static int encode_insn(asm_t *a, const char *mnem_in, char **ops, int nops)
         if (nops != 2) { asm_error(a, "lea needs 2 operands"); return 0; }
         if (!parse_operand(a, ops[0], &d) || !parse_operand(a, ops[1], &s)) return 0;
         if (!is_reg(&d)) { asm_error(a, "lea needs a register destination"); return 0; }
-        /* "lea reg, symbol" uses the symbol's address; emu8086 folds it
-         * into a plain immediate move */
-        if (find_label(a, ops[1])) {
+        /* "lea reg, symbol" (or "symbol+d") uses the symbol's address;
+         * emu8086 folds it into a plain immediate move.  The operand text is
+         * not usually a bare label name, so match on its leading identifier. */
+        if (s.kind == OP_MEM || starts_with_label(a, ops[1])) {
             int ok2, lv = eval_expr(a, ops[1], &ok2);
-            if (ok2 || s.kind == OP_IMM) {
-                int val = ok2 ? lv : s.imm;
+            if (ok2) {
+                int val = lv;
                 emit8(a, (uint8_t)((d.size == 8 ? 0xB0 : 0xB8) + d.reg));
                 if (d.size == 8) emit8(a, (uint8_t)val); else emit16(a, (uint16_t)val);
                 return 1;

@@ -20,8 +20,8 @@ BASE = "C:/emu8086/examples"
 MUE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mue.exe")
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--min", type=int, default=79,
-                help="fail if fewer than this many programs assemble (default 79)")
+ap.add_argument("--min", type=int, default=85,
+                help="fail if fewer than this many programs assemble (default 85)")
 ap.add_argument("-v", "--verbose", action="store_true",
                 help="list each failing program and its error")
 args = ap.parse_args()
