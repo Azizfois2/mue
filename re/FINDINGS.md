@@ -451,11 +451,72 @@ references (`re/methods_dump.txt`, `re/owners.py`).
 | `0x52AE10` | 407 | emulator state (variant) | `"emulator.state"` |
 | `0x5457C0` | 599 | FPU emulation | `"FPU ERROR: "` |
 | `0x547EC0` | 606 | FPU step-back | `"CRITICAL ERROR 2:"` |
-| `0x559…` | — | INT dispatchers | `"INT 21h, AH=09h - "`, `"INT 10h, AH=0"`, `"INT 16h, AH=0"` |
-| `0x585…` | — | INT 21h file system | `"OPEN_VIRTUAL_FILE:"`, `"SEEK_VIRTUAL_FILE:"` |
-| `0x5856…` | — | INT 21h 4Ah/48h/49h memory | `"Allocate Memory Block OK"` |
+| `0x51FF60` | 405 | **INT dispatcher** (INT 04/10/11/12/13/15/16/17/1A/19/20/21/33 + fall-through) | 13-entry INT chain then per-INT AH chain on field `+0xBB`; see s5.1 |
+| `0x56BEC0`+ | ~700s | video helpers | `draw_char_to_video_memory` (`0x44AA2C`), `unsupported video mode:` (`0x44AB08` at `0x56CA11`) |
+| `0x5DDF80`/`0x5DED70`/`0x5DF2D0` | 1237/1242/1243 | INT 21h file ops | create/open, SEEK, rename |
+| `0x5856`+ | - | INT 21h 4Ah/48h/49h memory | `Allocate Memory Block OK` (`0x458720`) |
 | `0x595…` | — | fasm / MASM bridging | `"assemble_with_fasm"`, `"CHECK_FASM_LOG"` |
 | `0x5A8E30` | 990 | symbol-table writer | `"< THE SYMBOL TABLE >"` |
+
+### 5.1 INT dispatcher internals  (CONFIRMED - Ghidra + objdump + docs)
+
+Single function `FUN_0051FF60`, 43557 bytes, 947 blocks (ranges
+`0x51FF60-0x5235BA/0x5235C0-0x52A938/...`; tail `0x52A934` shared exit).
+Register-field block at `[ebp+8]` (CONFIRMED offsets, reused in every
+handler): `+0xBA`=AL, `+0xBB`=AH, `+0xBC`=BL, `+0xBD`=BH, `+0xBE`=CL,
+`+0xBF`=CH, `+0xC0`=DL, `+0xC1`=DH, `+0xC4`=SI / `+0xCA`=DI (x16 phys),
+`+0x4C`=carry flag word. `0x621218` = global carry mirror,
+`0x621C04` = global file-table guard.
+AH-byte test idiom: `MOV ECX,<AH>; CALL [0x401238] (__vbaUI1I2); CMP
+[ebp-<slot>],AL; JNZ next`.
+
+**INT-number chain** (CONFIRMED order on `[ebp-0x26C]`, jne = fall-through):
+`04 -> 10 -> 11 -> 12 -> 13 -> 15 -> 16 -> 17 -> 1A -> 19 -> 20 -> 21 ->
+33 -> else`. The `else` logs `"this interrupt is not defined yet..."`
+plus `INT %02X`-style templates at `0x447F78/0x44800C/0x448094`.
+
+| INT | AHs tested (in order) | Notes |
+|---|---|---|
+| `04` | - (overflow trap; returns through core) | prologue stub at `0x52000D` (`xor ecx,ecx` = already-zero test) |
+| `10` | `00,01,02,03,05,06,07,08,09,0A,0C,0D,0E,0F,11,13,1003` (AX-full, BL=01 logged via template `0x447714` at `0x52360F`) | `AH=00` body at `0x520666`; `AH=13` ES:BP string loop at `0x522D0E` (`imul esi,esi,0x10` seg x16 + `0x4AD050` variant-to-int, branch-bit `AH&1` via `and cx,1`) |
+| `11` | - | `MOV AX,1` (`0x523B76`: `get_BYTE 0x410/0x411` -> AL `+0xBA` / AH `+0xBB`) |
+| `12` | - | same helper pair (`0x413/0x414`), memory-size AX |
+| `13` | AH=`00` (reset: `WORD [ecx+0x3A]=0xFFFF` at `0x523C76`), `02` (read), `03` (write via `0x4AD050` + phys x16) | fail template `0x447884` at `0x523E99` |
+| `15` | AH=`86` only (BIOS wait; `fmul [0x409828]` delay math) | fail template `0x4478E4` at `0x5245F4` |
+| `16` | AH=`00,01` | kb-buffer OCX vtable sink `+0x750/0x754`; fail template `0x4479B4` at `0x524BDF` |
+| `17` | - | direct `CALL 0x550B40` ("wrong parameter...") |
+| `1A` | AH=`00` (time; `fmul` + `0x4011`-scaled `rtcHexVarFromVar`) | fail template `0x4479D4` at `0x5252EE` |
+| `19` | - | reboot: `[ecx+0x4C]=0xFFFF; [0x621218]=0xFFFF; CALL [eax+0x7AC]` |
+| `20` | - | terminate: same `0x4C/0x621218=0xFFFF` + `[eax+0x7AC]` halt |
+| `21` | 47 AHs: `00,01,02,05,06,07,08,09,0A,0B,0C,0D,0E,17,19,1A,1F,25,2A,2C,2E,30,35,36,39,3A,3B,47,3C,3D,3E,3F,40,41,42,4D,54,56,4C,4E,4F,57,23,33,48,49,4A` | doc lists 27; the other 20 (00,0D,17,1A,1F,23,2E,30,33,36,43,48,49,4A,4D,4E,4F,54,56,57) still have compare-and-handle bodies in the binary; fail template `0x447EB0` at `0x52A2D4`; shared exit `0x52A52A: jmp 0x52A934` |
+| `33` | AX=`0000/0001/0002/0003` (mouse; template `0x453680` `int 33h/AX=0` at `0x5EEFB5/0x5EF1B8`) | else `not supported INT 21h/33h AL=` (`0x448798`); reg-dump block at `0x52A549` pushes fields `+0xBA..+0xC1` |
+
+**INT 21h AH to handler attribution (CONFIRMED call targets):**
+file: `3C,3D->0x5DDF80` (via `0x54A0C0+0x5DC410` EA prologue), `3E->0x5DE530`,
+`3F->[eax+0x76C]`, `40->[edx+0x76C]`, `41->0x5DC410+0x5DEB80`,
+`42->0x5DED70` (SEEK, "allowed values for AL = 0/1/2"), `54->0x5E0870`,
+`56->0x5DF2D0` (rename, via `0x54A0C0+0x5DC410` x2 EA prologue),
+`43->0x5E16C0`, `4E->0x5E25E0`, `4F->0x5E2C20`, `57->0x5E2E50`,
+`23->[eax+0x7C0]` (COM file-size/get-attr), `33(get)->[edx+0xB4C]`,
+`48->0x60A910`, `49->0x60AE30`, `4A->0x60B0B0` (OCX screen/keyboard trio,
+only called from the dispatcher), `0E->0x5DC310`, `17->0x5E33F0`,
+`19->0x5DC390`, `1A->0x5E2170`, `1F->0x5E2300`,
+`0A->0x571280 x3 + 0x4AD050` buffered-input chain.
+`2E/30/36/47-resp.` tails are inline (no CALL). Printer AH=`05` =
+`CALL 0x5E1E70` + vtable sinks; "virtual printer does not respond."
+(`0x452204`) is pushed at `0x5E1FEF` inside it.
+FPU: `0x5457C0` (7212 B, 323 blocks) owns "FPU ERROR: " (`0x4490A0` pushed
+at `0x5474DE` inside `0x547EC0` FPU step-back). Floppy: `0x595E00/0x596370`
+(1011/1091 B, only called from `0x51FF60`) for INT 13h disk paths.
+Video: `0x56BEC0`+ owns `set_VIDEO_MODE` strings; "unsupported video mode:"
+(`0x44AB08`) pushed at `0x56CA11`.
+
+Clone gaps this closes (DESIGN follow-ups, not behaviour changes): none -
+`src/dos.c` already implements every documented AH above. Two open deltas:
+INT 10h AH=`01/02/03/0C/0D` + `08/09/0A` attribute bytes (clone writes chars
+but drops page/attribute; original routes through `frmScreen` OCX + the
+`0x621C04`-guarded helpers), and INT 13h AH=`02/03` real sector I/O (clone
+returns success without touching `FLOPPY_0`).
 
 ### Supporting native routines  (CONFIRMED addresses)
 
