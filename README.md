@@ -5,14 +5,31 @@ reverse engineering (see `re/FINDINGS.md`, `re/CPU_SPEC.md`).
 
 ## Build
 
+    make                # -> src/mue.exe
+
+(MinGW ships GNU make as `mingw32-make`; that name works too.) Without make:
+
     cd src
     gcc -O2 -Wall -Wno-unused-parameter -I. -o mue.exe \
         main.c exec.c mem.c alu.c io.c dos.c asm_main.c asm_sup.c asm_ops.c exe.c
 
-Optional CPU self-test:
+## Test
 
-    gcc -O2 -I. -o test_cpu.exe test_cpu.c exec.c mem.c alu.c io.c dos.c
-    ./test_cpu.exe          # -> ALL PASS (0 failures)
+One command runs every check and exits non-zero if any of them regresses:
+
+    make test
+
+It performs three independent checks, in order:
+
+1. **CPU self-test** (`src/test_cpu.c`) — flags, stack, call/ret, loop, mul/div.
+2. **Assembler vs emu8086 `.list` listings** (`src/check_asm.py`) — every emitted
+   byte compared at the offset the listing reports.
+3. **Byte round-trip** (`src/check_roundtrip.py`) — reassemble emu8086's own
+   shipped sources and require the output to be byte-identical to the binaries
+   emu8086 itself produced, MZ EXE header included.
+
+Checks 2 and 3 read fixtures from `C:\emu8086`, so they need emu8086 installed;
+`make` alone never touches it.
 
 ## Use
 

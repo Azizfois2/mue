@@ -1211,9 +1211,15 @@ static int resolve_include(const char *name, const char *cur_dir, char *out, int
     FILE *f;
 
     for (i = 0; dirs[i]; i++) {
-        if (i == 0) snprintf(out, outsz, "%s", name);
-        else if (i == 1 && cur_dir && *cur_dir) snprintf(out, outsz, "%s/%s", cur_dir, name);
-        else snprintf(out, outsz, "%s/%s", dirs[i], name);
+        /* cur_dir can be as long as out, so build "dir/name" with an explicit
+         * precision: a plain "%s/%s" could overflow silently. */
+        int n;
+        if (i == 0) n = snprintf(out, outsz, "%s", name);
+        else if (i == 1 && cur_dir && *cur_dir)
+            n = snprintf(out, outsz, "%.*s/%s", outsz - (int)strlen(name) - 2,
+                         cur_dir, name);
+        else n = snprintf(out, outsz, "%s/%s", dirs[i], name);
+        if (n < 0 || n >= outsz) continue;      /* too long for this search */
         f = fopen(out, "r");
         if (f) { fclose(f); return 1; }
     }

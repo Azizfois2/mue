@@ -3,7 +3,7 @@
 The .list files truncate long data lines, so every byte is compared at the
 location the listing reports rather than by naive concatenation.
 """
-import re, subprocess, os, glob
+import re, subprocess, os, glob, sys
 
 base = "C:/emu8086/MyBuild"
 ok = fail = skip = 0
@@ -82,3 +82,5 @@ for lst in sorted(glob.glob(base + "/*.list")):
 print("PASS %d  FAIL %d  SKIP %d" % (ok, fail, skip))
 for n, m in fails[:16]:
     print("  %s: %s" % (n, m))
+
+sys.exit(1 if fail else 0)
