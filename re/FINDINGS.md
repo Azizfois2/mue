@@ -14,6 +14,16 @@ GNU objdump (MinGW), Python static parsing.
 > **byte-level static parsing I performed myself**. Decompiled-source evidence
 > is therefore absent; every claim is labelled CONFIRMED or INFERRED.
 
+**Scope and intent.** This document records *where* things are in the original
+binary so that a replacement can reproduce its observable behaviour, which is
+what interoperability research requires. It contains no decompiled source, no
+copied code, and no bulk string or byte dumps: the quoted strings are short
+diagnostic messages used as evidence that a routine does what it is claimed to
+do, and the pseudo-code is my own notation describing observed effects, not the
+original's implementation. The full disassembly and raw string/address extracts
+are deliberately *not* published (see `re/.gitignore`); regenerate them locally
+from your own licensed copy if you want to verify a claim.
+
 ---
 
 ## 1. File and image structure  (CONFIRMED)

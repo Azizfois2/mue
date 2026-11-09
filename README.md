@@ -1,7 +1,14 @@
 # mue — clean-room 8086 assembler + emulator
 
-A behaviour-compatible reimplementation of `emu8086.exe`, derived by static
-reverse engineering (see `re/FINDINGS.md`, `re/CPU_SPEC.md`).
+A behaviour-compatible reimplementation of `emu8086.exe` (the 8086
+assembler and emulator by Yuri Starodubtcev), written from scratch in C by
+observing the original's external behaviour. See `re/FINDINGS.md` and
+`re/CPU_SPEC.md` for the analysis, with every claim labelled CONFIRMED,
+INFERRED or DESIGN.
+
+This is an independent project. It is not affiliated with, endorsed by, or
+supported by the authors of emu8086. The name is used only to say what the
+program is compatible with.
 
 ## Build
 
@@ -70,5 +77,13 @@ emu8086 itself produced next to it (`*.bin_`, `*.com_`, `*.exe_`):
 
 CPU self-test (`test_cpu.exe`): ALL PASS (0 failures).
 
-`C:\emu8086\Examples\*.asm`: 79 of 85 assemble (the rest use source-level
-features such as `include` that are not yet implemented).
+`make examples`: all 85 programs in `C:\emu8086\Examples` assemble.
+
+## Licence
+
+MIT — see `LICENSE`. You may use, modify and redistribute this code freely,
+including commercially, provided the copyright notice is retained.
+
+`emu8086` itself is a separate, proprietary product with its own licence; none
+of its code is included here. This project only reproduces its observable
+behaviour and output format.
