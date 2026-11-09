@@ -21,8 +21,11 @@ MUE = [os.path.join(HERE, "mue.exe"), os.path.join(HERE, "mue"),
        os.path.join(HERE, "..", "mue.exe"), os.path.join(HERE, "..", "mue")]
 
 PROLOG = "org 100h\nmov ax,cs\nmov es,ax\n"
-EPILOG = ("mov ah,0eh\nmov al,'|'\nint 10h\n"      # marker, and it clobbers AX
-          "mov ah,03h\nmov bh,0\nint 10h\n"        # cursor -> DX
+# Read the cursor before printing the marker: AH=0Eh advances it too, so the
+# marker would otherwise add a column to what the check measures.  AH=0Eh does
+# not touch DX, so the position survives for the dump.
+EPILOG = ("mov ah,03h\nmov bh,0\nint 10h\n"        # cursor -> DX
+          "mov ah,0eh\nmov al,'|'\nint 10h\n"      # marker
           "ret\n")
 
 
@@ -124,7 +127,22 @@ def main():
     dx = reg(out, "DX")
     check("noadv-keeps-cursor", dx == 0x0505, hex(dx) if dx is not None else None)
 
-    # 4. AH=02 sets the cursor, AH=03 reads it back.
+    # 4. AH=0Eh teletype moves the cursor: printable advances one column,
+    # CR returns to column 0, LF drops a row.
+    rc, out = run(mue, "mov ah,02h\nmov bh,0\nmov dx,0205h\nint 10h\n"
+                       "mov ah,0eh\nmov al,'a'\nint 10h\n"
+                       "mov ah,0eh\nmov al,'b'\nint 10h\n"
+                       "mov ah,03h\nint 10h\nret\n")
+    dx = reg(out, "DX")
+    check("teletype-advances", dx == 0x0207, hex(dx) if dx is not None else None)
+    rc, out = run(mue, "mov ah,02h\nmov bh,0\nmov dx,0240h\nint 10h\n"
+                       "mov ah,0eh\nmov al,0dh\nint 10h\n"
+                       "mov ah,0eh\nmov al,0ah\nint 10h\n"
+                       "mov ah,03h\nint 10h\nret\n")
+    dx = reg(out, "DX")
+    check("teletype-cr-lf", dx == 0x0300, hex(dx) if dx is not None else None)
+
+    # 5. AH=02 sets the cursor, AH=03 reads it back.
     rc, out = run(mue, "mov ah,02h\nmov bh,0\nmov dx,0a14h\nint 10h\n"
                        "mov ah,03h\nmov bh,0\nint 10h\nret\n")
     dx = reg(out, "DX")
@@ -132,7 +150,7 @@ def main():
     check("set-read-cursor", dx == 0x0A14, hex(dx) if dx is not None else None)
     check("read-cursor-shape", cx == 0x0607, hex(cx) if cx is not None else None)
 
-    # 5. CX above 0x7D0 is refused and halts, as the original does
+    # 6. CX above 0x7D0 is refused and halts, as the original does
     # (0x522F70 -> log + [obj+0x7AC] halt).  Nothing is written, and the
     # marker after the call never runs.
     rc, out = run(mue, PROLOG +

@@ -48,6 +48,9 @@ test: $(BIN) $(TBIN)
 	@echo "== CPU self-test =="
 	@cd src && ./test_cpu$(EXE)
 	@echo
+	@echo "== assembler encodings (no fixtures needed) =="
+	@cd src && "$(PYTHON)" check_enc.py
+	@echo
 	@echo "== assembler vs emu8086 .list listings =="
 	@cd src && $(SKIPOK) "$(PYTHON)" check_asm.py
 	@echo

@@ -425,6 +425,23 @@ H(ps4, push_r16(SP)); H(ps5, push_r16(BP)); H(ps6, push_r16(SI)); H(ps7, push_r1
 H(po0, pop_r16(AX));  H(po1, pop_r16(CX));  H(po2, pop_r16(DX));  H(po3, pop_r16(BX));
 H(po4, pop_r16(SP));  H(po5, pop_r16(BP));  H(po6, pop_r16(SI));  H(po7, pop_r16(DI));
 
+/* 06/07/0E/16/17/1E/1F PUSH/POP segment register.  The original tests these
+ * as individual opcodes (0x5022C4 = 06, 0x5022FD = 16, 0x502337 = 1F) and
+ * routes them through the same push16/pop16 slots as the general forms
+ * (FINDINGS 16). */
+static void push_sr(int s) { push16(cpu.sr[s]); }
+static void pop_sr (int s) { sr_set(s, pop16()); }
+H(s06, push_sr(ES));
+H(s07, pop_sr(ES));
+H(s0e, push_sr(CS));
+H(s16, push_sr(SS));
+H(s17, pop_sr(SS));
+H(s1e, push_sr(DS));
+H(s1f, pop_sr(DS));
+/* 0F is POP CS on the 8086 (it is not a prefix there), so the fetch pointer
+ * has to follow the new CS, like every other control transfer. */
+H(s0f, { sr_set(CS, pop16()); cpu.phys = seg_off_to_phys(cpu.sr[CS], cpu.ip); });
+
 /* 60-6F : 80186+ forms, rejected to match the original */
 #define REJECT_80186(n) static void h_##n(void) { cpu.halted = 1; cpu.exit_code = -2; }
 REJECT_80186(60) REJECT_80186(61) REJECT_80186(62) REJECT_80186(63)
@@ -751,6 +768,9 @@ static void op_table_init(void)
     SET(0x54, ps4); SET(0x55, ps5); SET(0x56, ps6); SET(0x57, ps7);
     SET(0x58, po0); SET(0x59, po1); SET(0x5a, po2); SET(0x5b, po3);
     SET(0x5c, po4); SET(0x5d, po5); SET(0x5e, po6); SET(0x5f, po7);
+
+    SET(0x06, s06); SET(0x07, s07); SET(0x0e, s0e); SET(0x0f, s0f);
+    SET(0x16, s16); SET(0x17, s17); SET(0x1e, s1e); SET(0x1f, s1f);
 
     { int i;
       for (i = 0x60; i <= 0x6f; i++) OP[i] = h_60 + (i - 0x60); }

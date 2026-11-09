@@ -699,8 +699,10 @@ static int encode_insn(asm_t *a, const char *mnem_in, char **ops, int nops)
             return 1;
         }
         if (d.kind == OP_SREG) {
-            emit8(a, (uint8_t)(ispop ? 0x07 : 0x06));
-            if (d.reg) { emit8(a, 0x0F); emit8(a, (uint8_t)d.reg); }  /* cs/ds/ss */
+            /* One byte for all eight forms: 06/07 ES, 0E/0F CS, 16/17 SS,
+             * 1E/1F DS.  SR[] is already in that order, so the index folds
+             * into the opcode (FINDINGS 16). */
+            emit8(a, (uint8_t)((ispop ? 0x07 : 0x06) + (d.reg << 3)));
             return 1;
         }
         if (d.kind == OP_IMM) {

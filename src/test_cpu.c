@@ -42,6 +42,26 @@ int main(void){
     chk("push/pop ax",cpu.r[AX],0x1234);
     chk("  sp",cpu.r[SP],0xFFF0);
 
+    /* push/pop segment register: 06/07 ES, 0E/0F CS, 16/17 SS, 1E/1F DS */
+    run((uint8_t[]){0x06,0x5B,0xF4},3);              /* push es ; pop bx */
+    chk("push es; pop bx",cpu.r[BX],0x0100);
+    chk("  sp restored",cpu.r[SP],0xFFF0);
+    run((uint8_t[]){0x0E,0x58,0xF4},3);              /* push cs ; pop ax */
+    chk("push cs; pop ax",cpu.r[AX],0x0100);
+    run((uint8_t[]){0x16,0x59,0xF4},3);              /* push ss ; pop cx */
+    chk("push ss; pop cx",cpu.r[CX],0x0100);
+    run((uint8_t[]){0x1E,0x5A,0xF4},3);              /* push ds ; pop dx */
+    chk("push ds; pop dx",cpu.r[DX],0x0100);
+    run((uint8_t[]){0xB8,0x00,0x20,0x50,0x1F,0xF4},6);   /* mov ax,2000 ; push ax ; pop ds */
+    chk("pop ds",cpu.sr[DS],0x2000);
+    run((uint8_t[]){0xB8,0x00,0x20,0x50,0x07,0xF4},6);   /* pop es */
+    chk("pop es",cpu.sr[ES],0x2000);
+    run((uint8_t[]){0xB8,0x00,0x20,0x50,0x17,0xF4},6);   /* pop ss */
+    chk("pop ss",cpu.sr[SS],0x2000);
+    run((uint8_t[]){0xB8,0x00,0x20,0x50,0x0F,0xF4},6);   /* pop cs */
+    chk("pop cs",cpu.sr[CS],0x2000);
+    chk("  phys follows cs",cpu.phys,(uint32_t)(0x2000<<4)+cpu.ip);
+
     /* call: E8 disp; target = ip_after + disp ; want 0104 => disp = 0 */
     run((uint8_t[]){0xE8,0x00,0x00,0xB8,0x77,0x00,0xF4},7);
     chk("call near self+0 -> mov ax,77",cpu.r[AX],0x0077);

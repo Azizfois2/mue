@@ -466,13 +466,14 @@ Register-field block at `[ebp+8]` (CONFIRMED offsets, reused in every
 handler): `+0xBA`=AL, `+0xBB`=AH, `+0xBC`=BL, `+0xBD`=BH, `+0xBE`=CL,
 `+0xBF`=CH, `+0xC0`=DL, `+0xC1`=DH, `+0x4C`=carry flag word.
 
-**High-register / segment fields (CORRECTED this pass; an earlier revision of
-this table said `+0xC4`=SI and `+0xCA`=DI, which is wrong):**
-`+0xC4`=**ES**, `+0xC6`=**SI**, `+0xC8`=**DI**, `+0xCA`=**BP**, `+0xCC`=CS,
-`+0xCE`=IP. Evidence is section 15.1: the `A4`/`A5` (MOVS) arm reads its
-*source* through `+0xC6` and writes its *destination* through
-`+0xC4 x16 + +0xC8`, and the INT 10h AH=13h arm physicalises its documented
-`ES:BP` source as `+0xC4 x16 + +0xCA`. `0x621218` = global carry mirror,
+**High-register / segment fields (CORRECTED; an earlier revision of this table
+said `+0xC4`=SI and `+0xCA`=DI, which is wrong):**
+`+0xC2`=**DS**, `+0xC4`=**ES**, `+0xC6`=**SI**, `+0xC8`=**DI**, `+0xCA`=**BP**,
+`+0xCC`=CS, `+0xCE`=IP, `+0xD0`=**SS**. Evidence is section 15.1 (the `A4`/`A5`
+MOVS arm reads its *source* through `+0xC6` and writes its *destination*
+through `+0xC4 x16 + +0xC8`; INT 10h AH=13h physicalises its documented `ES:BP`
+source as `+0xC4 x16 + +0xCA`) and section 16.2 for DS/SS (`0x06` pushes
+`+0xC4`, `0x16` pushes `+0xD0`, `0x1F` pops into `+0xC2`). `0x621218` = global carry mirror,
 `0x621C04` = global file-table guard.
 AH-byte test idiom: `MOV ECX,<AH>; CALL [0x401238] (__vbaUI1I2); CMP
 [ebp-<slot>],AL; JNZ next`.
@@ -575,17 +576,21 @@ AH=02/AH=03 round trip, CX limit), wired into `make test`. Verified to bite:
 forcing the pairs skip off and the advance unconditional makes exactly the
 three affected checks fail.
 
-Remaining differences, all deliberate:
+Remaining differences, and why they are not defects:
 
-- BL's attribute and page BH are ignored (single console, mode 3 only).
+- BL's attribute and page BH produce no observable effect in a single-console
+  clone: attributes cannot be rendered and there is only page 0. They are
+  accepted and ignored, which is the only faithful option here.
 - Wrapping at 80 columns / 25 rows is the clone's choice: the real wrap and
-  scroll belong to the `frmScreen` OCX, which was not decoded.
+  scroll belong to the `frmScreen` OCX, which was not decoded. It matches the
+  80x25 the clone already reports from AH=0F and uses in AH=06/07.
 - The per-iteration `p_src > 0x10FFF1` guard (`0x5230EE`, "CX is out of
-  memory") is unreachable here - `seg_off_to_phys()` masks to 20 bits, so the
-  pointer can never exceed 0xFFFFF. Implemented as absent, not silently
-  approximated.
-- AH=0Eh teletype still does not move the modelled cursor; only AH=13h
-  advances it. Pre-existing, separate from this gap.
+  memory") is dead code in the **original** too: `p_src` is at most
+  `0xFFFF*16 + 0xFFFF = 0x10FFEF`, which never exceeds `0x10FFF1`. Omitting it
+  is behaviour-identical, so there is nothing to implement.
+- AH=0Eh teletype now moves the modelled cursor as well (printable advances a
+  column, CR to column 0, LF down a row, BS back one), so AH=03 stays coherent
+  wherever a guest looks. Covered by `teletype-advances` / `teletype-cr-lf`.
 
 ### 5.3 INT 13h AH=00/02/03 floppy sector I/O  (CONFIRMED - objdump + file stat)
 
@@ -1121,14 +1126,17 @@ Consequences for the clone (`src/dos.c`):
 guest: it must not depend on persistence that the clone does not implement,
 and it now fails correctly if the clone's head decode regresses (see 5.6).
 
-## 16. OPEN DEFECT FOUND: `push`/`pop` of a segment register (NOT fixed)
+## 16. `push`/`pop` of a segment register: encoder + missing opcodes (FIXED)
 
 Found while validating 5.2 against the shipped `examples\int10_13.asm`, which
-starts with the standard `push cs` / `pop es` idiom. Not fixed here: it is a
-separate assembler defect, outside the INT 10h change.
+starts with the standard `push cs` / `pop es` idiom. The defect had two halves
+- a wrong encoding in the assembler and no handlers at all in the CPU - and
+both are now fixed and covered.
 
-**Symptom (CONFIRMED).** `push cs` is emitted as three bytes, and the register
-index leaks into the stream:
+### 16.1 The encoder half: symptom, cause, fix
+
+**Symptom (CONFIRMED).** `push cs` was emitted as three bytes and the register
+index leaked into the instruction stream:
 
 Measured one instruction per assembly (`mue -a`, single-line sources):
 
@@ -1166,15 +1174,60 @@ if (d.kind == OP_SREG) {
 The 8086 encodes all eight forms as one byte, `(ispop ? 0x07 : 0x06) + (sreg << 3)`,
 with ES=0, CS=1, SS=2, DS=3. That is exactly the numbering the parser already
 produces: `SR[4] = { "es","cs","ss","ds" }` and `sreg_index()` returns the index
-into it. So the fix is to drop the trailing `0x0F` pair and fold the index into
-the opcode; `0x0F` is not part of any 8086 form (it is `POP CS` on the 8086 and
-the 386 escape prefix).
+into it. The trailing `0x0F` pair is not part of any 8086 form (0F is `POP CS`
+on the 8086 and the 386 escape prefix).
 
-**Why the gate misses it (CONFIRMED, negative).** No fixture under
+**Fix (applied).** The opcode is now emitted as one byte with the index folded
+in:
+
+```c
+emit8(a, (uint8_t)((ispop ? 0x07 : 0x06) + (d.reg << 3)));
+```
+
+### 16.2 The CPU half: no handlers for these opcodes at all
+
+The assembler fix alone was not enough - `0x06/07/0E/0F/16/17/1E/1F` were
+absent from the emulator's dispatch table, so the first byte of
+`int10_13.asm` hit the unknown-opcode funnel. `src/exec.c` now has all eight,
+built on the existing `push16`/`pop16` and `sr_set`:
+
+```c
+static void push_sr(int s) { push16(cpu.sr[s]); }
+static void pop_sr (int s) { sr_set(s, pop16()); }
+```
+
+`0F` (POP CS on the 8086) also recomputes `cpu.phys`, like the other control
+transfers.
+
+The original does the same thing, one opcode at a time, and this is where the
+DS/SS field offsets come from (CONFIRMED, `0x5022C4`-`0x502370`):
+
+| opcode | original | field |
+|---|---|---|
+| `06` PUSH ES | `push &obj+0xC4; call [vtable+0xB40]` | ES = `+0xC4` |
+| `16` PUSH SS | `push &obj+0xD0; call [vtable+0xB40]` | SS = `+0xD0` |
+| `1F` POP DS | `call [vtable+0xB3C]` then `[obj+0xC2] = ax` | DS = `+0xC2` |
+
+`0xB40`/`0xB3C` are the push/pop vtable slots the general `50`-`5F` forms use,
+so segment stack traffic shares their implementation.
+
+**Why the gate missed it (CONFIRMED, negative).** No fixture under
 `C:\emu8086\MyBuild` uses push/pop of a segment register - `grep -i "push *\(cs\|ds\|es\|ss\)" *.~asm` returns nothing. The 46/46 `.list` comparison and the
 44/44 byte round-trip therefore never cover it, and `check_examples.py` only
-asserts that a source assembles, not that the bytes are right. A one-line
-fixture would close that hole.
+asserts that a source assembles, not that the bytes are right.
 
-**Workaround used by the new INT 10h regression:** set ES with `mov ax,cs` /
-`mov es,ax` (that path is encoded correctly) instead of `push cs` / `pop es`.
+**Coverage added.**
+
+- `src/check_enc.py` (new, fixture-free so it also runs where emu8086 is not
+  installed): the eight forms plus the `push cs`/`pop es` prologue, with
+  `mov ax,cs` and `push ax`/`pop bx` as controls that must not change.
+- `src/test_cpu.c`: executes each form and checks the register landed in the
+  segment, that SP is restored, and that POP CS moves the fetch pointer.
+
+**After the fix** `examples\int10_13.asm` runs and prints
+`hello world!<hello world!<`; `make examples` still assembles 85/85; the
+`.list` and round-trip gates stay at 46/46 and 44/44.
+
+**Note for the INT 10h regression:** `src/check_int10.py` sets ES with
+`mov ax,cs` / `mov es,ax`. It could use the prologue now, but either is fine and
+the current form keeps that check independent of the segment push/pop path.

@@ -242,6 +242,16 @@ static void video_putc(int c)
     else dos_putc(c);
 }
 
+/* Move the modelled cursor n columns, wrapping at the mode-3 width. */
+static void cursor_advance_cols(int n)
+{
+    cur_col += n;
+    while (cur_col >= VIDEO_COLS) {
+        cur_col -= VIDEO_COLS;
+        cur_row  = (cur_row + 1) % VIDEO_ROWS;
+    }
+}
+
 /* AH=13h size guard.  The original logs "INT 10h, AH=13h - " + message and
  * then halts through [obj+0x7AC], setting the 0x62141C error flag
  * (0x52301E-0x523079).  Same outcome here: diagnostic, then stop. */
@@ -286,7 +296,16 @@ static void int10(void)
         }
         break;
     case 0x0E:                                  /* teletype output */
-        video_putc(cpu.r[AX] & 0xFF);
+        {
+            int c = cpu.r[AX] & 0xFF;
+            video_putc(c);
+            /* Teletype moves the cursor: CR to column 0, LF down a row, BS
+             * back one column, anything else one column forward. */
+            if (c == 0x0D)                        cur_col = 0;
+            else if (c == 0x0A)                   cur_row = (cur_row + 1) % VIDEO_ROWS;
+            else if (c == 0x08) { if (cur_col > 0) cur_col--; }
+            else                                  cursor_advance_cols(1);
+        }
         break;
     case 0x0F:                                  /* get video mode */
         cpu.r[0] = (uint16_t)((cpu.r[0] & 0x00FF) | (0x03 << 8));
@@ -319,13 +338,7 @@ static void int10(void)
                 video_putc(ch);
                 written++;
             }
-            if (advance) {
-                cur_col += written;
-                while (cur_col >= VIDEO_COLS) {
-                    cur_col -= VIDEO_COLS;
-                    cur_row  = (cur_row + 1) % VIDEO_ROWS;
-                }
-            }
+            if (advance) cursor_advance_cols(written);
         }
         break;
     default:
