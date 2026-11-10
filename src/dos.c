@@ -778,14 +778,15 @@ static void cursor_advance_cols(int n)
     }
 }
 
-/* AH=13h size guard.  The original logs "INT 10h, AH=13h - " + message and
- * then halts through [obj+0x7AC], setting the 0x62141C error flag
- * (0x52301E-0x523079).  Same outcome here: diagnostic, then stop. */
-static void int10_write_string_fail(const char *why)
+/* AH=13h size guard.  The original logs "INT 10h, AH=13h - " + message,
+ * calls [obj+0x7AC], sets the 0x62141C error word and returns through the
+ * dispatcher epilogue (0x522F7D-0x523079, jmp 0x52ABDF).  It never writes
+ * the halt marker ds:0x621218 or the +0x4C halt word, and the run loop at
+ * 0x5A3FCB stops on nothing else, so the guest keeps running: the call is
+ * refused, not fatal.  See FINDINGS 24. */
+static void int10_write_string_reject(const char *why)
 {
     fprintf(stderr, "INT 10h, AH=13h - %s\n", why);
-    cpu.halted = 1;
-    cpu.exit_code = -5;                 /* BIOS call rejected */
 }
 
 static void int10(void)
@@ -871,15 +872,18 @@ static void int10(void)
             uint32_t p  = seg_off_to_phys(cpu.sr[ES], cpu.r[BP]);
             int i, ch, written = 0;
 
-            /* DX is the starting position, as on the real BIOS. */
-            cur_row = (cpu.r[DX] >> 8) & 0xFF;
-            cur_col = cpu.r[DX] & 0xFF;
-
+            /* The size guard is checked before DX is latched, so a refused
+             * call leaves the cursor where it was (the original jumps
+             * straight to the epilogue and never reaches the cursor sink). */
             if (cells > 0x7D0) {                /* FINDINGS 5.2 guard */
-                int10_write_string_fail(
+                int10_write_string_reject(
                     "CX value (string size) is above the allowed limit!");
                 break;
             }
+
+            /* DX is the starting position, as on the real BIOS. */
+            cur_row = (cpu.r[DX] >> 8) & 0xFF;
+            cur_col = cpu.r[DX] & 0xFF;
             for (i = 0; i < cells; i++) {
                 int attr = 0x07;
                 unsigned char *cell;

@@ -206,17 +206,29 @@ def main():
     check("scroll-blanks-cells", bx == 0x0720,
           hex(bx) if bx is not None else None)
 
-    # 8. CX above 0x7D0 is refused and halts, as the original does
-    # (0x522F70 -> log + [obj+0x7AC] halt).  Nothing is written, and the
-    # marker after the call never runs.
+    # 8. CX above 0x7D0 is refused: a diagnostic, nothing written, the cursor
+    # untouched - and execution continues.  The original only logs, calls
+    # [obj+0x7AC] and sets the 0x62141C error word, then returns through the
+    # dispatcher epilogue (0x522F7D-0x523079 -> jmp 0x52ABDF); it never writes
+    # the halt marker ds:0x621218, which is the only thing the run loop
+    # (0x5A3FCB) tests.  FINDINGS 24.
     rc, out = run(mue, PROLOG +
-                  "mov ah,13h\nmov al,1\nmov cx,07d1h\nmov dx,0\n"
-                  "lea bp,msg\nint 10h\n" +
-                  EPILOG + "msg db 'abc'\n")
+                  "mov ah,02h\nmov bh,0\nmov dx,0305h\nint 10h\n"  # park cursor
+                  "mov ah,13h\nmov al,1\nmov cx,07d1h\nmov dx,0a0ah\n"
+                  "lea bp,msg\nint 10h\n"
+                  "mov ah,03h\nmov bh,0\nint 10h\n"      # cursor -> DX
+                  "mov ah,0eh\nmov al,'|'\nint 10h\n"      # marker
+                  "ret\n" +
+                  "msg db 'abc'\n")
     txt = guest_text(out)
-    check("cx-limit-writes-nothing", txt == "", repr(txt))
-    check("cx-limit-halts", rc != 0, rc)
+    check("cx-limit-writes-nothing", txt == "|", repr(txt))
+    check("cx-limit-continues", rc == 0, rc)
     check("cx-limit-diagnostic", "above the allowed limit" in out, repr(out[-200:]))
+    # The refused call must leave the cursor alone: it was parked at 0305h,
+    # and the 0A0Ah in DX must not reach it.
+    dx = reg(out, "DX")
+    check("cx-limit-keeps-cursor", dx == 0x0305,
+          hex(dx) if dx is not None else None)
 
     print("INT10 %s (%d fail)" % ("PASS" if not fails else "FAIL", len(fails)))
     return 1 if fails else 0

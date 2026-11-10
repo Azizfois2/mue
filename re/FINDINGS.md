@@ -570,11 +570,12 @@ behaviour:
 - `AL` bit 0: the cursor advances over exactly the characters written and not
   at all when the bit is clear. Before this change the clone had no cursor at
   all - AH=02 was a no-op and AH=03 always returned 0,0.
-- `CX > 0x7D0` is refused: diagnostic on stderr, then halt with
-  `exit_code = -5`, matching `0x522F70` -> log -> `[obj+0x7AC]` ->
-  `WORD ds:0x62141C = 0xFFFF` (`0x52301E-0x523079`). The clone treats that
-  path as a halt; whether `[obj+0x7AC]` *is* the halt or only the message
-  sink is still open (21.2), so this remains INFERRED.
+- `CX > 0x7D0` is refused: diagnostic on stderr, nothing written, cursor
+  untouched, and execution continues - matching `0x522F70` -> log ->
+  `[obj+0x7AC]` -> `WORD ds:0x62141C = 0xFFFF` (`0x52301E-0x523079`). This
+  section originally claimed a halt with `exit_code = -5`; that was wrong.
+  See 24 for the CONFIRMED reading (`[obj+0x7AC]` is a UI report, and the
+  only halt marker is `ds:0x621218`, which this path never writes).
 
 Regressions: `src/check_int10.py`, 18 checks (advance, pairs, no-advance,
 AH=02/AH=03 round trip, teletype movement, cell reads/writes, scroll, CX
@@ -1485,13 +1486,13 @@ None of these branches writes any other register field, so a guest that does
 interrupt. That is the original's behaviour, and it is why DOS error handling
 "works" in the docs but not here.
 
-**Still open (do not over-claim):** the identity of the sink `[obj+0x7AC]`,
-called by the 3C/3D failure paths and by the INT 10h AH=13h `CX` guard. It has
-62 call sites, takes no arguments beyond `this`, and is reached from
-non-error code as well (`0x4E18DF`), so it may be "stop" or "refresh/notify".
-The unambiguous halt marker is `ds:0x621218 = 0xFFFF` (INT 19/20), and these
-file-error paths do **not** set it. Wherever earlier sections say "halts
-through `[obj+0x7AC]`", read that as INFERRED rather than CONFIRMED.
+**The sink `[obj+0x7AC]` - SETTLED in 24.** It is a VB6 COM method call on
+the project's global object (`__vbaHresultCheckObj(hr, this,
+IID{CB74122D-86F6-4403-89A1-5AB68F733C03}, 0x7AC)`), not a halt: the only
+stop marker is `ds:0x621218` (INT 19/20, run loop), and neither these
+file-error paths nor the INT 10h `CX` guard write it. So a failed INT 21h
+file call reports and returns; the guest keeps running. Wherever earlier
+sections say "halts through `[obj+0x7AC]`", read that as superseded.
 Related: `+0x4C` is a halt word, not the carry flag, correcting the table in
 5.1.
 
@@ -1643,3 +1644,125 @@ returns EOF immediately from `fgetc` (checked with a standalone C probe:
 environment; what the regression pins is the EOF fallback and the peek
 semantics. On a real console the read waits for a line (console input is
 line-buffered, so a key followed by Enter).
+
+## 24. What `[obj+0x7AC]` is, and what the INT 10h CX guard really does (CONFIRMED)
+
+Open since 21.2: the sink called by 60 sites, including the INT 10h AH=13h
+`CX > 0x7D0` guard, "reboot"/"terminate", and the INT 20h/21h failure paths.
+It is **not** a halt. What the binary actually contains:
+
+### 24.1 The call is a VB6 COM method call on the project object
+
+The whole application is **Visual Basic 6**, not C++: the PE entry point is
+`push 0x41AC1C; call [ThunkRTMain]`, the header at `0x41AC1C` starts with the
+`"VB5!"` magic, `wRuntimeBuild = 0x1FF0`, `lpSubMain = 0x4CC150`,
+`lpProjectData = 0x41B5C8`, `wFormCount = 39`, `wExternalCount = 5`,
+`dwThunkCount = 0xE9`, and the project name is `emu8086`. 273 imports come
+from `MSVBVM60.DLL`.
+
+Every `call DWORD PTR [reg+0x7AC]` is therefore the VB6 code generator's
+shape for a virtual call on a class object:
+
+```
+mov edx,[ebp+8]     ; this
+mov eax,[edx]       ; vtable
+mov ecx,[ebp+8]
+push ecx            ; this is the only argument
+call [eax+0x7ac]    ; obj.Method()
+jge ok              ; negative HRESULT -> error
+push 0x7ac          ; vtable offset
+push 0x43a388       ; IID {CB74122D-86F6-4403-89A1-5AB68F733C03}
+push this
+push hr
+call ds:0x4010B0    ; MSVBVM60!__vbaHresultCheckObj
+```
+
+`ds:0x4010B0` is CONFIRMED from the import table (`MSVBVM60.DLL`,
+`__vbaHresultCheckObj`), which is also what identifies the `push <offset>` +
+`push <IID>` + `push pUnk` + `push hr` quartet: it is the runtime's
+"check the HRESULT of the interface method you just called" helper. The same
+IID is used for the `0x7AC` checks at `0x5A3FB7` on the object in the global
+`ds:0x6214D0`, so the callee is a method of the **project's global object**,
+the same object that owns the INT handlers, their register block
+(`+0xB0..+0xC4`), the halt word `+0x4C` and the single-step method
+`[obj+0x7BC]`.
+
+### 24.2 It is not the halt
+
+The run loop (`0x5A3F81`) is:
+
+```
+5A3FAB: call [ecx+0x7bc]        ; one instruction
+5A3FC9: call ebx                ; runtime message pump
+5A3FCB: cmp WORD ds:0x621218,0  ; halt marker
+5A3FD3: jne 0x5A4587            ; -> leave the loop
+```
+
+`ds:0x621218` is the **only** stop condition for the run loop (the other
+look, `0x5A409D`, also tests it; `0x5A40AB` additionally tests
+`ds:0x62123C`, the pause/step flag). Nothing else can stop a run.
+
+Against that, the CX guard block (`0x522F7D-0x523079`) does exactly:
+
+- composes and logs `"INT 10h, AH=13h - "` + `"CX value (string size) is
+  above the allowed limit!"` (`0x447650`),
+- calls `[obj+0x7AC]`,
+- on a negative HRESULT calls `__vbaHresultCheckObj`,
+- writes `WORD ds:0x62141C = 0xFFFF`,
+- `jmp 0x52ABDF`, the dispatcher epilogue (`__vbaFreeObj`-style cleanup at
+  `ds:0x4010E0` then `jmp 0x52AD31`, the VB6 procedure return).
+
+It never writes `ds:0x621218` and never writes the `+0x4C` halt word, so it
+cannot stop the CPU. `ds:0x62141C` cannot do it either: across the whole image
+it is *read* at only three places (`0x525895`, `0x525A9F`, `0x529FE3`), all
+inside the same INT dispatcher method (`0x51FF60`), i.e. it is a
+"a message has already been reported" flag for message composition, not a
+machine state. For comparison, the paths that really do stop the emulator
+write `0x621218` (INT 19h at `0x52557E`, INT 20h at `0x525833`, the run loop
+itself at `0x5A38F2`).
+
+Since `[obj+0x7AC]` is also called from entirely ordinary code (the end of the
+form's initialisation at `0x4E18DF`, right after `this` was constructed and
+before the window is shown), a halt there would abort startup, which settles
+it: **the call is a "report/refresh the UI" step, not the stop**. Its exact
+VB6 name is still unresolved (see 24.4).
+
+### 24.3 Clone delta: the CX guard no longer halts
+
+`src/dos.c` used to treat the guard as fatal (`cpu.halted = 1;
+cpu.exit_code = -5`), which was INFERRED from the (wrong) reading of
+`[obj+0x7AC]`. It now matches the original: the diagnostic goes to stderr and
+execution continues with the next instruction.
+
+The guard was also moved above the `DX` latch. The original only reaches the
+cursor sink `[edx+0x760]` on the success path, so a refused call leaves the
+cursor untouched.
+
+`src/check_int10.py` pins all four properties: `cx-limit-writes-nothing`
+(the only output is the `|` marker printed *after* the call),
+`cx-limit-continues` (exit 0), `cx-limit-diagnostic`, and
+`cx-limit-keeps-cursor` (cursor parked at `0305h`, the refused call's `0A0Ah`
+must not reach it). Both were verified to bite: restoring the halt fails the
+first three, and moving the guard below the `DX` latch fails only
+`cx-limit-keeps-cursor`.
+
+### 24.4 Still open
+
+The name behind vtable offset `0x7AC`. The VB5 header gives
+`lpObjectTable = 0x435018`, whose 39 records are
+`{name, count, table, 0xFFFF, flags, ..., entry, 0xFFFFFFFF, iid, ...}` and
+name the project's parts (`frmMain`, `Module1`, `frmDat`, `Module2`,
+`frmInfo`, `StringTokenizer`, `frmMacro`, `frmEmulation`, `ALU`, `frmScreen`,
+`RAM`, `frmFLAGS`, `frmOptions`, `ComDlg`, `frm_mBox`, `frmAbout`,
+`mCodeSelector`, `frmOrigCode`, `frmBaseConvertor`, `frmStack`, `mDisk`,
+`mFASM`, `mAnalyser`, `frmEvaluator`, `mMath`, `mString`, `mEditor`,
+`frmDebugLog`, `mRecentFiles`, `mSYMBOL_TABLE`, `mOptions`,
+`mSegment_Names_Table`, `mDAT`, `frmWriteBinToFloppy`, `mOutput`, ...), and
+the packed pointer tables from `0x4360BC` hold their method names in
+declaration order (`do_instruction_D8_DF`, `MAKE_sub_BYTES`, `add_to_SCREEN`,
+`clear_SCREEN`, `stopAutoStep`, `mnuSingleStep_Click_PUBLIC`,
+`do_INT_21_4E_4F_StepBack`, `showFPU_STATE`, ...). But those tables contain
+1025 slots of which only 257 are named and the gaps do not line up with
+`(offset-0x1C)/4`, so the offset -> name mapping is not the file order; the
+runtime-built vtable keeps that mapping in memory. Treat the *name* as open;
+the *behaviour* above (no halt, UI report) is CONFIRMED.
