@@ -12,6 +12,11 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 #include "cpu.h"
 #include "alu.h"
 #include "dos.h"
@@ -42,10 +47,27 @@ void dos_feed_stdin(const char *text)
     while (*text) { dos_push_key(*text); text++; }
 }
 
+/* One byte from the host, so `mue prog.asm < input` works.  A terminal is
+ * never touched: the emulator must not block waiting for a keypress nobody
+ * asked for. */
+static int host_stdin_byte(void)
+{
+    static int binary;
+    int c;
+
+    if (isatty(0)) return -1;
+#ifdef _WIN32
+    /* Text mode would eat the CR before the guest ever sees it. */
+    if (!binary) { _setmode(_fileno(stdin), _O_BINARY); binary = 1; }
+#endif
+    c = fgetc(stdin);
+    return c == EOF ? -1 : c;
+}
+
 static int kb_pop(void)
 {
     int v;
-    if (kb_head == kb_tail) return -1;
+    if (kb_head == kb_tail) return host_stdin_byte();
     v = kb[kb_head];
     kb_head = (kb_head + 1) & 0xFF;
     return v;
@@ -452,8 +474,26 @@ static void int21(void)
         int i, h = cpu.r[BX];
         FILE *f;
 
+        /* Handle 0 is the console: DOS stops at CR and keeps it in the
+         * buffer, and echoes what it read. */
+        if (h == 0) {
+            p = seg_off_to_phys(cpu.sr[DS], cpu.r[DX]);
+            n = cpu.r[CX];
+            if (p + n > (uint32_t)0x100000) { dos_file_error(5); break; }
+            while (done < n) {
+                int c = kb_pop();
+                if (c < 0) break;
+                poke8(p + done, (uint8_t)c);
+                done++;
+                if (c == 0x0D) { dos_putc('\n'); break; }
+                dos_putc(c);
+            }
+            cpu.flags &= ~F_CF;
+            setAX((int)done);               /* 0 = end of input */
+            break;
+        }
         f = dos_slot_file(h, &i);
-        if (!f) { dos_file_error(6); break; }   /* includes stdin: see below */
+        if (!f) { dos_file_error(6); break; }
         if (dos_fmode[i] == 1) { dos_file_error(5); break; }
         p = seg_off_to_phys(cpu.sr[DS], cpu.r[DX]);
         n = cpu.r[CX];

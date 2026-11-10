@@ -1318,9 +1318,7 @@ returns, so a reader that reopens the file sees them immediately.
 `CF`/`AX` error convention are the documented DOS contract the original
 implements - they are asserted by the regression, not derived from the
 disassembly, and should be called INFERRED rather than CONFIRMED.
-Reading from handle 0 (stdin) is not modelled: the clone has no file handle
-for it, so it reports invalid handle rather than pretending to hit EOF.
-`AH=41` and `AH=4E`/`4F` are covered in 19.
+Handle 0 (stdin) is covered in 20; `AH=41` and `AH=4E`/`4F` in 19.
 
 Regression `src/check_int21.py` (14 checks, wired into `make test`): each
 guest runs in a scratch directory and the host reads the files back, so the
@@ -1387,3 +1385,45 @@ ending in `AX=0x12`+CF, directory visibility with and without `CX=0x10`,
 reporting, and delete succeeding once then failing. Proved to bite: dropping
 the `0x10` directory filter, ignoring the `AH=1A` address and stubbing
 `remove()` fails exactly the six affected checks.
+
+## 20. INT 21h AH=3F on handle 0 (stdin) (IMPLEMENTED)
+
+`AH=3F` with `BX=0` reported invalid handle (6), so a guest could not read
+its standard input at all.
+
+**A finding while wiring it:** the keyboard queue was inert. `kb_pop()` is
+the source for INT 16h and INT 21h `AH=00/01/0A`, but nothing ever pushed
+into it - `dos_feed_stdin()` and `dos_push_key()` are exported and were never
+called. So the queue was always empty, and that is why `AH=3F`/0 had nothing
+to read from. The queue is now fed from the host on demand:
+
+- `kb_pop()` falls back to `host_stdin_byte()` when the queue is empty. That
+  makes `mue prog.asm < input` work for the console calls as well, not just
+  for `3F`.
+- A terminal is never read (`isatty(0)`), because the emulator must not block
+  waiting for a keypress nobody asked for.
+- stdin is switched to `_O_BINARY` on Windows before the first read. In text
+  mode the C runtime ate every CR, so a guest looking for a DOS line ending
+  saw `hi\nrest` instead of `hi\r\nrest` and a CR-terminated read could never
+  terminate. This was caught by the regression, not by inspection.
+
+`AH=3F` on handle 0 then behaves like DOS reading CON:
+
+- at most `CX` bytes are transferred, into `DS:DX`;
+- the read stops at CR, and the CR *is* stored, so the guest sees a normal
+  DOS line;
+- bytes after the CR stay queued for the next read;
+- `AX` is the count; an empty input gives `AX=0` with `CF` clear, not an
+  error;
+- the characters are echoed, as DOS echoes console input.
+
+The CR rule is the documented DOS console behaviour, INFERRED rather than
+read out of the binary; the rest is exercised end to end.
+
+Regressions added to `src/check_int21.py` (36 checks total):
+`stdin-read-stops-at-cr`, `stdin-keeps-cr` (the file written from the buffer
+contains `hi\r`), `stdin-continues-after-cr`, `stdin-rest-unconsumed`
+(`\nrest` is still there), plus the EOF pair. Both halves were proved to
+bite: dropping the CR stop makes the first read take all 8 bytes and keeps
+`hi\r\nrest`; dropping `_setmode` loses the CR and fails the same four
+checks.

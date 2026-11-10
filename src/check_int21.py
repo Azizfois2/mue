@@ -28,12 +28,13 @@ def find_mue():
     return None
 
 
-def run(mue, src, cwd):
+def run(mue, src, cwd, stdin_data=None):
     """Assemble + run in cwd; return (exit code, combined output)."""
     a = os.path.join(cwd, "t.asm")
     with open(a, "w") as f:
         f.write(src)
-    p = subprocess.run([mue, a], capture_output=True, timeout=60, cwd=cwd)
+    p = subprocess.run([mue, a], input=stdin_data, capture_output=True,
+                       timeout=60, cwd=cwd)
     return p.returncode, (p.stdout + p.stderr).decode("utf-8", "replace")
 
 
@@ -293,6 +294,60 @@ ret
 fna db 'a.txt',0
 """
 
+# Handle 0 is stdin through the keyboard queue: the read stops at CR, keeps
+# it, and the second read picks up after it.
+T_STDIN = PROLOG + """
+mov ah,3fh
+mov bx,0
+mov cx,8
+mov dx,200h
+int 21h
+mov si,ax
+mov ah,3fh
+mov bx,0
+mov cx,8
+mov dx,210h
+int 21h
+mov bp,ax
+mov ah,3ch
+mov cx,0
+lea dx,f1
+int 21h
+mov bx,ax
+mov ah,40h
+mov cx,si
+mov dx,200h
+int 21h
+mov ah,3eh
+int 21h
+mov ah,3ch
+mov cx,0
+lea dx,f2
+int 21h
+mov bx,ax
+mov ah,40h
+mov cx,bp
+mov dx,210h
+int 21h
+mov ah,3eh
+int 21h
+ret
+f1 db 's1.txt',0
+f2 db 's2.txt',0
+"""
+
+# End of input is not an error: AX=0, CF clear.
+T_STDIN_EOF = PROLOG + """
+mov ah,3fh
+mov bx,0
+mov cx,4
+mov dx,200h
+int 21h
+pushf
+pop di
+ret
+"""
+
 # Handle 1 is stdout: the bytes must reach the console, not a file.
 T_STDOUT = PROLOG + """
 mov ah,40h
@@ -411,6 +466,21 @@ def main():
         check("delete-first-cf-clear", di is not None and not (di & 1), di)
         check("delete-again-not-found", ax == 2, ax)
         check("delete-again-cf", si is not None and (si & 1), si)
+
+        rc, out = run(mue, T_STDIN, d, b"hi\r\nrest")
+        si = reg(out, "SI")
+        bp = reg(out, "BP")
+        check("stdin-read-stops-at-cr", si == 3, si)
+        check("stdin-keeps-cr", host("s1.txt") == b"hi\r", host("s1.txt"))
+        check("stdin-continues-after-cr", bp == 5, bp)
+        check("stdin-rest-unconsumed", host("s2.txt") == b"\nrest",
+              host("s2.txt"))
+
+        rc, out = run(mue, T_STDIN_EOF, d, b"")
+        ax = reg(out, "AX")
+        di = reg(out, "DI")
+        check("stdin-eof-returns-zero", ax == 0, ax)
+        check("stdin-eof-cf-clear", di is not None and not (di & 1), di)
 
         rc, out = run(mue, T_STDOUT, d)
         txt = guest_text(out)
