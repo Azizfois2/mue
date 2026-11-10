@@ -242,6 +242,8 @@ def main():
     txt = guest_text(out)
     check("unsupported-ah-continues", rc == 0 and txt == "|",
           (rc, repr(txt)))
+    check("unsupported-ah-reports",
+          "INT 10h, AH=99h - not supported yet." in out, repr(out[-200:]))
 
     print("INT10 %s (%d fail)" % ("PASS" if not fails else "FAIL", len(fails)))
     return 1 if fails else 0

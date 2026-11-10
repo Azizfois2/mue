@@ -1788,10 +1788,16 @@ writes yields 16 sites, **none** in the INT 10h range `0x520000-0x523BFF`
 So the only INT 10h path that *can* stop the CPU is none of them; the `-5`
 halt was a clone-only invention.
 
-What remains different is reporting, not halting: the clone is silent where
-the original logs `"INT 10h, AH=0X - not supported yet."` and
-`"INT 13h, AH=0X - not supported yet."`. Left as is (no guest-visible
-behaviour depends on it), but now recorded.
+Reporting was the remaining difference, and it is now implemented:
+`unsupported_ah()` in `src/dos.c` prints
+`INT 10h, AH=99h - not supported yet.` (and the INT 13h equivalent) on an
+AH with no arm, which is what the original composes at `0x52244F` and
+`0x523E92` from `"INT 10h, AH=0"` + `Hex(AH)` + `"h   "` +
+`"- not supported yet."`. Two deliberate cosmetic divergences: `%02X`
+formatting instead of the original's `"AH=0" + Hex(AH)` (which renders
+`AH=1A` as `AH=01Ah`), and the original's second line
+`"refer to the list of supported interrupts"` (`0x44782C`) is not repeated.
+Pinned by `unsupported-ah-reports` and `else-reports`.
 
 New regressions pin the non-halt: `unsupported-ah-continues` in
 `src/check_int10.py` (INT 10h AH=99h, marker printed after the call, exit 0)

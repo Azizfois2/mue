@@ -141,6 +141,8 @@ def main():
     check("else-sets-cf", cx is not None and bool(int(cx) & 1), cx)
     check("else-continues", bx is not None and int(bx) == 0x1234,
           hex(bx) if bx is not None else None)
+    check("else-reports", "INT 13h, AH=01h - not supported yet." in out,
+          repr(out[-200:]))
 
     # Sector I/O end to end, with the pattern on head 1 of the last track.
     # head=1 is load-bearing: DH is the register the clone once read from BH,

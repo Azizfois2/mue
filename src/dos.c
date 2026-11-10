@@ -788,6 +788,18 @@ static void int10_write_string_reject(const char *why)
     fprintf(stderr, "INT 10h, AH=13h - %s\n", why);
 }
 
+/* Original fail tail for an AH that has no arm: it logs
+ * "INT 10h, AH=0" + Hex(AH) + "h   " + "- not supported yet."
+ * (0x52244F, 0x523E92, 0x524DE2 ...), then the separate hint
+ * "refer to the list of supported interrupts" (0x44782C), sets the 0x62141C
+ * error word and returns.  Only the first line is reproduced: the hint is
+ * noise on a terminal, and the error word has no consumer outside the
+ * dispatcher (FINDINGS 24.2).  Notably these paths do NOT stop the machine. */
+static void unsupported_ah(const char *service, int ah)
+{
+    fprintf(stderr, "%s, AH=%02Xh - not supported yet.\n", service, ah);
+}
+
 static void int10(void)
 {
     int ah = (cpu.r[0] >> 8) & 0xFF;
@@ -900,6 +912,7 @@ static void int10(void)
         }
         break;
     default:
+        unsupported_ah("INT 10h", ah);
         break;
     }
 }
@@ -1012,7 +1025,8 @@ static void int13(void)
         cpu.r[AX] = (uint16_t)(al & 0xFF);      /* AH=0, AL=sectors done */
         return; }
     default:
-        cpu.flags |= F_CF;                      /* cf. fail path 5.3 */
+        unsupported_ah("INT 13h", ah);         /* cf. fail path 5.3 */
+        cpu.flags |= F_CF;
         setAThi(1);
         return;
     }
