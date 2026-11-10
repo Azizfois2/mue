@@ -1746,10 +1746,44 @@ must not reach it). Both were verified to bite: restoring the halt fails the
 first three, and moving the guard below the `DX` latch fails only
 `cx-limit-keeps-cursor`.
 
-### 24.4 Still open
+### 24.4 Where slot 0x7AC points, resolved at run time (CONFIRMED)
 
-The name behind vtable offset `0x7AC`. The VB5 header gives
-`lpObjectTable = 0x435018`, whose 39 records are
+`[obj+0x7AC]` is **method `0x52D380`**. The vtable only exists in memory, so
+this was read from a live process (`re/live_vtable.py`): start `emu8086.exe`,
+`ReadProcessMemory(0x6214D0)` -> project object (e.g. `0x994AC0`), read its
+first dword -> **vtable `0x634FCC`**, then read `vtable+0x7AC`. The entries are
+VB6 **thunks**, not method addresses - which is why the static search for
+`0x51FF60`/`0x52D380` as a dword found nothing:
+
+```
+434709: e9 72 8c 0f 00          jmp 52D380          ; <- slot 0x7AC
+43470e: 81 6c 24 04 ff ff 00 00  sub dword [esp+4], 0xFFFF
+434716: e9 ...                  jmp <next thunk>
+```
+
+Each thunk is a `jmp rel32` to the real method, followed by a `this`
+adjustment for the *next* entry (VB6 hands out interface pointers one byte
+past the object). Same dump: `0x7BC` (the single step) -> `0x53A0A0`,
+`0x760` -> `0x4E9E50`, `0x77C` -> `0x51A1F0`, all real VB method prologues.
+
+What `0x52D380` (0x220 bytes) does, now that we can read it:
+
+- `push 1; call __vbaOnError` - the whole body runs under
+  **`On Error Resume Next`**, so it is best-effort by construction.
+- `call [this+0x4]` (AddRef), then `call [this+0x358]` and
+  `__vbaObjSet` - fetch a sub-object, then `obj->[0xE4](0)` with
+  `__vbaHresultCheckObj` around it.
+- `call [this+0x3BC]`, `obj->[0x5C](0)` the same way.
+- `mov WORD PTR [this+0x68], 0` - clear one state word.
+- `call ds:0x401358` (MSVBVM60 ordinal 685), `obj->[0x2C]`, then
+  `__vbaResume` / `__vbaExitProc` and `ret 4`.
+
+So it is a small **best-effort state/UI reset**, with no halt in it: no write
+to `ds:0x621218`, none to `this+0x4C`, no loop. That is the last piece of
+24.2 - the callers log, reset and return, and the guest keeps running.
+
+The VB6 *name* is still unresolved, and the tables in 25 are why: the VB5
+header gives `lpObjectTable = 0x435018`, whose 39 records are
 `{name, count, table, 0xFFFF, flags, ..., entry, 0xFFFFFFFF, iid, ...}` and
 name the project's parts (`frmMain`, `Module1`, `frmDat`, `Module2`,
 `frmInfo`, `StringTokenizer`, `frmMacro`, `frmEmulation`, `ALU`, `frmScreen`,
@@ -1763,46 +1797,9 @@ declaration order (`do_instruction_D8_DF`, `MAKE_sub_BYTES`, `add_to_SCREEN`,
 `clear_SCREEN`, `stopAutoStep`, `mnuSingleStep_Click_PUBLIC`,
 `do_INT_21_4E_4F_StepBack`, `showFPU_STATE`, ...). But those tables contain
 1025 slots of which only 257 are named and the gaps do not line up with
-`(offset-0x1C)/4`, so the offset -> name mapping is not the file order; the
-runtime-built vtable keeps that mapping in memory. Treat the *name* as open;
-the *behaviour* above (no halt, UI report) is CONFIRMED.
-
-### 24.5 Audit: no other INT 10h/13h failure path stops the machine
-
-The 24.2 result generalises, and the clone was checked against it:
-
-| path | original | clone before | clone now |
-|---|---|---|---|
-| INT 10h AH=13h `CX > 0x7D0` | log + `[obj+0x7AC]` + `0x62141C`, return (`0x522F7D`) | halt `-5` | report, continue |
-| INT 10h other fail arms | log + `[obj+0x7AC]` + `0x62141C`, return (`0x52244F`, `0x5228B9`, `0x523209`, `0x5236C2`, `0x52389C`, `0x523AFE`, `0x52409D`, `0x524DE2`, ...) | silent, continue | unchanged |
-| INT 10h unknown AH | log `"INT 10h, AH=0X - not supported yet."`, return | silent, continue | unchanged |
-| INT 13h AH=00/02/03 errors | `CF=1`, `AH=error`, return | same | unchanged |
-| INT 13h other AH | log `"INT 13h, AH=0X - not supported yet."` + `0x62141C` (`0x523E92-0x5240EF`), return | `CF=1`, `AH=1`, continue | unchanged |
-| INT 20h / INT 21h `00h`/`4Ch` | `[this+0x4C]=0xFFFF`, `ds:0x621218=0xFFFF` (`0x525833`, `0x525A3D`, `0x529F74-0x529F81`) | halt, exit code | correct as-is |
-
-Evidence for the whole-INT-10h claim: scanning the image for `ds:0x621218`
-writes yields 16 sites, **none** in the INT 10h range `0x520000-0x523BFF`
-(they are `0x4E107B`, `0x5165EC`, `0x51AED9`, `0x52557E`, `0x525833`,
-`0x525A3D`, `0x529F81`, `0x52CD0B`, `0x540F75`, `0x5A2BF6`, `0x5A2CD5`,
-`0x5A38F2`, `0x5B2BF0`, `0x5EAAAB`, plus the `mov ...,si` / `cmp` forms).
-So the only INT 10h path that *can* stop the CPU is none of them; the `-5`
-halt was a clone-only invention.
-
-Reporting was the remaining difference, and it is now implemented:
-`unsupported_ah()` in `src/dos.c` prints
-`INT 10h, AH=99h - not supported yet.` (and the INT 13h equivalent) on an
-AH with no arm, which is what the original composes at `0x52244F` and
-`0x523E92` from `"INT 10h, AH=0"` + `Hex(AH)` + `"h   "` +
-`"- not supported yet."`. Two deliberate cosmetic divergences: `%02X`
-formatting instead of the original's `"AH=0" + Hex(AH)` (which renders
-`AH=1A` as `AH=01Ah`), and the original's second line
-`"refer to the list of supported interrupts"` (`0x44782C`) is not repeated.
-Pinned by `unsupported-ah-reports` and `else-reports`.
-
-New regressions pin the non-halt: `unsupported-ah-continues` in
-`src/check_int10.py` (INT 10h AH=99h, marker printed after the call, exit 0)
-and `else-continues` in `src/check_int13.py` (INT 13h AH=01h sets `BX=1234h`
-after the call). Verified to bite: making either arm halt fails them.
+`(offset-0x1C)/4`, so offset -> name is not the file order: the thunk table is
+the only slot -> code map, and it carries no names. Naming it would need a
+mapping from method address to name, which this build does not keep.
 
 ## 25. The VB6 project layout, as a reusable reference (CONFIRMED)
 
@@ -1956,7 +1953,10 @@ to these names by file order alone.
 ### 25.5 Scripts
 
 `re/vbdata.py` (header + project data), `re/vbtable.py` (object table, prints
-the table in 25.2), `re/objtab.py` (records + name-table pointers),
+the table in 25.2), `re/live_vtable.py` (**the runtime vtable**: launches the
+exe, reads `ds:0x6214D0`, follows the object to its vtable and prints any slot
+- the only reliable slot -> code map, see 24.4), `re/objtab.py` (records +
+name-table pointers),
 `re/slot7ac.py` (name at a given slot offset per class),
 `re/globalidx.py` (packed name-table index walk), `re/site7ac.py` (all
 `[x+0x7AC]` call sites with the flags/messages around them),
