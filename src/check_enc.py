@@ -31,6 +31,12 @@ CASES = [
     ("pop ds",             "1f"),
     # the standard prologue, as written by examples\int10_13.asm
     ("push cs\npop es",    "0e 07"),
+    # string ops with a repeat prefix: the prefix alone is not the instruction.
+    # `rep movsb` used to emit only F3 and drop the copy (FINDINGS 31).
+    ("rep movsb",          "f3 a4"),
+    ("rep stosw",          "f3 ab"),
+    ("repne scasb",        "f2 ae"),
+    ("movsb",              "a4"),
     # controls: these were already correct and must stay that way
     ("mov ax,cs",          "8c c8"),
     ("push ax\npop bx",    "50 5b"),

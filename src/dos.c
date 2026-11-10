@@ -250,10 +250,19 @@ static int dos_apply_path(int drive, const char *path, char *out, size_t n)
 #define DOS_HEAP_END   0xA000
 #define DOS_BLOCKS     64
 
-/* A child started by 4Bh runs in the 64K window just below the arena.  At
- * most one child at a time: dos_exec_depth is set while it runs. */
-#define DOS_CHILD_SEG  0x1000
+/* A child started by 4Bh gets its own 64K window, counting down from the top
+ * of the megabyte (0xF000, 0xE000, ...) so that children can nest and none of
+ * them overlaps the 48h arena, which ends at 0xA000 paragraphs.  Video memory
+ * is not in MEM (it is a separate array in this file), and nothing else of
+ * ours lives above 0xA000. */
+#define DOS_CHILD_TOP    0xF000
+#define DOS_CHILD_LEVELS 6
 static int dos_exec_depth;
+
+static uint16_t dos_child_seg(void)
+{
+    return (uint16_t)(DOS_CHILD_TOP - 0x1000 * dos_exec_depth);
+}
 
 /* The original answers 48h/49h/4Ah with nothing observable (FINDINGS 29).
  * MUE_INT21_MEM_NOOP=1 reproduces that exactly - the handler returns without
@@ -306,6 +315,33 @@ static int dos_block_find(uint32_t seg)
     for (i = 0; i < DOS_BLOCKS; i++)
         if (dos_block[i].used && dos_block[i].seg == seg) return i;
     return -1;
+}
+
+/* Allocate PARAS paragraphs; 0 when they do not fit.  Shared by 48h and by the
+ * 4Bh environment copy, which needs a block but must answer itself. */
+static uint32_t dos_arena_alloc(uint32_t paras)
+{
+    uint32_t seg = DOS_HEAP_FIRST;
+    int i;
+
+    if (!paras) return 0;
+    for (i = 0; i < DOS_BLOCKS; i++)
+        if (!dos_block[i].used) break;
+    if (i == DOS_BLOCKS) return 0;
+    for (; seg + paras <= DOS_HEAP_END; seg++) {
+        if (!dos_gap_free(seg, paras)) continue;
+        dos_block[i].seg = (uint16_t)seg;
+        dos_block[i].paras = (uint16_t)paras;
+        dos_block[i].used = 1;
+        return seg;
+    }
+    return 0;
+}
+
+static void dos_arena_free(uint32_t seg)
+{
+    int i = dos_block_find(seg);
+    if (i >= 0) dos_block[i].used = 0;
 }
 
 /* Build a $-terminated string starting at DS:DX and print it. */
@@ -636,26 +672,15 @@ static void int21(void)
         break; }
 
     case 0x48: {                                /* allocate block, BX paras */
-        uint32_t want = cpu.r[3], seg = DOS_HEAP_FIRST;
-        int slot = -1, i;
+        uint32_t seg;
 
         if (dos_mem_noop()) break;              /* original: no answer at all */
-
-        for (i = 0; i < DOS_BLOCKS; i++)
-            if (!dos_block[i].used) { slot = i; break; }
-        if (want)
-            for (; seg + want <= DOS_HEAP_END; seg++)
-                if (dos_gap_free(seg, want)) break;
-        /* want=0 still lands here: `seg + 0 <= END` holds, so the guard below
-         * is what rejects it. */
-        if (!want || seg + want > DOS_HEAP_END || slot < 0) {
+        seg = dos_arena_alloc(cpu.r[3]);
+        if (!seg) {                             /* 0 paragraphs fails too */
             cpu.r[3] = (uint16_t)dos_largest_free();
             dos_file_error(8);                  /* insufficient memory */
             break;
         }
-        dos_block[slot].seg = (uint16_t)seg;
-        dos_block[slot].paras = (uint16_t)want;
-        dos_block[slot].used = 1;
         setAX((uint16_t)seg);
         cpu.flags &= ~F_CF;
         break; }
@@ -676,22 +701,25 @@ static void int21(void)
         break; }
 
     case 0x4B: {                                /* exec a program */
-        char name[160], want[160], host[512];
+        char name[160], want[160], host[512], path_rec[200];
         FILE *f;
         long n;
         uint8_t *img;
         cpu_t saved;
         int saved_req = dos_exit_requested, saved_code = dos_exit_code;
         uint32_t saved_dta = dta;
-        int saved_dta_valid = dta_valid, child_exit;
+        int saved_dta_valid = dta_valid, saved_depth = dos_exec_depth;
+        int child_exit, cmd_len, i;
+        uint16_t seg, env_seg = 0;
+        uint32_t base, pb, cmd_phys, env_phys, env_len, j;
 
         /* Original: no 4Bh arm either (see 30), so it reports "not supported"
          * and returns.  A child process is a divergence, implemented the DOS
          * way for the one form that can work here: AL=0, load and execute a
-         * .COM.  AL=1/3 (overlay) and MZ images are refused, and a child may
-         * not itself exec, because every child runs in the same 64K window. */
+         * .COM with a parameter block (ES:BX).  AL=1/3 (overlay) and MZ images
+         * are refused. */
         if ((cpu.r[0] & 0xFF) != 0) { dos_file_error(1); break; }
-        if (dos_exec_depth) { dos_file_error(8); break; }
+        if (dos_exec_depth >= DOS_CHILD_LEVELS) { dos_file_error(8); break; }
         if (dos_guest_name(name, sizeof name) != 0) { dos_file_error(3); break; }
         dos_seed();
         if (dos_apply_path(dos_drive, name, want, sizeof want) != 0) {
@@ -717,18 +745,72 @@ static void int21(void)
         }
         if (n > 0xFF00) n = 0xFF00;
 
-        /* One child at a time, in the 64K window just under the 48h arena. */
-        saved = cpu;
-        memset(MEM + (DOS_CHILD_SEG << 4), 0, 0x10000);
-        memcpy(MEM + (DOS_CHILD_SEG << 4) + 0x100, img, (size_t)n);
+        seg = dos_child_seg();
+        base = (uint32_t)seg << 4;
+        memset(MEM + base, 0, 0x10000);
+        memcpy(MEM + base + 0x100, img, (size_t)n);
         free(img);
-        MEM[DOS_CHILD_SEG << 4] = 0xCD;         /* int 20h */
-        MEM[(DOS_CHILD_SEG << 4) + 1] = 0x20;
-        MEM[(DOS_CHILD_SEG << 4) + 0x80] = 0;   /* empty command tail */
 
-        cpu.sr[ES] = cpu.sr[CS] = cpu.sr[SS] = cpu.sr[DS] = DOS_CHILD_SEG;
+        /* ---- minimal PSP, from the caller's parameter block ------------
+         * ES:BX points at the DOS 3.x block: +0 environment segment, then a
+         * far pointer to the counted command line, then two FCB pointers we
+         * leave as the zeroed block already has them. */
+        pb = seg_off_to_phys(cpu.sr[ES], cpu.r[3]);
+        cmd_phys = seg_off_to_phys(peek16(pb + 4), peek16(pb + 2));
+        env_phys = seg_off_to_phys(peek16(pb), 0);
+
+        cmd_len = peek8(cmd_phys);
+        if (cmd_len > 127) cmd_len = 127;
+        MEM[base + 0x80] = (uint8_t)cmd_len;
+        for (i = 0; i < cmd_len; i++)
+            MEM[base + 0x81 + i] = peek8(cmd_phys + 1 + (uint32_t)i);
+        MEM[base + 0x81 + cmd_len] = 0x0D;      /* DOS's terminating CR */
+
+        MEM[base]      = 0xCD;                  /* int 20h */
+        MEM[base + 1]  = 0x20;
+        MEM[base + 0x50] = 0xCD;                /* int 21h; retf */
+        MEM[base + 0x51] = 0x21;
+        MEM[base + 0x52] = 0xCB;
+        poke16(base + 2, (uint16_t)(seg + 0x1000));   /* top of memory */
+
+        /* ---- environment: the caller's strings plus DOS's two trailing
+         * records (a word 1, the full path, a word 0), copied into a block of
+         * its own so the child owns it and the parent may free or reuse
+         * its copy.  PSP:0x2C points at the copy. ---------------------- */
+        env_len = 0;
+        if (peek16(pb)) {
+            while (env_len < 2048 &&
+                   !(peek8(env_phys + env_len) == 0 &&
+                     peek8(env_phys + env_len + 1) == 0))
+                env_len++;
+            env_len += 2;                       /* keep the empty string */
+        }
+        if (env_len) {
+            uint32_t total;
+
+            snprintf(path_rec, sizeof path_rec, "%c:\\%s", 'A' + dos_drive, want);
+            total = env_len + 2 + (uint32_t)strlen(path_rec) + 1 + 2;
+            env_seg = (uint16_t)dos_arena_alloc((total + 15) / 16);
+            if (!env_seg) { dos_file_error(8); break; }
+            {
+                uint32_t eb = (uint32_t)env_seg << 4;
+
+                memset(MEM + eb, 0, ((total + 15) / 16) * 16);
+                for (j = 0; j < env_len; j++)
+                    MEM[eb + j] = peek8(env_phys + j);
+                MEM[eb + env_len] = 1;
+                MEM[eb + env_len + 1] = 0;
+                for (j = 0; j <= strlen(path_rec); j++)
+                    MEM[eb + env_len + 2 + j] = (uint8_t)path_rec[j];
+                MEM[eb + env_len + 3 + strlen(path_rec)] = 0;
+            }
+            poke16(base + 0x2C, env_seg);
+        }
+
+        saved = cpu;
+        cpu.sr[ES] = cpu.sr[CS] = cpu.sr[SS] = cpu.sr[DS] = seg;
         cpu.ip = 0x100;
-        cpu.phys = seg_off_to_phys(DOS_CHILD_SEG, 0x100);
+        cpu.phys = seg_off_to_phys(seg, 0x100);
         cpu.r[SP] = 0xFFFE;
         cpu.flags = F_IF;
         cpu.halted = 0;
@@ -739,7 +821,7 @@ static void int21(void)
         dta_valid = 0;                          /* the child's own PSP */
         dos_exit_requested = 0;
         dos_exit_code = 0;
-        dos_exec_depth = 1;
+        dos_exec_depth = saved_depth + 1;
 
         cpu_run(2000000);
 
@@ -749,7 +831,8 @@ static void int21(void)
         dta_valid = saved_dta_valid;
         dos_exit_requested = saved_req;
         dos_exit_code = saved_code;
-        dos_exec_depth = 0;
+        dos_exec_depth = saved_depth;
+        if (env_seg) dos_arena_free(env_seg);
         setAX((uint16_t)(child_exit & 0xFF));
         cpu.flags &= ~F_CF;
         break; }

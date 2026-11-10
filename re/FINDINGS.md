@@ -2198,19 +2198,38 @@ covers one- and two-digit values and is the authoritative one.)
   execute a `.COM`.
   - The name goes through `dos_apply_path`/`dos_host_dir`, so relative names,
     `..` and the current drive all resolve like the other file calls.
-  - The child's 64K window is segment `0x1000`, immediately below the 48h
-    arena at `0x2000`; it gets a minimal PSP (`int 20h` at offset 0, an empty
-    command tail at 0x80), CS=DS=ES=SS, IP=0x100, SP=0xFFFE, and its own
-    default DTA. The child's exit code comes back in AX with CF clear.
+  - **Nested exec**: each child gets its own 64K window, counted down from the
+    top of the megabyte - `0xF000`, `0xE000`, ..., six levels deep
+    (`DOS_CHILD_TOP`/`DOS_CHILD_LEVELS`, `dos_child_seg()`). They sit above the
+    48h arena (`0x2000`..`0xA000`) and above the guest's own load segment at
+    `0x1000`, and `0xF000` covers `0xF0000`..`0xFFFFF` exactly, so every window
+    is inside `MEM`. Video memory is a separate `vram` array, so no window
+    aliases it. A seventh level, or an exec while six children are live,
+    answers **AX=8**.
+  - The child's initial state: CS=DS=ES=SS = its window, IP=0x100, SP=0xFFFE,
+    IF set, its own default DTA (the parent's is restored afterwards).
+  - **PSP** (the `AL=0` DOS 3.x parameter block at ES:BX): `int 20h` at offset
+    0, the window's top of memory at +2, the environment segment at +0x2C,
+    `int 21h; retf` at +0x50 (so a child can leave through `ret`), the counted
+    command tail plus the terminating CR at +0x80, and zeroed FCB pointers.
+  - **Command tail**: the counted string the parameter block points at is
+    copied into `PSP:0x80` verbatim (length clamped to 127) followed by 0x0Dh,
+    exactly as DOS does, so `INT 21h AH=9` on `PSP:0x81` prints the arguments
+    up to the CR.
+  - **Environment**: the caller's string block is copied into a block from the
+    arena, followed by DOS's two trailing records - a word 1, then the full
+    path of the program (drive letter, colon, backslash, path), then a word 0 -
+    and `PSP:0x2C` points at the copy. The copy belongs to the child and is
+    freed when it returns; the parent's block is untouched. A null environment
+    segment in the parameter block means the child gets `PSP:0x2C = 0`.
   - Refusals: `AL` other than 0 -> **AX=1** (overlay forms are not modelled);
     a file that does not open -> **AX=2**; an MZ image or a short/odd read ->
-    **AX=11**; an exec from inside a child -> **AX=8**, because every child uses
-    the same window and one level is all that fits. The command tail is not
-    passed through.
+    **AX=11**; no free arena paragraphs for the environment -> **AX=8**.
   - The parent's whole `cpu` struct, `DTA` (value and its cached flag), and the
     `dos_exit_requested`/`dos_exit_code` pair are saved and restored around the
     nested `cpu_run`, which is safe because `cpu_int()` returns to the caller
-    without touching `ip`/`phys` once a service has handled the interrupt.
+    without touching `ip`/`phys` once a service has handled the interrupt. The
+    child's exit code comes back in AX with CF clear.
 
 Note for future work: 4Ch's AL is recorded in `dos_exit_code` but never becomes
 the process status (`mue` still exits 0), so a 31h exit code is only observable
@@ -2238,7 +2257,60 @@ exactly as set: AX=0x4800, BX=0x5678, CF still set) and
 `mem-noop-off-by-default` (without it the same guest gets a segment in AX and CF
 clear).
 
+Nested exec and the passed-through PSP are pinned by four more checks, driven
+by guests assembled with `mue -a` into the scratch directory at check time:
+
+- `exec-nested`: `c1` prints `c1`, execs `c2`, `c2` prints `c2` and exits with
+  AL=9, and the parent prints `parent` last. On success the output is
+  `c1c2parent` and the parent's AX is 9 - so the check proves the second window
+  ran and that the grandchild's exit code travelled back through both levels.
+- `exec-command-tail`: the parent passes a counted ` HI`; the child prints
+  `PSP:0x81` after replacing the CR with `$`, giving `HI|`.
+- `exec-environment`: the parent's block is `FOO=BAR`,0,0; the child follows
+  `PSP:0x2C` and prints the first string, giving `FOO=BAR`.
+- `exec-args-returns-child-code`: the same guest, whose child exits 4Ch/AL=0,
+  gets AX=0 back.
+
 Verified to bite: emptying the 31h case fails `tsr-terminates` (BX=0xDEAD) and
 `tsr-code-reaches-exec-caller`; returning 0 instead of the child's exit code
-fails `exec-reports-child-exit-code`; and making `dos_mem_noop()` always return
-0 fails `mem-noop-compat-flag` with the arena's AX/BX.
+fails `exec-reports-child-exit-code`; making `dos_mem_noop()` always return 0
+fails `mem-noop-compat-flag` with the arena's AX/BX; putting back the old
+one-level rule (`if (dos_exec_depth) -> AX=8`) fails `exec-nested` with
+`(8, "'c1parent'")`; dropping the tail copy fails `exec-command-tail` with
+`'|FOO=BAR'`; and dropping `poke16(base + 0x2C, env_seg)` fails
+`exec-environment` with `'HI|'`.
+
+Guest-authoring gotcha worth remembering: like MASM, this assembler reads
+`mov bx,label` as `mov bx,[label]`, a word load. Addressing a parameter block
+needs `mov bx,offset label`; getting that wrong in a test guest looks exactly
+like a broken 4Bh, because ES:BX then points at whatever the label's first word
+held.
+
+## 31. `rep movsb` emitted the prefix and dropped the instruction (CONFIRMED, fixed)
+
+Found while writing the 4Bh tests: a guest that copied its environment block
+with `rep movsb` did nothing, and the byte dump showed why. This
+
+    org 100h
+    rep stosb
+    rep movsw
+    ret
+
+assembled to `f3 f3 c3` - both prefixes, neither opcode - while bare `movsb`
+assembled correctly to `a4`. The prefix branch in `encode_insn` (`asm_main.c`,
+mnemonics `rep`/`repe`/`repz`/`repne`/`repnz`) emitted F3/F2 and returned, so
+the instruction the prefix applies to - which the parser hands over as the
+first *operand* - was discarded. Every `rep` string operation in a listing was
+therefore just a repeat of whatever byte came next, and a `rep movsb`/`rep
+stosb` guest silently did nothing.
+
+The clone now emits the prefix and recurses on the remaining mnemonic and its
+operands, so `rep movsb` gives `f3 a4`, `repne scasb` gives `f2 ae`, `rep stosw`
+gives `f3 ab`, and a prefix with no instruction is an error instead of a lone
+prefix byte. `check_enc.py` pins those three forms plus bare `movsb`, and the
+INT 21h environment check is the end-to-end proof: the `rep movsb` copy is what
+puts `FOO=BAR` into the child's environment block.
+
+Not affected: the emulator's REP handling (`cpu.rep_kind`), which already
+repeated A4..AF correctly - verified with a standalone `rep movsb` guest that
+prints the copied string. The bug was entirely in the assembler.

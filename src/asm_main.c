@@ -404,11 +404,15 @@ static int encode_insn(asm_t *a, const char *mnem_in, char **ops, int nops)
 
     snprintf(m, sizeof(m), "%s", mnem_in);
 
-    /* prefixes */
-    if (!strcmp(m, "rep") || !strcmp(m, "repe") || !strcmp(m, "repz")) {
-        emit8(a, 0xF3); return 1;
+    /* prefixes: the prefixed instruction travels as the first operand, so
+     * `rep movsb` must emit F3 *and* the MOVSB it applies to. */
+    if (!strcmp(m, "rep") || !strcmp(m, "repe") || !strcmp(m, "repz") ||
+        !strcmp(m, "repne") || !strcmp(m, "repnz")) {
+        uint8_t pfx = (m[3] == 'n') ? 0xF2 : 0xF3;   /* repne/repnz vs rep */
+        if (nops < 1) { asm_error(a, "%s needs an instruction", m); return 0; }
+        emit8(a, pfx);
+        return encode_insn(a, ops[0], ops + 1, nops - 1);
     }
-    if (!strcmp(m, "repne") || !strcmp(m, "repnz")) { emit8(a, 0xF2); return 1; }
 
     /* jcc */
     {

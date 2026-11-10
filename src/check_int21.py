@@ -545,6 +545,129 @@ int 21h
 msg db 'child$'
 """
 
+# Nested exec: c1 prints, executes c2 (which prints and exits 9), then leaves
+# with whatever c2's exit code was - so AX=9 proves it travelled two levels.
+C1_ASM = PROLOG + """
+mov ah,9
+lea dx,m1
+int 21h
+mov ax,4b00h
+lea dx,cname
+mov bx,offset param
+push ds
+pop es
+int 21h
+mov ah,4ch
+int 21h
+m1 db 'c1$'
+cname db 'c2.com',0
+param dw 0
+dd 0
+dd 0
+dd 0
+"""
+
+C2_ASM = PROLOG + """
+mov ah,9
+lea dx,m2
+int 21h
+mov ah,4ch
+mov al,9
+int 21h
+m2 db 'c2$'
+"""
+
+T_EXEC_C1 = PROLOG + """
+mov ax,4b00h
+lea dx,c1name
+mov bx,offset param
+push ds
+pop es
+int 21h
+mov bp,ax
+mov ah,9
+lea dx,pmsg
+int 21h
+ret
+c1name db 'c1.com',0
+param dw 0
+dd 0
+dd 0
+dd 0
+pmsg db 'parent$'
+"""
+
+# c3 prints its command tail, then the first string of the environment it was
+# handed.  Both come from its PSP, so they can only work if 4Bh built one.
+C3_ASM = PROLOG + """
+mov al,[80h]
+mov ah,0
+mov bx,81h
+add bx,ax
+mov byte ptr [bx],'$'
+mov ah,9
+mov dx,81h
+int 21h
+mov ah,2
+mov dl,'|'
+int 21h
+mov ax,[2ch]
+test ax,ax
+jz done
+mov ds,ax
+mov bx,0
+scan:
+cmp byte ptr [bx],0
+je repl
+inc bx
+jmp scan
+repl:
+mov byte ptr [bx],'$'
+mov dx,0
+mov ah,9
+int 21h
+done:
+mov ah,4ch
+mov al,0
+int 21h
+"""
+
+# 4Bh with a full parameter block: an environment block taken from 48h and
+# filled with FOO=BAR, and the counted command tail "HI".
+T_EXEC_ARGS = PROLOG + """
+mov ah,48h
+mov bx,1
+int 21h
+mov [envseg],ax
+mov es,ax
+mov si,offset envstr
+xor di,di
+mov cx,10
+rep movsb
+push ds
+pop es
+mov bx,offset paramblk
+mov ax,[envseg]
+mov [bx],ax
+mov ax,offset cmdstr
+mov [bx+2],ax
+mov ax,ds
+mov [bx+4],ax
+mov ax,4b00h
+lea dx,c3name
+int 21h
+mov bp,ax
+ret
+envseg dw 0
+paramblk dw 0
+dd 0
+dd 0
+dd 0
+envstr db 'FOO=BAR',0,0,0
+cmdstr db 2,'HI',13
+c3name db 'c3.com',0
+"""
+
 T_EXEC_TSR = PROLOG + """
 mov ah,4bh
 mov al,0
@@ -996,6 +1119,26 @@ def main():
         check("exec-reports-child-exit-code",
               reg(out, "BP") == 5, reg(out, "BP"))
         check("exec-error-answers", reg(out, "BX") == 0, reg(out, "BX"))
+
+        # Nested exec: the grandchild's exit code has to come back two levels.
+        for nm, src in (("c1", C1_ASM), ("c2", C2_ASM), ("c3", C3_ASM)):
+            with open(os.path.join(d, nm + ".asm"), "w") as f:
+                f.write(src)
+            subprocess.run([mue, "-a", nm + ".asm", nm + ".com"], cwd=d,
+                           capture_output=True, timeout=60)
+        rc, out = run(mue, T_EXEC_C1, d)
+        txt = guest_text(out)
+        check("exec-nested",
+              reg(out, "BP") == 9 and "c1" in txt and "c2" in txt and
+              txt.index("c1") < txt.index("c2") < txt.index("parent"),
+              (reg(out, "BP"), repr(txt)))
+
+        # Command tail and environment, both from the child's own PSP.
+        rc, out = run(mue, T_EXEC_ARGS, d)
+        txt = guest_text(out)
+        check("exec-command-tail", "HI|" in txt.replace("\r", ""), repr(txt))
+        check("exec-environment", "FOO=BAR" in txt, repr(txt))
+        check("exec-args-returns-child-code", reg(out, "BP") == 0, reg(out, "BP"))
 
         # A child that leaves through 31h: its AL must reach the 4Bh caller.
         with open(os.path.join(d, "tsr.asm"), "w") as f:
