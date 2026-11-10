@@ -466,6 +466,69 @@ ret
 buf db 80 dup(0)
 """
 
+# 36h: every drive reports the same fixed picture; DL > 26 is AX=0xFFFF.
+# The guest does the invalid drive first, so DX still holds the valid answer at
+# the end; CX is a sentinel 36h must not touch.
+T_FREESPACE = PROLOG + """
+mov cx,1234h
+mov ah,36h
+mov dl,27
+int 21h
+mov si,ax
+pushf
+pop di
+mov ah,36h
+mov dl,3
+int 21h
+mov bp,ax
+ret
+"""
+
+# 48h/49h/4Ah: two blocks, a grow that cannot fit, then a double free.  CL
+# collects a bit for every CF that came back wrong (set where it should be
+# clear, clear where it should be set), so CL=0 at the end means every call
+# answered the way DOS says.  The grow asks for 0xFFF0 paragraphs, more than
+# the whole arena, so it can never succeed.
+T_MEMORY = PROLOG + """
+mov cl,0
+mov ah,48h
+mov bx,10h
+int 21h
+jnc a1
+or cl,1
+a1:
+mov bp,ax
+mov ah,48h
+mov bx,20h
+int 21h
+jnc a2
+or cl,2
+a2:
+mov si,ax
+mov ah,4ah
+mov es,si
+mov bx,0fff0h
+int 21h
+jc g1
+or cl,4
+g1:
+mov dx,ax
+mov ah,49h
+mov es,bp
+int 21h
+jnc f1
+or cl,8
+f1:
+mov ah,49h
+mov es,bp
+int 21h
+jc f2
+or cl,16
+f2:
+mov di,ax
+ret
+"""
+
 # Round trip: mkdir, chdir, get the directory, climb back out, rmdir.  The
 # guest prints each 47h answer (converted to '$' in place) so the host can see
 # the path itself, and leaves the last chdir's CF/AX in BP/BX.
@@ -814,6 +877,33 @@ def main():
               dx is not None and dx not in (0, ord("/"), ord("\\")), dx)
         check("getdir-invalid-drive", cx == 0x0F, cx)
         check("getdir-invalid-drive-cf", di is not None and (di & 1), di)
+
+        # 36h free space: constants from the original's inline arm, and the
+        # invalid drive answer.
+        rc, out = run(mue, T_FREESPACE, d)
+        check("freespace-valid-drive",
+              reg(out, "BP") == 0x0012 and reg(out, "BX") == 0x0200 and
+              reg(out, "DX") == 0xA000,
+              (reg(out, "BP"), reg(out, "BX"), reg(out, "DX")))
+        check("freespace-leaves-cx", reg(out, "CX") == 0x1234, reg(out, "CX"))
+        check("freespace-invalid-drive",
+              reg(out, "SI") == 0xFFFF and (reg(out, "DI") or 0) & 1,
+              (reg(out, "SI"), reg(out, "DI")))
+
+        # 48h/49h/4Ah: the arena.
+        rc, out = run(mue, T_MEMORY, d)
+        seg1, seg2 = reg(out, "BP"), reg(out, "SI")
+        errs = (reg(out, "CX") or 0) & 0xFF      # the guest's CF error bits
+        check("alloc-returns-segment",
+              (errs & 3) == 0 and seg1 and seg2, (errs, seg1, seg2))
+        check("alloc-blocks-do-not-overlap",
+              seg1 == 0x2000 and seg2 == 0x2010, (seg1, seg2))
+        check("resize-too-big-fails-with-max",
+              reg(out, "DX") == 8 and 0 < (reg(out, "BX") or 0) < 0xFFF0,
+              (reg(out, "DX"), reg(out, "BX")))
+        check("free-block-and-double-free",
+              reg(out, "DI") == 9 and (errs & 0x1C) == 0,
+              (reg(out, "DI"), errs))
 
         # 3Bh + per-drive 47h, driven by a full mkdir/chdir/getdir round trip.
         rc, out = run(mue, T_CHDIR, d)

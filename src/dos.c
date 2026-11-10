@@ -234,6 +234,62 @@ static int dos_apply_path(int drive, const char *path, char *out, size_t n)
     return 0;
 }
 
+/* ---- INT 21h 48h/49h/4Ah: memory blocks ----------------------------- */
+/* The original's handlers (0x60A910, 0x60AE30, 0x60B0B0) are VB wrappers
+ * around its internal block allocator: they hand out 0x500-byte chunks from a
+ * private range that starts at 0x3000 and is capped at 0x9000 (globals
+ * ds:0x621DAC base / 0x621DB0 / 0x621DB4 count / 0x621DB8 block list), reusing
+ * freed entries.  They return their result in EAX to an arm that discards it,
+ * so a guest sees *no* segment and *no* error code at all - the arms
+ * 0x52A266/0x52A291/0x52A2BC just call and jump to the shared epilogue.
+ *
+ * That is unusable for a program that really allocates, so the clone answers
+ * the DOS way from an arena of its own, well above the guest's PSP at 0x0100.
+ * Blocks are paragraphs and never move; 4Ah only grows a block in place. */
+#define DOS_HEAP_FIRST 0x2000
+#define DOS_HEAP_END   0xA000
+#define DOS_BLOCKS     64
+
+static struct {
+    uint16_t seg, paras;
+    int used;
+} dos_block[DOS_BLOCKS];
+
+/* Is [seg, seg+paras) clear of every live block? */
+static int dos_gap_free(uint32_t seg, uint32_t paras)
+{
+    int i;
+    for (i = 0; i < DOS_BLOCKS; i++) {
+        uint32_t b = dos_block[i].seg;
+        if (!dos_block[i].used) continue;
+        if (seg < b + dos_block[i].paras && b < seg + paras) return 0;
+    }
+    return 1;
+}
+
+/* Largest run of free paragraphs in the arena - what 48h/4Ah report in BX
+ * when they fail, so the guest can retry with a smaller request. */
+static uint32_t dos_largest_free(void)
+{
+    uint32_t seg, run = 0, best = 0;
+    for (seg = DOS_HEAP_FIRST; seg < DOS_HEAP_END; seg++) {
+        if (dos_gap_free(seg, 1)) {
+            if (++run > best) best = run;
+        } else {
+            run = 0;
+        }
+    }
+    return best;
+}
+
+static int dos_block_find(uint32_t seg)
+{
+    int i;
+    for (i = 0; i < DOS_BLOCKS; i++)
+        if (dos_block[i].used && dos_block[i].seg == seg) return i;
+    return -1;
+}
+
 /* Build a $-terminated string starting at DS:DX and print it. */
 static void print_dollar_string(void)
 {
@@ -544,6 +600,85 @@ static void int21(void)
         /* Original: 0x5DC390 returns ds:0x621C5C, arm puts it in AL. */
         setAThi(dos_drive);
         break;
+
+    case 0x36: {                                /* free disk space */
+        /* Original (0x527F35-0x528060): DL above 26 sets both halves of AX
+         * (AL and AH) to 0xFF, i.e. AX=0xFFFF.  Every other drive gets the
+         * same fixed picture: AL=0x12, AH=0, BX=0x0200, DL=0, DH=0xA0, with CX
+         * and the other registers untouched.  There is no filesystem behind
+         * it, so the values never change. */
+        if ((cpu.r[DX] & 0xFF) > 26) {
+            dos_file_error(0xFFFF);
+            break;
+        }
+        setAX(0x0012);                          /* AL=18, AH=0 */
+        cpu.r[3] = 0x0200;                      /* BX */
+        cpu.r[2] = 0xA000;                      /* DL=0, DH=0xA0 */
+        cpu.flags &= ~F_CF;
+        break; }
+
+    case 0x48: {                                /* allocate block, BX paras */
+        uint32_t want = cpu.r[3], seg = DOS_HEAP_FIRST;
+        int slot = -1, i;
+
+        for (i = 0; i < DOS_BLOCKS; i++)
+            if (!dos_block[i].used) { slot = i; break; }
+        if (want)
+            for (; seg + want <= DOS_HEAP_END; seg++)
+                if (dos_gap_free(seg, want)) break;
+        /* want=0 still lands here: `seg + 0 <= END` holds, so the guard below
+         * is what rejects it. */
+        if (!want || seg + want > DOS_HEAP_END || slot < 0) {
+            cpu.r[3] = (uint16_t)dos_largest_free();
+            dos_file_error(8);                  /* insufficient memory */
+            break;
+        }
+        dos_block[slot].seg = (uint16_t)seg;
+        dos_block[slot].paras = (uint16_t)want;
+        dos_block[slot].used = 1;
+        setAX((uint16_t)seg);
+        cpu.flags &= ~F_CF;
+        break; }
+
+    case 0x49: {                                /* free block, ES = segment */
+        int i = dos_block_find(cpu.sr[ES]);
+
+        if (i < 0) {
+            dos_file_error(9);                  /* invalid block */
+            break;
+        }
+        dos_block[i].used = 0;
+        setAX(0);
+        cpu.flags &= ~F_CF;
+        break; }
+
+    case 0x4A: {                                /* resize block, ES/BX */
+        int i = dos_block_find(cpu.sr[ES]);
+        uint32_t seg, want = cpu.r[3];
+
+        if (i < 0) {
+            dos_file_error(9);                  /* invalid block */
+            break;
+        }
+        seg = dos_block[i].seg;
+        if (want > dos_block[i].paras) {
+            /* Blocks never move: ask for the space right after this one. */
+            uint32_t grow = want - dos_block[i].paras, room = 0;
+
+            while (seg + dos_block[i].paras + room < DOS_HEAP_END &&
+                   dos_gap_free(seg + dos_block[i].paras + room, 1) &&
+                   room < grow)
+                room++;
+            if (room < grow) {
+                cpu.r[3] = (uint16_t)(dos_block[i].paras + room);
+                dos_file_error(8);              /* insufficient memory */
+                break;
+            }
+        }
+        dos_block[i].paras = (uint16_t)want;
+        setAX(0);
+        cpu.flags &= ~F_CF;
+        break; }
 
     case 0x3B: {                                /* change directory */
         char path[160], want[160];

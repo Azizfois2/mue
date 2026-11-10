@@ -2087,3 +2087,81 @@ did leave and the rmdir landed in the parent). Verified to bite: deleting the
 `dos_dir[dos_drive]` store fails the first two and the cleanup check (the
 guest then rmdirs the wrong directory), and dropping the `dos_chdir()`
 failure from the guard fails `chdir-missing-dir-fails` with `AX=0`.
+
+## 29. INT 21h 36h, and 48h/49h/4Ah (IMPLEMENTED, with a divergence)
+
+### 36h free disk space (CONFIRMED)
+
+The inline arm is `0x527F35-0x528060`. It reads DL (`movzx ax, byte [edx+0xc0]`)
+and compares it with `0x1A` (26):
+
+- **DL > 26**: both bytes of AX are set from the constant `0xFF`
+  (`0x527F61`/`0x527F7C`, stored to `+0xBA` = AL and `+0xBB` = AH), so
+  **AX = 0xFFFF**. Nothing else is written.
+- **otherwise**: `AH = 0` (`0x527FA7`), `AL = 0x12` (`0x527FC2`), then a
+  scratch pair is loaded with `0` and `2` and copied into BL/BH, i.e.
+  **BX = 0x0200**, and `DL = 0`, `DH = 0xA0`, i.e. **DX = 0xA000**
+  (`0x52803F`, `0x52805A`). CX is never touched.
+
+So there is no filesystem behind 36h: every drive (0..26 alike) reports the
+same 18/512/40960 picture and the numbers never change. In DOS terms these
+land in the sectors-per-cluster, "bytes per sector" and total-cluster slots,
+and CX - the real "bytes per sector" slot - is left as the guest had it, which
+is the practical proof that the original is not querying anything.
+
+Clone: the same constants (`AX=0x0012`, `BX=0x0200`, `DX=0xA000`, CX
+untouched), plus `CF=1, AX=0xFFFF` for `DL > 26` per the house error
+convention.
+
+Checks: `freespace-valid-drive` (AX/BX/DX), `freespace-leaves-cx` (a sentinel
+`CX=0x1234` comes back unchanged) and `freespace-invalid-drive` (`AX=0xFFFF`,
+CF set). Verified to bite: deleting the `BX` store fails `freespace-valid-drive`
+with `BX=0`.
+
+### 48h/49h/4Ah memory blocks (CONFIRMED: the guest sees nothing)
+
+The arms are one-liners: `0x52A266 call 0x60A910` (48h), `0x52A291 call
+0x60AE30` (49h), `0x52A2BC call 0x60B0B0` (4Ah), each followed directly by
+`jmp 0x52A52A`. **None of them writes the register frame** - no `+0xC0`..`+0xC3`
+access appears anywhere in `0x60A910-0x60B3A0` - so the EAX the handlers
+compute is discarded. A guest calling 48h gets no segment, and no error code;
+its CF is whatever it was.
+
+What the handlers do internally (relevant only if we ever need the layout): a
+VB wrapper around the project object's allocator (`ds:0x6214D0`, slots
+`+0x818`/`+0x828`/`+0x83C`/`+0x840`/`+0x70C`/`+0x714`), driven by globals
+`ds:0x621DAC` (base, starts at 0 and bumps to 0x3000 - `0x60A964`/`0x60A96E`),
+`ds:0x621DB0`, `ds:0x621DB4` (block count) and `ds:0x621DB8` (a VB array of
+freed blocks). 48h allocates in 0x500 steps and refuses past 0x9000
+(`0x60AA1E`, `0x60AB9D`); a freed block whose value falls in
+`[0x3000, 0x9000)` is popped from the array and reused. 49h frees by pushing
+the current block onto that array; 4Ah asks for a resize and, when the size is
+`<= 0x500`, frees the block instead. `0x60B3A0` is the reset routine that
+zeroes all four globals.
+
+**Divergence, deliberate:** "returns nothing" makes 48h useless to a real
+program, so the clone answers the DOS way from its own arena:
+
+- Arena: paragraphs `0x2000`..`0xA000`, above the guest's PSP at `0x0100`
+  (see `main.c`), first fit, blocks never move.
+- `48h` (BX = paragraphs): success returns the segment in **AX** with CF
+  clear; failure returns **AX=8** and **BX = largest free run**, CF set.
+- `49h` (ES = segment): frees the block, `AX=0`, CF clear; an unknown segment
+  gives **AX=9**, CF set.
+- `4Ah` (ES/BX): shrink always succeeds; grow only in place, so a block that
+  cannot expand by the requested amount fails with **AX=8** and
+  **BX = current size + the room that is there**, CF set. An unknown segment
+  gives AX=9.
+
+Guest `T_MEMORY` allocates 16 and 32 paragraphs, asks 4Ah to grow the second to
+0xFFF0 paragraphs (the whole arena is 0x8000, so it must fail), frees the first
+block twice, and collects a bit in CL for every CF that came back wrong.
+
+Checks: `alloc-returns-segment`, `alloc-blocks-do-not-overlap` (first fit puts
+them at 0x2000 and 0x2010), `resize-too-big-fails-with-max` (`AX=8`, BX below
+the request) and `free-block-and-double-free` (`AX=9`, and CL stayed 0).
+Verified to bite: dropping the 4Ah error code fails
+`resize-too-big-fails-with-max`, and dropping the `used = 0` in 49h fails
+`free-block-and-double-free`. Note the first version of this guest had its
+`jnc`/`jc` the wrong way round on the expected-failure branch and *reported*
+success - the CL sentinel is what caught it.
