@@ -7,6 +7,7 @@
  */
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 #ifdef _WIN32
+#include <direct.h>
 #include <fcntl.h>
 #include <io.h>
 #define DOS_IREAD   _S_IREAD
@@ -605,6 +607,23 @@ static void int21(void)
 
         if (dos_guest_name(name, sizeof name) != 0) { dos_file_error(3); break; }
         if (remove(name) != 0) { dos_file_error(2); break; }
+        cpu.flags &= ~F_CF;
+        break; }
+
+    case 0x39:                                  /* create directory */
+    case 0x3A: {                                /* remove directory */
+        char name[128];
+        int r;
+
+        if (dos_guest_name(name, sizeof name) != 0) { dos_file_error(3); break; }
+        r = (ah == 0x39) ? mkdir(name) : rmdir(name);
+        if (r != 0) {
+            /* DOS reports 3 when the path does not exist and 5 for every
+             * other refusal (already there, not empty, is a file).  The
+             * CF + code convention is the clone's, see 21.3. */
+            dos_file_error(errno == ENOENT ? 3 : 5);
+            break;
+        }
         cpu.flags &= ~F_CF;
         break; }
 

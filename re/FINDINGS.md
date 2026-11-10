@@ -1961,3 +1961,33 @@ the table in 25.2), `re/objtab.py` (records + name-table pointers),
 `re/globalidx.py` (packed name-table index walk), `re/site7ac.py` (all
 `[x+0x7AC]` call sites with the flags/messages around them),
 `re/find_iid.py` (IID occurrences), `re/rsrc.py` (resource directory).
+
+## 26. INT 21h 39h/3Ah (mkdir/rmdir), chosen by measuring the examples (IMPLEMENTED)
+
+Before adding services, the shipped programs were measured rather than
+guessed: `re/int21_usage.py` walks `C:/emu8086/examples/**/*.asm`, finds every
+`int 21h`, and takes the `mov ah,`/`mov ax,` that precedes it. Result over 73
+sites: 09 (17), 3E (9), 40 (6), 0A/3C/42 (5), 4C (4), 2C/3D/43 (3), 39/3A/3F/
+56/41 (2), 01/02/2A (1). **The only functions used and missing were 39h and
+3Ah**, both only in `file-operations.asm`, so those are what this change adds;
+everything else in the original's 47-AH set (`05,0C,0D,0E,17,1F,23,2E,33,36,
+47,48,49,4A,54,57`) is unused by the examples and stays unimplemented.
+
+Both take an ASCIIZ path at `DS:DX` and report through the convention of 21.3
+(`CF` + DOS code, our deliberate divergence from AX-only):
+
+| call | success | failure |
+|---|---|---|
+| `39h` create directory | `CF=0` | `AX=5` if it already exists, `AX=3` if the path does not resolve |
+| `3Ah` remove directory | `CF=0` | `AX=3` when there is no such directory, `AX=5` for other refusals (not empty, is a file) |
+
+`errno == ENOENT` picks 3, everything else 5 - which is how DOS itself
+distinguishes "not found" from "access denied".
+
+Checks: `mkdir-creates-directory`, `mkdir-cf-clear`,
+`mkdir-exists-is-denied` (`AX=5`), `mkdir-exists-cf`, `rmdir-removes-directory`,
+`rmdir-cf-clear`, `rmdir-missing-not-found` (`AX=3`), `rmdir-missing-cf`.
+Verified to bite: short-circuiting the two cases fails five of them
+(`mkdir-creates-directory`, `mkdir-exists-is-denied`, `mkdir-exists-cf`,
+`rmdir-missing-not-found`, `rmdir-missing-cf`) while the CF-clear checks pass
+vacuously, as expected.

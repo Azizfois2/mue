@@ -420,6 +420,40 @@ ret
 fnew db 'new.txt',0
 """
 
+# 39h/3Ah.  The guests leave the directory for the host to inspect, so the
+# checks can look at both the registers and the filesystem.
+T_MKDIR = PROLOG + """
+mov ah,39h
+lea dx,dname
+int 21h
+pushf
+pop si
+mov ah,39h
+lea dx,dname
+int 21h
+mov di,ax
+pushf
+pop bp
+ret
+dname db 'mk_a',0
+"""
+
+T_RMDIR = PROLOG + """
+mov ah,3ah
+lea dx,dname
+int 21h
+pushf
+pop si
+mov ah,3ah
+lea dx,dname
+int 21h
+mov di,ax
+pushf
+pop bp
+ret
+dname db 'mk_a',0
+"""
+
 T_ATTR_ERR = PROLOG + """
 mov ah,43h
 mov al,0
@@ -641,6 +675,29 @@ def main():
         check("attrs-missing-cf", di is not None and (di & 1), di)
         check("attrs-bad-subfunction", bx == 1, bx)
         check("attrs-bad-subfunction-cf", si is not None and (si & 1), si)
+
+        # 39h/3Ah: the two functions the shipped examples call that were
+        # missing (examples/file-operations.asm).  DOS answers 5 for "already
+        # exists" / "not empty" and 3 for "no such path".
+        rc, out = run(mue, T_MKDIR, d)
+        si = reg(out, "SI")
+        di = reg(out, "DI")
+        bp = reg(out, "BP")
+        check("mkdir-creates-directory", os.path.isdir(os.path.join(d, "mk_a")),
+              os.listdir(d))
+        check("mkdir-cf-clear", si is not None and not (si & 1), si)
+        check("mkdir-exists-is-denied", di == 5, di)
+        check("mkdir-exists-cf", bp is not None and (bp & 1), bp)
+
+        rc, out = run(mue, T_RMDIR, d)
+        si = reg(out, "SI")
+        di = reg(out, "DI")
+        bp = reg(out, "BP")
+        check("rmdir-removes-directory", not os.path.exists(os.path.join(d, "mk_a")),
+              os.listdir(d))
+        check("rmdir-cf-clear", si is not None and not (si & 1), si)
+        check("rmdir-missing-not-found", di == 3, di)
+        check("rmdir-missing-cf", bp is not None and (bp & 1), bp)
 
         rc, out = run(mue, T_INT16_PEEK, d, b"K")
         bx = reg(out, "BX")
