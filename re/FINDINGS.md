@@ -464,7 +464,10 @@ Single function `FUN_0051FF60`, 43557 bytes, 947 blocks (ranges
 `0x51FF60-0x5235BA/0x5235C0-0x52A938/...`; tail `0x52A934` shared exit).
 Register-field block at `[ebp+8]` (CONFIRMED offsets, reused in every
 handler): `+0xBA`=AL, `+0xBB`=AH, `+0xBC`=BL, `+0xBD`=BH, `+0xBE`=CL,
-`+0xBF`=CH, `+0xC0`=DL, `+0xC1`=DH, `+0x4C`=carry flag word.
+`+0xBF`=CH, `+0xC0`=DL, `+0xC1`=DH. **CORRECTED:** `+0x4C` is a *halt* word,
+not the carry flag - its only write in the dispatcher is `0x529F74`
+(`WORD [regblock+0x4C] = 0xFFFF`) immediately beside `ds:0x621218 = 0xFFFF`
+and the stop sink, which is the terminate path. See 21.2.
 
 **High-register / segment fields (CORRECTED; an earlier revision of this table
 said `+0xC4`=SI and `+0xCA`=DI, which is wrong):**
@@ -495,7 +498,7 @@ plus `INT %02X`-style templates at `0x447F78/0x44800C/0x448094`.
 | `17` | - | direct `CALL 0x550B40` ("wrong parameter...") |
 | `1A` | AH=`00` (time-of-day; host clock `fmul [0x409828]` -> `>>1` div-2 BCD chain -> CH/CL/DH/DL; CX/DX read-path variant) | fail template `0x4479D4` at `0x5252EE`; see 5.5 |
 | `19` | - | reboot: `[ecx+0x4C]=0xFFFF; [0x621218]=0xFFFF; CALL [eax+0x7AC]` |
-| `20` | - | terminate: same `0x4C/0x621218=0xFFFF` + `[eax+0x7AC]` halt |
+| `20` | - | terminate: same `0x4C/0x621218=0xFFFF` + `[eax+0x7AC]` (identity of that sink is still open, 21.2) |
 | `21` | 47 AHs: `00,01,02,05,06,07,08,09,0A,0B,0C,0D,0E,17,19,1A,1F,25,2A,2C,2E,30,35,36,39,3A,3B,47,3C,3D,3E,3F,40,41,42,4D,54,56,4C,4E,4F,57,23,33,48,49,4A` | doc lists 27; the other 20 (00,0D,17,1A,1F,23,2E,30,33,36,43,48,49,4A,4D,4E,4F,54,56,57) still have compare-and-handle bodies in the binary; fail template `0x447EB0` at `0x52A2D4`; shared exit `0x52A52A: jmp 0x52A934` |
 | `33` | AX=`0000/0001/0002/0003` (mouse; template `0x453680` `int 33h/AX=0` at `0x5EEFB5/0x5EF1B8`) | else `not supported INT 21h/33h AL=` (`0x448798`); reg-dump block at `0x52A549` pushes fields `+0xBA..+0xC1` |
 
@@ -568,8 +571,10 @@ behaviour:
   at all when the bit is clear. Before this change the clone had no cursor at
   all - AH=02 was a no-op and AH=03 always returned 0,0.
 - `CX > 0x7D0` is refused: diagnostic on stderr, then halt with
-  `exit_code = -5`, matching `0x522F70` -> log -> `[obj+0x7AC]` halt ->
-  `WORD ds:0x62141C = 0xFFFF` (`0x52301E-0x523079`).
+  `exit_code = -5`, matching `0x522F70` -> log -> `[obj+0x7AC]` ->
+  `WORD ds:0x62141C = 0xFFFF` (`0x52301E-0x523079`). The clone treats that
+  path as a halt; whether `[obj+0x7AC]` *is* the halt or only the message
+  sink is still open (21.2), so this remains INFERRED.
 
 Regressions: `src/check_int10.py`, 18 checks (advance, pairs, no-advance,
 AH=02/AH=03 round trip, teletype movement, cell reads/writes, scroll, CX
@@ -625,9 +630,8 @@ Entry `0x523C49` (INT byte test `0x13`, slot copy `AH->[ebp-0x278]` at
   `"INT 13h, AH=0"` (`0x447884`) + `"h   "` (`0x4478A4`) +
   `"- not supported yet."` (`0x4478B4`) + `"refer to the list of
   supported i..."` (`0x44782C`) composed through `0x5F2380` + `0x547EC0`
-  (same log pipeline as the INT 10h fail paths), then forces the
-  `+0x7AC` halt call and sets `WORD [0x62141C] = 0xFFFF` before the shared
-  exit.
+  (same log pipeline as the INT 10h fail paths), then calls `+0x7AC` and
+  sets `WORD [0x62141C] = 0xFFFF` before the shared exit.
 
 Geometry ground truth (CONFIRMED by host file, not by REA):
 `C:\emu8086\FLOPPY_0` = 1474560 bytes = 80 tracks x 2 heads x 18 sectors
@@ -1314,10 +1318,11 @@ files, 5 access denied, 6 invalid handle. Writes are flushed when the call
 returns, so a reader that reopens the file sees them immediately.
 
 **Scope of the claim.** The handler addresses, the host-file backing and the
-`AL` seek-origin constraint are read from the binary. The numbering and the
-`CF`/`AX` error convention are the documented DOS contract the original
-implements - they are asserted by the regression, not derived from the
-disassembly, and should be called INFERRED rather than CONFIRMED.
+`AL` seek-origin constraint are read from the binary. The numbering is the
+standard DOS one. The `CF`/`AX` error convention was originally written here
+as INFERRED; it has since been checked against the dispatcher and the original
+**does not do that** - it answers in `AX` alone, with different codes, and
+never raises `CF`. 21 has the evidence and what the clone does instead.
 Handle 0 (stdin) is covered in 20; `AH=41` and `AH=4E`/`4F` in 19.
 
 Regression `src/check_int21.py` (14 checks, wired into `make test`): each
@@ -1427,3 +1432,76 @@ contains `hi\r`), `stdin-continues-after-cr`, `stdin-rest-unconsumed`
 bite: dropping the CR stop makes the first read take all 8 bytes and keeps
 `hi\r\nrest`; dropping `_setmode` loses the CR and fails the same four
 checks.
+
+## 21. INT 21h result convention, checked against the dispatcher (CONFIRMED)
+
+§18 left the `AX` vs `CF`/`AX` question labelled INFERRED. It has now been read
+out of `FUN_0051FF60` itself, and the answer is: **the original answers in `AX`
+only, and never raises `CF` for 3C/3D/3E/3F/40/42.**
+
+### 21.1 How an INT 21h arm reports
+
+The register block is zeroed at entry on four 16-bit status words:
+
+| word | zeroed at | set to 0xFFFF by |
+|---|---|---|
+| `+0x38` | `0x51FFBE` | every failure branch |
+| `+0x3A` | `0x51FFCE` | every success branch |
+| `+0x3C` | `0x51FFDE` | other INTs |
+| `+0x3E` | `0x51FFEE` | other INTs |
+
+They are **not** guest flags. A post-step reporter reads each one and turns it
+into a UI message: `+0x38` at `0x50108C` fetches text through object `0x621DEC`
+vtable `+0x304` and shows it, `+0x3A` at `0x501169` uses vtable `+0x308`, and
+`+0x3C`/`+0x3E` at `0x501246`/`0x501323` do the same. So `+0x38` = "error
+message", `+0x3A` = "info message": bookkeeping for the emulator's own
+reporting, nothing a guest can branch on.
+
+### 21.2 What the guest actually gets
+
+Success: the result is written to `AL` (`+0xBA`) - handle, byte count, or the
+low half of a 32-bit position - and `+0x3A` is marked. Examples: `0x528882`
+(3C), `0x528C27` (3E), `0x5290CC` (3F), `0x5298E8` (42).
+
+Failure: `+0x38` is marked, `AH` is set to 0 and `AL` to a **fixed per-call
+code**, which is the same regardless of the real reason:
+
+| AH | failure AX | evidence |
+|---|---|---|
+| `3C` | `0x0003` | `0x528133` mark, `AL=3` at `0x528158` |
+| `3D` | `0x0003` | `0x528A21`, `AL=3` at `0x528A54` |
+| `3E` | `0x0006` | `0x528C69`, `AL=6` at `0x528C8E` |
+| `3F` | `0x0005` | `0x5290DE`, `AL=5` at `0x529111` |
+| `40` | `0x0005` | `0x529574`, `AL=5` at `0x529599` |
+| `42` | `0x0003` | `0x52968D`, `AL=3` at `0x5296B2` |
+
+`3C`/`3D` additionally log `"interrupt error: "` (`0x447E40`) +
+`"h/3Dh : cannot open file."` (`0x447E68`) and set the global error flag
+`0x62141C = 0xFFFF` (`0x528BC4`).
+
+None of these branches writes any other register field, so a guest that does
+`int 21h` / `jc error` on emu8086 branches on the CF it had *before* the
+interrupt. That is the original's behaviour, and it is why DOS error handling
+"works" in the docs but not here.
+
+**Still open (do not over-claim):** the identity of the sink `[obj+0x7AC]`,
+called by the 3C/3D failure paths and by the INT 10h AH=13h `CX` guard. It has
+62 call sites, takes no arguments beyond `this`, and is reached from
+non-error code as well (`0x4E18DF`), so it may be "stop" or "refresh/notify".
+The unambiguous halt marker is `ds:0x621218 = 0xFFFF` (INT 19/20), and these
+file-error paths do **not** set it. Wherever earlier sections say "halts
+through `[obj+0x7AC]`", read that as INFERRED rather than CONFIRMED.
+Related: `+0x4C` is a halt word, not the carry flag, correcting the table in
+5.1.
+
+### 21.3 What the clone does, and why
+
+`src/dos.c` keeps the DOS convention: `CF=1` plus a DOS error code
+(`2` not found, `3` path, `4` too many files, `5` access, `6` invalid handle,
+`0x12` no more files). That is a **deliberate, verified divergence**: without
+`CF` a guest has no failure signal at all, and every program that probes for a
+file would take its success path. Keeping `CF` makes those programs run
+correctly; it does not make the clone byte-identical to emu8086 here.
+
+The divergence is confined to the failure branch - success paths already match
+the original (`AX` = handle/bytes/position).
