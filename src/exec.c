@@ -586,9 +586,13 @@ H(bd_, cpu.r[BP] = fetch16());
 H(be_, cpu.r[SI] = fetch16());
 H(bf_, cpu.r[DI] = fetch16());
 
-/* C0-C1 80186 shift-with-immediate: rejected (FINDINGS sec. 5) */
-REJECT_80186(c0)
-REJECT_80186(c1)
+/* C0/C1: shift/rotate by immediate.  Not encodable on a plain 8086, but
+ * emu8086 documents "SHL REG, immediate" as a valid operand form
+ * (documentation/8086_instruction_set.html) and its assembler accepts it, so
+ * the immediate form has to run rather than be rejected - our own assembler
+ * already emits C1 for `rol ax,4` (FINDINGS 23). */
+H(c0, grp2(8, 0, 1));
+H(c1, grp2(16, 0, 1));
 
 /* C2/C3 RET */
 H(nC2, { uint16_t n = fetch16(); cpu.ip = pop16(); cpu.r[SP] = (uint16_t)(cpu.r[SP] + n);

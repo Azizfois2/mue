@@ -1547,3 +1547,73 @@ Proved to bite: stubbing `rename()` and dropping the read-only bit fail
 `attrs-readonly-readable` respectively. The test also caught itself crashing
 on a missing file instead of reporting - fixed by making the permission
 restore tolerant.
+
+## 23. `examples/dirlist.asm`: a 4Eh/4Fh lister, and what the original does (CONFIRMED)
+
+`examples/dirlist.asm` walks the current directory with `AH=4Eh`/`4Fh` and
+prints `NAME  size` in hex per entry, reading the default DTA at `PSP:0080`
+(name `+1Eh`, size `+1Ah`, the layout confirmed in 19). It stops when the
+search reports "no more files" - testing both `CF` and `AX != 0` so it works
+whether the emulator uses the DOS convention or a plain error code.
+
+`src/check_dirlist.py` (wired into `make test`) runs it in a scratch directory
+with known contents: four files of 5/3/10/1 bytes and a subdirectory. It
+asserts the exact listing (`A.TXT  0005`, `B.TXT  0003`, `C.DAT  000A`,
+`KEEP.ME  0001`), that the directory is skipped (`CX=0` search), that names are
+upper-case, that the guest leaves through `AH=4Ch` (`AX=4C00h`), and that an
+empty directory lists nothing and still terminates.
+
+### 23.1 Check against the real emulator
+
+Two things had to be checked against the install rather than assumed.
+
+**4Eh/4Fh are not a supported call.** `documentation/8086_bios_and_dos_
+interrupts.html` lists the INT 21h AHs the emulator supports:
+`01,02,05,06,07,09,0A,0B,0C,0E,19,25,2A,2C,35,39,3A,3B,3C,3D,3E,3F,40,41,42,
+47,4C,56` - no `4E`, no `4F`, and no `43` either (22 implements 43 anyway,
+because the dispatcher has an arm for it).
+
+**The arms exist but return nothing.** `0x52A146` (`4E`) and `0x52A171` (`4F`)
+call `0x5E25E0`/`0x5E2C20` and jump straight to the shared exit; neither arm
+touches a register. Inside `0x5E25E0` there is not a single write to the
+register block (`+0xBA`/`+0xBB`/`+0x38`/`+0x3A`); it fills the DTA through the
+global `0x621C48` and sets its own globals. So the guest's `AX` and `CF` are
+**unchanged** by 4Eh/4Fh.
+
+Predicted behaviour of the shipped program on the real emulator: after
+`mov ah,4Eh; int 21h`, `AX` is still `4E00h`, so the `or ax,ax` / `jnz done`
+guard fires on the first iteration and the program prints **nothing**. The
+clone's `CF=1` + `AX=0x12` for "no more files" is the DOS contract (and what
+a guest needs), not the original's behaviour - the same divergence described
+in 21.3.
+
+**Paths.** The original's file and search handlers go through the vdrive
+object at `0x6214D0` (calls `+0x804`/`+0x808` in `0x5E25E0`), i.e. the virtual
+drives under `C:\emu8086\vdrive\`; the clone resolves host paths relative to
+its working directory. A 4Eh search therefore lists different directories on
+the two implementations even before the return codes differ.
+
+One more difference inside the DTA: the clone writes the name as `A.TXT`
+(the host name upper-cased), where DOS pads it to `A       TXT`. The ASCIZ
+field is what the program reads, so this only matters to a guest that wants
+the padded 11-byte form.
+
+### 23.2 A CPU defect the program exposed (FIXED)
+
+Writing the hex printer with `rol ax,4` produced no output. Two facts, in
+order:
+
+- the clone's assembler emits `C1 C0 04` for `rol ax,4` - the 186+ immediate
+  form. That is right: emu8086 documents `SHL REG, immediate` and
+  `SHL memory, immediate` as valid operand forms, and its instruction list
+  includes `PUSHA`/`POPA`, so 186 encodings are in scope;
+- `src/exec.c` **rejected** `C0`/`C1` (`REJECT_80186`), so the instruction
+  halted the run with exit code -2, and before that change it silently did
+  nothing.
+
+The core now executes both through the existing `grp2(width, 0, 1)` path
+(rotate/shift by `imm8`, count masked into 5 bits, count 0 = no operation).
+`src/test_cpu.c` pins `rol ax,4` -> `2341h`, `shl ax,4` -> `2340h`,
+`sar ax,4` of `8000h` -> `F800h`, the count-0 no-op, and the 8-bit `C0` form.
+The real assembler's own output for these was checked against the shipped
+`.list` fixtures, which use `D0`/`D1` for a count of 1.

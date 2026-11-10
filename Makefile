@@ -66,6 +66,9 @@ test: $(BIN) $(TBIN)
 	@echo "== INT 21h file services =="
 	@cd src && $(SKIPOK) "$(PYTHON)" check_int21.py
 	@echo
+	@echo "== examples/dirlist.asm (4Eh/4Fh walk) =="
+	@cd src && $(SKIPOK) "$(PYTHON)" check_dirlist.py
+	@echo
 	@echo "all checks passed (any SKIP above means emu8086 fixtures were not found)"
 
 # Breadth check: does every shipped example still assemble?  Kept out of
