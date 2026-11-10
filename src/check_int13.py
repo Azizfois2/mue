@@ -66,7 +66,11 @@ T_READ = ("mov ax,1000h\nmov es,ax\nmov bx,0\nmov ah,2\nmov al,1\n"
           "mov si,ax\npushf\npop cx\nmov ax,si\nret\n")
 T_BAD = ("mov ah,2\nmov al,1\nmov ch,0\nmov cl,0\nmov dh,0\nmov dl,0\n"
          "int 13h\npushf\npop cx\nmov ax,0\nret\n")
-T_ELSE = ("mov ah,1\nint 13h\npushf\npop cx\nmov ax,0\nret\n")
+# AH=1 is not a supported function: the original logs "INT 13h, AH=01 - not
+# supported yet.", sets the 0x62141C error word and returns (0x523E92-0x5240EF).
+# It never writes the halt marker ds:0x621218, so the guest continues - BX is
+# set after the call to prove that.  FINDINGS 24.5.
+T_ELSE = ("mov ah,1\nint 13h\npushf\npop cx\nmov bx,1234h\nmov ax,0\nret\n")
 
 # Sector I/O exercised end to end inside the guest, with no host-file oracle
 # (the clone keeps the image in memory; it does not write it back):
@@ -133,7 +137,10 @@ def main():
 
     out = run(mue, T_ELSE)
     cx = reg(out, "CX")
+    bx = reg(out, "BX")
     check("else-sets-cf", cx is not None and bool(int(cx) & 1), cx)
+    check("else-continues", bx is not None and int(bx) == 0x1234,
+          hex(bx) if bx is not None else None)
 
     # Sector I/O end to end, with the pattern on head 1 of the last track.
     # head=1 is load-bearing: DH is the register the clone once read from BH,

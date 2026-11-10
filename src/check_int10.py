@@ -230,6 +230,19 @@ def main():
     check("cx-limit-keeps-cursor", dx == 0x0305,
           hex(dx) if dx is not None else None)
 
+    # 9. An unsupported AH only reports; it does not stop the machine.  No
+    # INT 10h path in the original writes the halt marker ds:0x621218 - the
+    # whole INT 10h region (0x520000-0x523BFF) has none - so the only thing a
+    # failing call can do is log (0x52244F/0x5228B9/0x523027 ...), set the
+    # 0x62141C error word and return.  FINDINGS 24.5.
+    rc, out = run(mue, PROLOG +
+                  "mov ah,99h\nint 10h\n" +
+                  "mov ah,0eh\nmov al,'|'\nint 10h\n"      # marker
+                  "ret\n")
+    txt = guest_text(out)
+    check("unsupported-ah-continues", rc == 0 and txt == "|",
+          (rc, repr(txt)))
+
     print("INT10 %s (%d fail)" % ("PASS" if not fails else "FAIL", len(fails)))
     return 1 if fails else 0
 

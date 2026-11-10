@@ -1766,3 +1766,192 @@ declaration order (`do_instruction_D8_DF`, `MAKE_sub_BYTES`, `add_to_SCREEN`,
 `(offset-0x1C)/4`, so the offset -> name mapping is not the file order; the
 runtime-built vtable keeps that mapping in memory. Treat the *name* as open;
 the *behaviour* above (no halt, UI report) is CONFIRMED.
+
+### 24.5 Audit: no other INT 10h/13h failure path stops the machine
+
+The 24.2 result generalises, and the clone was checked against it:
+
+| path | original | clone before | clone now |
+|---|---|---|---|
+| INT 10h AH=13h `CX > 0x7D0` | log + `[obj+0x7AC]` + `0x62141C`, return (`0x522F7D`) | halt `-5` | report, continue |
+| INT 10h other fail arms | log + `[obj+0x7AC]` + `0x62141C`, return (`0x52244F`, `0x5228B9`, `0x523209`, `0x5236C2`, `0x52389C`, `0x523AFE`, `0x52409D`, `0x524DE2`, ...) | silent, continue | unchanged |
+| INT 10h unknown AH | log `"INT 10h, AH=0X - not supported yet."`, return | silent, continue | unchanged |
+| INT 13h AH=00/02/03 errors | `CF=1`, `AH=error`, return | same | unchanged |
+| INT 13h other AH | log `"INT 13h, AH=0X - not supported yet."` + `0x62141C` (`0x523E92-0x5240EF`), return | `CF=1`, `AH=1`, continue | unchanged |
+| INT 20h / INT 21h `00h`/`4Ch` | `[this+0x4C]=0xFFFF`, `ds:0x621218=0xFFFF` (`0x525833`, `0x525A3D`, `0x529F74-0x529F81`) | halt, exit code | correct as-is |
+
+Evidence for the whole-INT-10h claim: scanning the image for `ds:0x621218`
+writes yields 16 sites, **none** in the INT 10h range `0x520000-0x523BFF`
+(they are `0x4E107B`, `0x5165EC`, `0x51AED9`, `0x52557E`, `0x525833`,
+`0x525A3D`, `0x529F81`, `0x52CD0B`, `0x540F75`, `0x5A2BF6`, `0x5A2CD5`,
+`0x5A38F2`, `0x5B2BF0`, `0x5EAAAB`, plus the `mov ...,si` / `cmp` forms).
+So the only INT 10h path that *can* stop the CPU is none of them; the `-5`
+halt was a clone-only invention.
+
+What remains different is reporting, not halting: the clone is silent where
+the original logs `"INT 10h, AH=0X - not supported yet."` and
+`"INT 13h, AH=0X - not supported yet."`. Left as is (no guest-visible
+behaviour depends on it), but now recorded.
+
+New regressions pin the non-halt: `unsupported-ah-continues` in
+`src/check_int10.py` (INT 10h AH=99h, marker printed after the call, exit 0)
+and `else-continues` in `src/check_int13.py` (INT 13h AH=01h sets `BX=1234h`
+after the call). Verified to bite: making either arm halt fails them.
+
+## 25. The VB6 project layout, as a reusable reference (CONFIRMED)
+
+emu8086.exe is a native-code VB6 program. This section records the fixed
+addresses and structures so later passes do not have to rediscover them; the
+scripts named at the end regenerate every number here.
+
+### 25.1 Header and imports
+
+- PE entry point (`0x41A018`): `push 0x41AC1C; call [ThunkRTMain]` - the classic
+  VB6 stub. `ThunkRTMain` resolves to `MSVBVM60!ThunRTMain`.
+- Project header at `0x41AC1C`, magic `"VB5!"`:
+
+| offset | field | value |
+|---|---|---|
+| `+0x00` | `szVbMagic` | `"VB5!"` |
+| `+0x04` | `wRuntimeBuild` | `0x1FF0` |
+| `+0x2C` | `lpSubMain` | `0x4CC150` |
+| `+0x30` | `lpProjectData` | `0x41B5C8` |
+| `+0x34` | `fMdlIntCtls` | `0x01FEFDFF` |
+| `+0x3C` | `dwThreadFlags` | `8` |
+| `+0x40` | `dwThreadCount` | `1` |
+| `+0x44` | `wFormCount` | `39` |
+| `+0x46` | `wExternalCount` | `5` |
+| `+0x48` | `dwThunkCount` | `0xE9` (233) |
+| `+0x4C` | `lpGuiTable` | `0x425F28` |
+| `+0x50` | `lpExternalTable` | `0x422CA0` |
+| `+0x54` | `lpComRegisterData` | `0x41A024` |
+
+- Project description strings follow the header (the project name `emu8086`
+  sits at `0x41AC8C`); the four DWORDs at `+0x58..+0x64` (`0x78`, `0x80`,
+  `0x88`, `0x89`) are lengths/offsets into that blob, not pointers.
+- `lpProjectData` = `0x41B5C8`: `dwVersion = 0x1F4`, `lpObjectTable = 0x435018`,
+  `lpCodeStart = 0x4869D0`, `lpCodeEnd = 0x61F200`, then `0x621008`/`0x621000`
+  (runtime data) and the UTF-16 original build path.
+- Resources: only ICON (`3/30001`), GROUP_ICON (`14/1`) and VERSION (`16/1`).
+  There is **no** TYPELIB resource, so class/method names must come from the
+  project tables below, not from `LoadTypeLib`.
+- Imports: 273 from `MSVBVM60.DLL`. Useful ones seen in the INT code:
+  `0x4010B0 __vbaHresultCheckObj`, `0x40130C __vbaFreeObj`,
+  `0x401328`/`0x4013D0`/`0x4013D4` string helpers, `0x401344 __vbaFreeStr`,
+  `0x4010E0` cleanup at the dispatcher epilogue.
+
+### 25.2 Object table (`0x435084`, stride `0x30`)
+
+`wFormCount` says 39, but 40 records parse cleanly; the extra is one of the
+BAS modules. Every record:
+
+| offset | meaning |
+|---|---|
+| `+0x00` | pointer to the ASCII class/module name |
+| `+0x04` | interface slot count **including unnamed slots** |
+| `+0x08` | pointer to this class's name table (`0` when it has none) |
+| `+0x0C` | `0x0000FFFF` |
+| `+0x10` | flags: `0x00018083` = form/class, `0x00018001` = BAS module |
+| `+0x14` | `0` |
+| `+0x18` | descriptor pointer, always inside `0x41A000-0x430050` |
+| `+0x1C` | `0xFFFFFFFF` |
+| `+0x20` | interface IID pointer |
+| `+0x24` | `0` |
+| `+0x28` | global default-instance variable (e.g. `0x6212FC`), `0` if none |
+| `+0x2C` | `0` |
+
+
+| # | name | slots | name table | entry descriptor | IID | global |
+|---|---|---|---|---|---|---|
+| 0 | `frmMain` | 111 | `0x4360BC` | `0x0041A3A8` | `0x00439424` | `0x6212FC` |
+| 1 | `Module1` | 51 | - | `0x0041E354` | `0x0043F6B4` | - |
+| 2 | `frmDat` | 1 | `0x436278` | `0x0041A1B0` | `0x00438A48` | `0x6211DC` |
+| 3 | `Module2` | 11 | - | `0x0041A488` | `0x004396A8` | `0x621378` |
+| 4 | `mInstructions` | 30 | - | `0x0041A450` | `0x004395B4` | `0x621340` |
+| 5 | `mDefinition` | 28 | - | `0x0041A728` | `0x0043B8C0` | `0x6215A8` |
+| 6 | `mBuild_Executable` | 13 | - | `0x0041A1E8` | `0x00438A8C` | `0x6211EC` |
+| 7 | `mCompMacro` | 6 | - | `0x0041A934` | `0x004387EC` | `0x621038` |
+| 8 | `mStart` | 20 | - | `0x004277B4` | `0x0043905C` | - |
+| 9 | `frmInfo` | 47 | `0x43627C` | `0x0041A530` | `0x004413F8` | `0x621A5C` |
+| 10 | `StringTokenizer` | 2 | - | `0x00422454` | `0x004395A8` | - |
+| 11 | `frmMacro` | 6 | `0x436338` | `0x00430050` | `0x0043B09C` | - |
+| 12 | `frmEmulation` | 298 | `0x436350` | `0x0041AA38` | `0x00438C9C` | `0x62120C` |
+| 13 | `other` | 54 | - | `0x0041E88C` | `0x00445154` | - |
+| 14 | `ALU` | 59 | `0x4367F8` | `0x00426B58` | `0x004434B8` | - |
+| 15 | `frmScreen` | 72 | `0x4368E4` | `0x0041A568` | `0x00442FB8` | `0x621BCC` |
+| 16 | `RAM` | 6 | - | `0x00421C14` | `0x00444CBC` | - |
+| 17 | `frmFLAGS` | 17 | `0x436A04` | `0x0042A580` | `0x0043D6F0` | - |
+| 18 | `frmOptions` | 16 | `0x436A48` | `0x0041ABB0` | `0x0043CE90` | `0x621604` |
+| 19 | `ComDlg` | 22 | - | `0x0041C288` | `0x00444E18` | - |
+| 20 | `frm_mBox` | 6 | `0x436A88` | `0x00423E64` | `0x00439BEC` | - |
+| 21 | `frmAbout` | 11 | `0x436AA0` | `0x0041A880` | `0x004390C0` | `0x6212D0` |
+| 22 | `mCodeSelector` | 16 | - | `0x0041DEAC` | `0x004390EC` | - |
+| 23 | `frmOrigCode` | 19 | `0x436ACC` | `0x004285B4` | `0x0043A064` | - |
+| 24 | `frmBaseConvertor` | 32 | `0x436B18` | `0x0041BA58` | `0x00444D44` | - |
+| 25 | `frmStack` | 9 | `0x436B98` | `0x0041A5A0` | `0x00445D74` | `0x621EFC` |
+| 26 | `mDisk` | 6 | - | `0x0041A9B0` | `0x0043E930` | `0x621978` |
+| 27 | `mAnalyser` | 8 | - | `0x00423530` | `0x0043D388` | - |
+| 28 | `frmEvaluator` | 20 | `0x436BBC` | `0x0041A798` | `0x00438A8C` | `0x6219B4` |
+| 29 | `mMath` | 8 | - | `0x0041A220` | `0x00438A8C` | `0x6211FC` |
+| 30 | `mString` | 1 | - | `0x0041A140` | `0x00438A8C` | `0x621954` |
+| 31 | `mEditor` | 4 | - | `0x0041FF38` | `0x004452F4` | - |
+| 32 | `frmDebugLog` | 31 | `0x436C0C` | `0x0041A418` | `0x00438A8C` | `0x6218F8` |
+| 33 | `mRecentFiles` | 3 | - | `0x0041A6B8` | `0x0043B958` | `0x6215C0` |
+| 34 | `mSYMBOL_TABLE` | 14 | - | `0x0041A0D0` | `0x00442B6C` | `0x621A78` |
+| 35 | `mOptions` | 20 | - | `0x0041A370` | `0x004391D8` | `0x6212E8` |
+| 36 | `mSegment_Names_Table` | 2 | - | `0x0041A098` | `0x0044073C` | `0x6219C4` |
+| 37 | `mDAT` | 1 | - | `0x00424904` | `0x00448788` | - |
+| 38 | `frmWriteBinToFloppy` | 6 | `0x436C88` | `0x0041A6F0` | `0x0043BA08` | `0x6215EC` |
+| 39 | `mOutput` | 3 | - | `0x0042053C` | `0x004453F4` | - |
+
+The `0x00018083` records are the forms/class modules (`frmMain`, `frmDat`,
+`frmInfo`, `frmMacro`, `frmEmulation`, `ALU`, `frmScreen`, `frmFLAGS`,
+`frmOptions`, `frm_mBox`, `frmAbout`, `frmOrigCode`, `frmBaseConvertor`,
+`frmStack`, `frmEvaluator`, `frmDebugLog`, `frmWriteBinToFloppy`); the
+`0x00018001` ones are BAS modules (`Module1`, `Module2`, `mInstructions`,
+`mDefinition`, `mStart`, `mDisk`, `mFASM`, `mAnalyser`, `mMath`, `mString`,
+`mEditor`, `mSYMBOL_TABLE`, ...). `frmEmulation` is the big one (298 slots) -
+it holds the instruction implementations (`do_instruction_*`).
+
+### 25.3 Method name tables (`0x4360BC` onwards)
+
+Each class with a name table has `count` consecutive 4-byte entries: a pointer
+to an ASCII name, or `0`. They are packed in object-table order, and the
+`count` field is exact - verified by contiguity, e.g. `frmMain`'s 111 entries
+run `0x4360BC..0x436278` and `frmDat`'s single entry starts at `0x436278`;
+`frmEmulation`'s 298 run `0x436350..0x4367F8` and `ALU`'s 59 start there.
+
+The names are in **declaration order**, not alphabetical (`fAdd_WORDS`,
+`add_WORDS`, `or_WORDS`, `and_WORDS`, `add_BYTES`, `xor_BYTES`, ...
+`MAKE_sub_BYTES`, `LOAD_A`, `shiftL_WORD`, `move_C_to_A` for `ALU`). Useful
+ones already harvested: `do_instruction_D8_DF`, `add_to_SCREEN`,
+`add_to_SCREEN_with_attrib`, `set_current_video_page_number`, `clear_SCREEN`,
+`clearScreen`, `showErrorBuffer`, `stopAutoStep`, `mnuSingleStep_Click_PUBLIC`,
+`mnuResetEmulator_and_RAM_Click_PUBLIC`, `get_Step_Delay`, `do_INT_21_4E_4F_StepBack`,
+`showFPU_STATE`, `DoShowMe` (many), `show_Registers_PUBLIC`.
+
+**Caveat, and the reason 24.4 is still open:** roughly three quarters of the
+entries are `0`, so the tables are not a dense per-slot map, and
+`slot offset = 0x1C + 4*index` does not reproduce the names we can check
+(`[obj+0x7BC]` is the single-step call in the run loop, but no index at
+`(0x7BC-0x1C)/4` is named `step`-like). The vtable the runtime builds for the
+project object is allocated at startup; the offsets in code cannot be mapped
+to these names by file order alone.
+
+### 25.4 IIDs seen in the INT code
+
+- `0x43A388` = `{CB74122D-86F6-4403-89A1-5AB68F733C03}` - the project/global
+  object interface; it is the IID pushed by every `[obj+0x7AC]` HRESULT check
+  (24.1) and by the `[obj+0x7BC]` step call.
+- `0x438A8C` is shared by `mBuild_Executable`, `frmEvaluator`, `mMath`,
+  `mString` and `frmDebugLog`, so it is a placeholder rather than a real
+  interface identity; do not use it to attribute calls.
+
+### 25.5 Scripts
+
+`re/vbdata.py` (header + project data), `re/vbtable.py` (object table, prints
+the table in 25.2), `re/objtab.py` (records + name-table pointers),
+`re/slot7ac.py` (name at a given slot offset per class),
+`re/globalidx.py` (packed name-table index walk), `re/site7ac.py` (all
+`[x+0x7AC]` call sites with the flags/messages around them),
+`re/find_iid.py` (IID occurrences), `re/rsrc.py` (resource directory).
