@@ -122,6 +122,29 @@ void dos_flush(FILE *f)
 static void setAX(int v) { cpu.r[0] = (uint16_t)v; }
 static void setAThi(int v) { cpu.r[0] = (uint16_t)((cpu.r[0] & 0xFF00) | (v & 0xFF)); }
 
+/* 47h wants the current directory the way DOS shows it: no drive, no leading
+ * separator ("EMU8086\EXAMPLE").  The original keeps one virtual
+ * subdirectory per drive ("GET_VIRTUAL_SUBDIRECTORY"); the clone tracks a
+ * single host directory, so the drive that is not the current one reports its
+ * root, and moving between directories (3Bh) is not modelled. */
+static void dos_current_dir(char *out, size_t n)
+{
+    char buf[512];
+    char *p;
+    size_t i;
+
+    out[0] = 0;
+    if (getcwd(buf, sizeof buf) == NULL) return;
+    p = buf;
+    if (p[0] != 0 && p[1] == ':') p += 2;       /* drop the drive letter */
+    while (*p == '/' || *p == '\\') p++;
+    for (i = 0; p[i] && i + 1 < n; i++) out[i] = p[i];
+    out[i] = 0;
+#ifdef _WIN32
+    for (i = 0; out[i]; i++) if (out[i] == '/') out[i] = '\\';
+#endif
+}
+
 /* Build a $-terminated string starting at DS:DX and print it. */
 static void print_dollar_string(void)
 {
@@ -220,6 +243,10 @@ static int dos_slot_alloc(void)
 #define DOS_NO_MORE_FILES 0x12
 static uint32_t dta;
 static int dta_valid;
+
+/* Current drive, A=0.  The original keeps it in ds:0x621C5C, set by 0Eh and
+ * read by 19h; C: is what emu8086 starts on. */
+static int dos_drive = 2;
 
 static uint32_t dta_addr(void)
 {
@@ -417,9 +444,36 @@ static void int21(void)
         setAThi(kb_head != kb_tail ? 0xFF : 0x00);
         break;
 
-    case 0x19:                                  /* current drive */
-        setAThi(2);                             /* C: */
+    case 0x0E:                                  /* select disk, DL */
+        /* Original: 0x5DC310 stores DL in ds:0x621C5C, then the arm sets
+         * AL=0x19 (0x5277AD) - 25 logical drives. */
+        dos_drive = cpu.r[DX] & 0xFF;
+        setAThi(0x19);
         break;
+
+    case 0x19:                                  /* current drive */
+        /* Original: 0x5DC390 returns ds:0x621C5C, arm puts it in AL. */
+        setAThi(dos_drive);
+        break;
+
+    case 0x47: {                                /* get current directory */
+        char path[64];
+        int drive = cpu.r[DX] & 0xFF;
+        uint32_t p;
+        size_t i;
+
+        /* Original (0x5283A5-0x528407): DL above 26 is "invalid drive" -
+         * status word +0x38 = FFFF, AH=0, AL=0x0F.  Success (0x5284D5) writes
+         * the ASCIIZ at DS:SI through 0x5DCA30, marks +0x3A, AH=0, AL=1. */
+        if (drive > 26) { dos_file_error(0x0F); break; }
+        if (drive == 0 || drive == dos_drive) dos_current_dir(path, sizeof path);
+        else path[0] = 0;                       /* other drive: its root */
+        p = seg_off_to_phys(cpu.sr[DS], cpu.r[SI]);
+        for (i = 0; path[i] && i < 63; i++) poke8(p + (uint32_t)i, path[i]);
+        poke8(p + (uint32_t)i, 0);
+        cpu.r[0] = 0x0001;
+        cpu.flags &= ~F_CF;
+        break; }
 
     case 0x1A:                                  /* set DTA */
         dta = seg_off_to_phys(cpu.sr[DS], cpu.r[DX]);

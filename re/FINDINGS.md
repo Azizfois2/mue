@@ -1991,3 +1991,46 @@ Verified to bite: short-circuiting the two cases fails five of them
 (`mkdir-creates-directory`, `mkdir-exists-is-denied`, `mkdir-exists-cf`,
 `rmdir-missing-not-found`, `rmdir-missing-cf`) while the CF-clear checks pass
 vacuously, as expected.
+
+## 27. INT 21h 0Eh/19h/47h: one current drive, no per-drive directory (IMPLEMENTED)
+
+All three are CONFIRMED from the handlers:
+
+- **`0Eh` select disk** - `0x5DC310`: `mov cl,[arg]; mov ds:0x621C5C,cl`, i.e. it
+  stores DL in a single global and returns nothing. The arm at `0x52778D` then
+  sets `+0xBA` (AL) to `0x19` = **25 logical drives**.
+- **`19h` current drive** - `0x5DC390`: `mov al,ds:0x621C5C`, and the arm at
+  `0x527805` copies AL into `+0xBA`. So 19h simply echoes what 0Eh stored.
+- **`47h` get current directory** - inline arm `0x5283A5-0x52853E`:
+  - `DL > 26` is refused: status word `+0x38 = 0xFFFF`, `AH=0`, `AL=0x0F`
+    (invalid drive), then the shared exit.
+  - otherwise `get_virtual_subdirectory(DL)` (the `ERROR!
+    GET_VIRTUAL_SUBDIRECTORY:` literal family, `0x5DD8D0`), truncated to 63
+    characters, written as an ASCIIZ to **DS:SI** through `0x5DCA30`, then
+    status `+0x3A = 0xFFFF`, `AH=0`, `AL=1`.
+
+The original therefore has **one** current drive (`ds:0x621C5C`) and a virtual
+subdirectory per drive; `0Eh` performs no validation at all, and only `47h`
+range-checks the letter (0..26 inclusive, i.e. the check is `DL <= 0x1A`).
+
+Clone (`src/dos.c`): `dos_drive` (default 2 = C:, what `19h` used to hardcode)
+is set by `0Eh` with `AL = 0x19` and read by `19h`; `47h` refuses `DL > 26`
+with `CF=1, AX=0x000F`, otherwise writes the ASCIIZ at DS:SI, capped at 63
+characters, and returns `AX=0x0001`. Divergences, both forced by the clone's
+single-directory model: the returned path is the host cwd with the drive
+stripped and no leading separator (`\` on Windows), and a drive that is not
+the current one reports its root rather than a per-drive directory, since 3Bh
+(change directory) is not implemented.
+
+Checks: `current-drive-is-c`, `select-disk-drive-count` (`AL=0x19`),
+`select-disk-takes-effect`, `getdir-cf-clear`, `getdir-returns-1`,
+`getdir-first-char-not-separator`, `getdir-invalid-drive` (`AX=0x0F`) and
+`getdir-invalid-drive-cf`. Verified to bite: dropping the `0Eh` store fails
+`select-disk-takes-effect`, and dropping the `DL > 26` guard fails both
+`getdir-invalid-drive*` checks.
+
+Note for future work: the original's file functions all go through this
+virtual-drive layer (`vdrive\`, `CREATE_VIRTUAL_SUBDIRECTORY`,
+`REMOVE_VIRTUAL_SUBDIRECTORY`, `CHANGE_VIRTUAL_SUBDIRECTORY`), so a future
+3Bh/47h refinement should model per-drive directories rather than the host
+cwd.

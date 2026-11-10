@@ -420,6 +420,52 @@ ret
 fnew db 'new.txt',0
 """
 
+# 0Eh/19h/47h.  47h writes an ASCIIZ at DS:SI; the guest reads it back byte by
+# byte into BX so the dump can be checked, and also prints it with 09h.
+T_DRIVE = PROLOG + """
+; The handlers write AL only (like the original, which stores +0xBA and
+; leaves AH alone), so read AL into AX explicitly before the dump.
+mov ah,19h
+int 21h
+mov ah,0
+mov si,ax                ; AL = current drive (2 = C:) before 0Eh
+mov ah,0eh
+mov dl,3                 ; select D:
+int 21h
+mov ah,0
+mov bx,ax                ; AL = 0x19 = 25 logical drives
+mov ah,19h
+int 21h
+mov ah,0
+mov di,ax                ; AL = 3
+mov ah,0eh
+mov dl,2                 ; back to C:
+int 21h
+ret
+"""
+
+T_GETDIR = PROLOG + """
+mov ah,47h
+xor dl,dl                ; default drive
+lea si,buf
+int 21h
+pushf
+pop bp                   ; CF
+mov bx,ax                ; AX (should be 0001h)
+mov al,[si]              ; first byte of the path
+mov ah,0
+mov dx,ax
+mov ah,47h
+mov dl,27                ; > 26 -> invalid drive
+lea si,buf
+int 21h
+mov cx,ax
+pushf
+pop di                   ; CF
+ret
+buf db 80 dup(0)
+"""
+
 # 39h/3Ah.  The guests leave the directory for the host to inspect, so the
 # checks can look at both the registers and the filesystem.
 T_MKDIR = PROLOG + """
@@ -675,6 +721,29 @@ def main():
         check("attrs-missing-cf", di is not None and (di & 1), di)
         check("attrs-bad-subfunction", bx == 1, bx)
         check("attrs-bad-subfunction-cf", si is not None and (si & 1), si)
+
+        rc, out = run(mue, T_DRIVE, d)
+        si = reg(out, "SI")
+        bx = reg(out, "BX")
+        di = reg(out, "DI")
+        check("current-drive-is-c", si == 2, si)
+        check("select-disk-drive-count", bx == 0x19, hex(bx) if bx is not None else None)
+        check("select-disk-takes-effect", di == 3, di)
+
+        rc, out = run(mue, T_GETDIR, d)
+        bp = reg(out, "BP")
+        bx = reg(out, "BX")
+        dx = reg(out, "DX")
+        cx = reg(out, "CX")
+        di = reg(out, "DI")
+        check("getdir-cf-clear", bp is not None and not (bp & 1), bp)
+        check("getdir-returns-1", bx == 1, hex(bx) if bx is not None else None)
+        # The path has to start with a real directory name: the check runs in a
+        # temp dir, so "temp" on POSIX and a drive-less Windows path otherwise.
+        check("getdir-first-char-not-separator",
+              dx is not None and dx not in (0, ord("/"), ord("\\")), dx)
+        check("getdir-invalid-drive", cx == 0x0F, cx)
+        check("getdir-invalid-drive-cf", di is not None and (di & 1), di)
 
         # 39h/3Ah: the two functions the shipped examples call that were
         # missing (examples/file-operations.asm).  DOS answers 5 for "already
