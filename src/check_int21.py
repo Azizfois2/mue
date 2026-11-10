@@ -28,19 +28,23 @@ def find_mue():
     return None
 
 
-def run(mue, src, cwd, stdin_data=None):
+def run(mue, src, cwd, stdin_data=None, env=None):
     """Assemble + run in cwd; return (exit code, combined output)."""
     a = os.path.join(cwd, "t.asm")
     with open(a, "w") as f:
         f.write(src)
+    e = None
+    if env:
+        e = dict(os.environ)
+        e.update(env)
     # stdin is closed unless the check supplies one: a guest that waits for a
     # keystroke must hit end-of-input, never block the suite.
     if stdin_data is None:
-        p = subprocess.run([mue, a], stdin=subprocess.DEVNULL,
+        p = subprocess.run([mue, a], stdin=subprocess.DEVNULL, env=e,
                            capture_output=True, timeout=60, cwd=cwd)
     else:
-        p = subprocess.run([mue, a], input=stdin_data, capture_output=True,
-                           timeout=60, cwd=cwd)
+        p = subprocess.run([mue, a], input=stdin_data, env=e,
+                           capture_output=True, timeout=60, cwd=cwd)
     return p.returncode, (p.stdout + p.stderr).decode("utf-8", "replace")
 
 
@@ -466,6 +470,103 @@ ret
 buf db 80 dup(0)
 """
 
+# 31h: terminate and stay resident.  Residency is impossible here, so the
+# clone ends the program like 4Ch; the `mov bx,0DEADh` after the call must
+# never run.
+T_TSR = PROLOG + """
+mov ah,31h
+mov al,7
+mov dx,20h
+int 21h
+mov bx,0deadh
+ret
+"""
+
+# 4Bh: a missing program, an overlay request (AL=1, refused), then a real
+# child that exits with 5 and prints before the parent does.  BL collects a
+# bit for every answer that came back wrong.
+T_EXEC = PROLOG + """
+mov bx,0
+mov ah,4bh
+mov al,0
+lea dx,missing
+int 21h
+jnc e1
+cmp ax,2
+je e1
+or bl,1
+e1:
+mov ah,4bh
+mov al,1
+lea dx,cname
+int 21h
+jnc e2
+cmp ax,1
+je e2
+or bl,2
+e2:
+mov ah,4bh
+mov al,0
+lea dx,cname
+int 21h
+jnc e3
+or bl,4
+e3:
+mov bp,ax
+mov ah,9
+lea dx,pmsg
+int 21h
+ret
+missing db 'nosuch.com',0
+cname db 'child.com',0
+pmsg db 'parent$'
+"""
+
+CHILD_ASM = PROLOG + """
+mov ah,9
+lea dx,msg
+int 21h
+mov ah,4ch
+mov al,5
+int 21h
+msg db 'child$'
+"""
+
+# The same child, leaving through 31h instead: its AL must become the exit
+# code the 4Bh caller sees, which is how a TSR exit is observable at all.
+CHILD_TSR_ASM = PROLOG + """
+mov ah,9
+lea dx,msg
+int 21h
+mov ah,31h
+mov al,5
+mov dx,100h
+int 21h
+msg db 'child$'
+"""
+
+T_EXEC_TSR = PROLOG + """
+mov ah,4bh
+mov al,0
+lea dx,tname
+int 21h
+mov bp,ax
+ret
+tname db 'tsr.com',0
+"""
+
+# 48h/49h/4Ah with the original's no-op behaviour switched on: nothing at all
+# may change - AX keeps AH=48h, BX keeps its value, and CF stays as set.
+T_MEM_NOOP = PROLOG + """
+mov ax,4800h
+mov bx,5678h
+stc
+int 21h
+pushf
+pop di
+ret
+"""
+
 # 36h: every drive reports the same fixed picture; DL > 26 is AX=0xFFFF.
 # The guest does the invalid drive first, so DX still holds the valid answer at
 # the end; CX is a sentinel 36h must not touch.
@@ -877,6 +978,46 @@ def main():
               dx is not None and dx not in (0, ord("/"), ord("\\")), dx)
         check("getdir-invalid-drive", cx == 0x0F, cx)
         check("getdir-invalid-drive-cf", di is not None and (di & 1), di)
+
+        # 31h: the handler must end the program, not fall through.
+        rc, out = run(mue, T_TSR, d)
+        check("tsr-terminates", reg(out, "BX") == 0, reg(out, "BX"))
+
+        # 4Bh: child program, loaded and run, its output before the parent's.
+        with open(os.path.join(d, "child.asm"), "w") as f:
+            f.write(CHILD_ASM)
+        subprocess.run([mue, "-a", "child.asm", "child.com"], cwd=d,
+                       capture_output=True, timeout=60)
+        rc, out = run(mue, T_EXEC, d)
+        txt = guest_text(out)
+        check("exec-runs-child-first",
+              "child" in txt and "parent" in txt and
+              txt.index("child") < txt.index("parent"), repr(txt))
+        check("exec-reports-child-exit-code",
+              reg(out, "BP") == 5, reg(out, "BP"))
+        check("exec-error-answers", reg(out, "BX") == 0, reg(out, "BX"))
+
+        # A child that leaves through 31h: its AL must reach the 4Bh caller.
+        with open(os.path.join(d, "tsr.asm"), "w") as f:
+            f.write(CHILD_TSR_ASM)
+        subprocess.run([mue, "-a", "tsr.asm", "tsr.com"], cwd=d,
+                       capture_output=True, timeout=60)
+        rc, out = run(mue, T_EXEC_TSR, d)
+        check("tsr-code-reaches-exec-caller",
+              reg(out, "BP") == 5 and "child" in guest_text(out),
+              (reg(out, "BP"), repr(guest_text(out))))
+
+        # The same 48h guest under the original's no-op switch and without it:
+        # the flag must change the answer, so both models are testable.
+        rc, out = run(mue, T_MEM_NOOP, d, env={"MUE_INT21_MEM_NOOP": "1"})
+        check("mem-noop-compat-flag",
+              reg(out, "AX") == 0x4800 and reg(out, "BX") == 0x5678 and
+              (reg(out, "DI") or 0) & 1,
+              (reg(out, "AX"), reg(out, "BX"), reg(out, "DI")))
+        rc, out = run(mue, T_MEM_NOOP, d)
+        check("mem-noop-off-by-default",
+              reg(out, "AX") == 0x2000 and (reg(out, "DI") or 0) & 1 == 0,
+              (reg(out, "AX"), reg(out, "DI")))
 
         # 36h free space: constants from the original's inline arm, and the
         # invalid drive answer.

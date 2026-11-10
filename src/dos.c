@@ -250,6 +250,24 @@ static int dos_apply_path(int drive, const char *path, char *out, size_t n)
 #define DOS_HEAP_END   0xA000
 #define DOS_BLOCKS     64
 
+/* A child started by 4Bh runs in the 64K window just below the arena.  At
+ * most one child at a time: dos_exec_depth is set while it runs. */
+#define DOS_CHILD_SEG  0x1000
+static int dos_exec_depth;
+
+/* The original answers 48h/49h/4Ah with nothing observable (FINDINGS 29).
+ * MUE_INT21_MEM_NOOP=1 reproduces that exactly - the handler returns without
+ * touching a register - so both models can be tested. */
+static int dos_mem_noop(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("MUE_INT21_MEM_NOOP");
+        on = (e != NULL && *e != 0 && *e != '0');
+    }
+    return on;
+}
+
 static struct {
     uint16_t seg, paras;
     int used;
@@ -621,6 +639,8 @@ static void int21(void)
         uint32_t want = cpu.r[3], seg = DOS_HEAP_FIRST;
         int slot = -1, i;
 
+        if (dos_mem_noop()) break;              /* original: no answer at all */
+
         for (i = 0; i < DOS_BLOCKS; i++)
             if (!dos_block[i].used) { slot = i; break; }
         if (want)
@@ -641,7 +661,10 @@ static void int21(void)
         break; }
 
     case 0x49: {                                /* free block, ES = segment */
-        int i = dos_block_find(cpu.sr[ES]);
+        int i;
+
+        if (dos_mem_noop()) break;
+        i = dos_block_find(cpu.sr[ES]);
 
         if (i < 0) {
             dos_file_error(9);                  /* invalid block */
@@ -652,9 +675,92 @@ static void int21(void)
         cpu.flags &= ~F_CF;
         break; }
 
+    case 0x4B: {                                /* exec a program */
+        char name[160], want[160], host[512];
+        FILE *f;
+        long n;
+        uint8_t *img;
+        cpu_t saved;
+        int saved_req = dos_exit_requested, saved_code = dos_exit_code;
+        uint32_t saved_dta = dta;
+        int saved_dta_valid = dta_valid, child_exit;
+
+        /* Original: no 4Bh arm either (see 30), so it reports "not supported"
+         * and returns.  A child process is a divergence, implemented the DOS
+         * way for the one form that can work here: AL=0, load and execute a
+         * .COM.  AL=1/3 (overlay) and MZ images are refused, and a child may
+         * not itself exec, because every child runs in the same 64K window. */
+        if ((cpu.r[0] & 0xFF) != 0) { dos_file_error(1); break; }
+        if (dos_exec_depth) { dos_file_error(8); break; }
+        if (dos_guest_name(name, sizeof name) != 0) { dos_file_error(3); break; }
+        dos_seed();
+        if (dos_apply_path(dos_drive, name, want, sizeof want) != 0) {
+            dos_file_error(3);
+            break;
+        }
+        dos_host_dir(dos_drive, want, host, sizeof host);
+        f = fopen(host, "rb");
+        if (!f) { dos_file_error(2); break; }
+        fseek(f, 0, SEEK_END);
+        n = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        img = (uint8_t *)malloc((size_t)n + 1);
+        if (!img || n <= 0) { fclose(f); free(img); dos_file_error(11); break; }
+        if (fread(img, 1, (size_t)n, f) != (size_t)n) {
+            fclose(f); free(img); dos_file_error(11); break;
+        }
+        fclose(f);
+        if (n >= 2 && img[0] == 'M' && img[1] == 'Z') {
+            free(img);
+            dos_file_error(11);                 /* MZ: not a .COM */
+            break;
+        }
+        if (n > 0xFF00) n = 0xFF00;
+
+        /* One child at a time, in the 64K window just under the 48h arena. */
+        saved = cpu;
+        memset(MEM + (DOS_CHILD_SEG << 4), 0, 0x10000);
+        memcpy(MEM + (DOS_CHILD_SEG << 4) + 0x100, img, (size_t)n);
+        free(img);
+        MEM[DOS_CHILD_SEG << 4] = 0xCD;         /* int 20h */
+        MEM[(DOS_CHILD_SEG << 4) + 1] = 0x20;
+        MEM[(DOS_CHILD_SEG << 4) + 0x80] = 0;   /* empty command tail */
+
+        cpu.sr[ES] = cpu.sr[CS] = cpu.sr[SS] = cpu.sr[DS] = DOS_CHILD_SEG;
+        cpu.ip = 0x100;
+        cpu.phys = seg_off_to_phys(DOS_CHILD_SEG, 0x100);
+        cpu.r[SP] = 0xFFFE;
+        cpu.flags = F_IF;
+        cpu.halted = 0;
+        cpu.exit_code = 0;
+        cpu.seg_override = -1;
+        cpu.lock = 0;
+        cpu.rep_kind = 0;
+        dta_valid = 0;                          /* the child's own PSP */
+        dos_exit_requested = 0;
+        dos_exit_code = 0;
+        dos_exec_depth = 1;
+
+        cpu_run(2000000);
+
+        child_exit = dos_exit_requested ? dos_exit_code : 0;
+        cpu = saved;
+        dta = saved_dta;
+        dta_valid = saved_dta_valid;
+        dos_exit_requested = saved_req;
+        dos_exit_code = saved_code;
+        dos_exec_depth = 0;
+        setAX((uint16_t)(child_exit & 0xFF));
+        cpu.flags &= ~F_CF;
+        break; }
+
     case 0x4A: {                                /* resize block, ES/BX */
-        int i = dos_block_find(cpu.sr[ES]);
-        uint32_t seg, want = cpu.r[3];
+        int i;
+        uint32_t seg, want;
+
+        if (dos_mem_noop()) break;
+        i = dos_block_find(cpu.sr[ES]);
+        want = cpu.r[3];
 
         if (i < 0) {
             dos_file_error(9);                  /* invalid block */
@@ -755,6 +861,16 @@ static void int21(void)
         cpu.r[0] = 0x0005;                     /* MS-DOS 5.0 */
         cpu.r[3] = 0;
         cpu.r[1] = 0;
+        break;
+
+    case 0x31:                                  /* terminate and stay resident */
+        /* Original: there is no 31h arm in the dispatcher (see 30), so it
+         * prints "not supported yet" and carries on.  Residency has no
+         * meaning here - one program, one prompt-less run - so the clone ends
+         * the program the way 4Ch does and ignores DX.  Divergence. */
+        dos_exit_requested = 1;
+        dos_exit_code = cpu.r[0] & 0xFF;
+        cpu.halted = 1;
         break;
 
     case 0x35:                                  /* get interrupt vector */

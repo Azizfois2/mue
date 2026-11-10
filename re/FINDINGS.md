@@ -2165,3 +2165,80 @@ Verified to bite: dropping the 4Ah error code fails
 `free-block-and-double-free`. Note the first version of this guest had its
 `jnc`/`jc` the wrong way round on the expected-failure branch and *reported*
 success - the CL sentinel is what caught it.
+
+## 30. INT 21h 31h and 4Bh, and the no-op memory switch (IMPLEMENTED, divergent)
+
+### Neither function exists in the original (CONFIRMED)
+
+The INT 21h dispatcher compares AH against exactly 110 values between
+`0x51FF60` and `0x52ABDF`:
+
+    01..0f 10 11 12 13 15 16 17 19 1a 20 21 23 24 25 2a 2c 2e 2f 30 33
+    35 36 39 3a 3b 3c 3d 3e 3f 40 41 42 43 47 48 49 4a 4c 4d 4e 4f
+    54 56 57 86 a0 ff
+
+Counted by pairing every `mov ecx,0xNN` with the `call ds:0x401238` that
+follows it (the VB comparison thunk each arm begins with, e.g. the 0Eh arm at
+`0x52777A`). **31h and 4Bh are not among them**, so both fall through the whole
+chain into the shared "not supported yet" report at `0x52A2CD` and the arm
+returns to the guest with every register untouched. They are not "partially
+supported": emu8086 simply has no exec and no TSR.
+
+(Incidental: the earlier arm sweeps in 24/26/27/29 matched only two-digit
+constants, which is why 0Eh never showed up in them. The 110-value list above
+covers one- and two-digit values and is the authoritative one.)
+
+### What the clone does (divergence, deliberate)
+
+- **31h terminate and stay resident** - residency is meaningless here (one
+  program, no prompt to return to), and falling through into the bytes after
+  the call is worse, so the clone ends the run exactly like 4Ch: AL is the exit
+  code, DX (the paragraphs to keep) is ignored.
+- **4Bh exec** - implemented for the one form that can work: `AL=0`, load and
+  execute a `.COM`.
+  - The name goes through `dos_apply_path`/`dos_host_dir`, so relative names,
+    `..` and the current drive all resolve like the other file calls.
+  - The child's 64K window is segment `0x1000`, immediately below the 48h
+    arena at `0x2000`; it gets a minimal PSP (`int 20h` at offset 0, an empty
+    command tail at 0x80), CS=DS=ES=SS, IP=0x100, SP=0xFFFE, and its own
+    default DTA. The child's exit code comes back in AX with CF clear.
+  - Refusals: `AL` other than 0 -> **AX=1** (overlay forms are not modelled);
+    a file that does not open -> **AX=2**; an MZ image or a short/odd read ->
+    **AX=11**; an exec from inside a child -> **AX=8**, because every child uses
+    the same window and one level is all that fits. The command tail is not
+    passed through.
+  - The parent's whole `cpu` struct, `DTA` (value and its cached flag), and the
+    `dos_exit_requested`/`dos_exit_code` pair are saved and restored around the
+    nested `cpu_run`, which is safe because `cpu_int()` returns to the caller
+    without touching `ip`/`phys` once a service has handled the interrupt.
+
+Note for future work: 4Ch's AL is recorded in `dos_exit_code` but never becomes
+the process status (`mue` still exits 0), so a 31h exit code is only observable
+from a 4Bh parent - that is what `tsr-code-reaches-exec-caller` relies on. If
+the process status is ever wired to the guest's exit code, every suite's idea of
+"the run succeeded" changes with it.
+
+### The compatibility switch
+
+`MUE_INT21_MEM_NOOP=1` makes 48h/49h/4Ah do exactly what the original does:
+nothing visible. The handlers return before touching AX, BX or CF, so a guest
+that checks flags or expects a segment sees the same "no answer" emu8086 gives
+(29). Unset - the default - is the DOS-style arena from 29. Same convention as
+`MUE_FLOPPY`: read once via `getenv`, empty or `0` means off.
+
+### Checks
+
+`tsr-terminates` (`mov bx,0DEADh` after the call never runs), `exec-runs-child-first`
+(the child's output precedes the parent's), `exec-reports-child-exit-code`
+(AX=5 from a child that exits with 4Ch/AL=5), `exec-error-answers` (a missing
+program answers AX=2 and an AL=1 overlay request answers AX=1, both with CF),
+`tsr-code-reaches-exec-caller` (a child that leaves through 31h/AL=5 gives the
+parent AX=5), `mem-noop-compat-flag` (with the switch on, AX/BX/CF come back
+exactly as set: AX=0x4800, BX=0x5678, CF still set) and
+`mem-noop-off-by-default` (without it the same guest gets a segment in AX and CF
+clear).
+
+Verified to bite: emptying the 31h case fails `tsr-terminates` (BX=0xDEAD) and
+`tsr-code-reaches-exec-caller`; returning 0 instead of the child's exit code
+fails `exec-reports-child-exit-code`; and making `dos_mem_noop()` always return
+0 fails `mem-noop-compat-flag` with the arena's AX/BX.
