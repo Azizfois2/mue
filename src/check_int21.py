@@ -466,6 +466,76 @@ ret
 buf db 80 dup(0)
 """
 
+# Round trip: mkdir, chdir, get the directory, climb back out, rmdir.  The
+# guest prints each 47h answer (converted to '$' in place) so the host can see
+# the path itself, and leaves the last chdir's CF/AX in BP/BX.
+T_CHDIR = PROLOG + """
+mov ah,39h
+lea dx,dname
+int 21h
+mov ah,3bh
+lea dx,dname
+int 21h
+mov [ok_in],0
+jnc in_ok
+mov [ok_in],1
+in_ok:
+mov ah,47h
+xor dl,dl
+lea si,buf1
+int 21h
+lea si,buf1
+call show
+mov ah,3bh
+lea dx,updir
+int 21h
+mov [ok_up],0
+jnc up_ok
+mov [ok_up],1
+up_ok:
+mov ah,47h
+xor dl,dl
+lea si,buf2
+int 21h
+lea si,buf2
+call show
+mov ah,3bh
+lea dx,baddir
+int 21h
+pushf
+pop bp
+mov bx,ax
+mov ah,3ah
+lea dx,dname
+int 21h
+ret
+
+show:
+mov bx,0
+scan:
+cmp byte ptr [si+bx],0
+je repl
+inc bx
+jmp scan
+repl:
+mov byte ptr [si+bx],'$'
+mov ah,9
+mov dx,si
+int 21h
+mov ah,2
+mov dl,10
+int 21h
+ret
+
+dname db 'rt1',0
+updir db '..',0
+baddir db 'nosuchdir',0
+ok_in db 0
+ok_up db 0
+buf1 db 80 dup(0)
+buf2 db 80 dup(0)
+"""
+
 # 39h/3Ah.  The guests leave the directory for the host to inspect, so the
 # checks can look at both the registers and the filesystem.
 T_MKDIR = PROLOG + """
@@ -744,6 +814,22 @@ def main():
               dx is not None and dx not in (0, ord("/"), ord("\\")), dx)
         check("getdir-invalid-drive", cx == 0x0F, cx)
         check("getdir-invalid-drive-cf", di is not None and (di & 1), di)
+
+        # 3Bh + per-drive 47h, driven by a full mkdir/chdir/getdir round trip.
+        rc, out = run(mue, T_CHDIR, d)
+        lines = [l.strip() for l in guest_text(out).splitlines() if l.strip()]
+        inside = lines[0] if lines else ""
+        back = lines[1] if len(lines) > 1 else ""
+        check("chdir-relative-enters",
+              inside.split("\\")[-1] == "rt1", repr(inside))
+        check("chdir-parent-leaves",
+              back.split("\\")[-1] != "rt1" and back == inside.rsplit("\\", 1)[0],
+              repr((inside, back)))
+        check("chdir-missing-dir-fails",
+              (reg(out, "BX") or 0) & 0xFFFF == 3 and (reg(out, "BP") or 0) & 1,
+              (reg(out, "BX"), reg(out, "BP")))
+        # The guest rmdir'd from the parent, so the directory must be gone.
+        check("chdir-round-trip-cleans-up", not os.path.isdir(os.path.join(d, "rt1")), None)
 
         # 39h/3Ah: the two functions the shipped examples call that were
         # missing (examples/file-operations.asm).  DOS answers 5 for "already

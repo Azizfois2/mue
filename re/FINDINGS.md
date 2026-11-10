@@ -2034,3 +2034,56 @@ virtual-drive layer (`vdrive\`, `CREATE_VIRTUAL_SUBDIRECTORY`,
 `REMOVE_VIRTUAL_SUBDIRECTORY`, `CHANGE_VIRTUAL_SUBDIRECTORY`), so a future
 3Bh/47h refinement should model per-drive directories rather than the host
 cwd.
+
+## 28. INT 21h 3Bh, and per-drive directories (IMPLEMENTED)
+
+**3Bh change directory is CONFIRMED** from the dispatcher arm at
+`0x528283-0x5283A0`. DS:DX goes through the EA prologue and the string is
+handed to `CHANGE_VIRTUAL_SUBDIRECTORY` (`0x5DD420`) - the same virtual-drive
+layer 47h reads from, alongside `CREATE_VIRTUAL_SUBDIRECTORY` and
+`REMOVE_VIRTUAL_SUBDIRECTORY` (the `vdrive\` literal family noted in 27). A
+non-zero result sets status `+0x3A` and **`AX=0`**, a zero result sets
+`+0x38` and **`AX=3`** ("path not found"). So 3Bh returns no path, and its one
+failure code is 3.
+
+This resolves the divergence 27 finished on: the original does keep a
+directory per drive, and 47h is the function that reports it.
+
+Clone model (`src/dos.c`), replacing the single-cwd shortcut:
+
+- `dos_dir[27][160]` - each drive's DOS-visible current directory, as a path
+  relative to that drive's root (`""` = root).
+- The host cwd is the live directory of `dos_drive` only. `dos_seed()` fills
+  `dos_dir[dos_drive]` from the host cwd on first use, so a guest started in a
+  directory sees that directory.
+- `0Eh` now stores the drive, then `chdir`s to `dos_dir[new drive]`, i.e.
+  switching to a drive re-enters the directory it was left on.
+- `3Bh` builds the target with `dos_apply_path()` (`.`/`..`, absolute paths
+  from the drive root, and `X:` prefixes; a prefix naming a drive other than
+  the current one is refused because there is one host cwd), `chdir`s to it,
+  and on success records it in `dos_dir[dos_drive]`.
+- `47h` reports `dos_dir[drive]` instead of the host cwd, and `DL=0` means
+  "default drive".
+
+Divergences from the original, all deliberate:
+
+- On failure the clone follows the house INT 21h convention of `CF=1` plus the
+  DOS code in AX (`AX=0x0003`), where the original only writes AX and a status
+  word. Success is `AX=0`, matching the original exactly.
+- A path prefixed with a drive letter other than the current drive fails with
+  "path not found"; the original's virtual-drive layer would accept it.
+
+`examples/` has no 3Bh caller, so the checks drive it directly. Guest
+`T_CHDIR` in `src/check_int21.py` does the full round trip: `39h` mkdir `rt1`,
+`3Bh` into it, `47h` and print (the guest walks to the NUL and overwrites it
+with `$` so `09h` can print the path in place), `3Bh` to `..`, `47h` and
+print, `3Bh` to a missing name (CF/AX left in BP/BX), then `3Ah` rmdir `rt1`.
+
+Checks: `chdir-relative-enters` (printed path ends in `rt1`),
+`chdir-parent-leaves` (second path is the first one's parent, not equal),
+`chdir-missing-dir-fails` (`AX=3` and `CF=1`), and
+`chdir-round-trip-cleans-up` (the host directory is gone, so the `..` really
+did leave and the rmdir landed in the parent). Verified to bite: deleting the
+`dos_dir[dos_drive]` store fails the first two and the cleanup check (the
+guest then rmdirs the wrong directory), and dropping the `dos_chdir()`
+failure from the guard fails `chdir-missing-dir-fails` with `AX=0`.

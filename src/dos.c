@@ -122,6 +122,18 @@ void dos_flush(FILE *f)
 static void setAX(int v) { cpu.r[0] = (uint16_t)v; }
 static void setAThi(int v) { cpu.r[0] = (uint16_t)((cpu.r[0] & 0xFF00) | (v & 0xFF)); }
 
+#define DOS_DRIVES 27
+
+/* Current drive, A=0.  The original keeps it in ds:0x621C5C, set by 0Eh and
+ * read by 19h; C: is what emu8086 starts on. */
+static int dos_drive = 2;
+
+/* Each drive remembers its own current directory, as DOS does, as a path
+ * relative to the drive root ("" = root).  The host cwd is the live directory
+ * of dos_drive, so switching drives (0Eh) re-enters that drive's directory. */
+static char dos_dir[DOS_DRIVES][160];
+static int dos_seeded;
+
 /* 47h wants the current directory the way DOS shows it: no drive, no leading
  * separator ("EMU8086\EXAMPLE").  The original keeps one virtual
  * subdirectory per drive ("GET_VIRTUAL_SUBDIRECTORY"); the clone tracks a
@@ -143,6 +155,83 @@ static void dos_current_dir(char *out, size_t n)
 #ifdef _WIN32
     for (i = 0; out[i]; i++) if (out[i] == '/') out[i] = '\\';
 #endif
+}
+
+/* Seed the current drive's directory from the host cwd the first time
+ * anything asks, so 47h answers what the emulator was started in. */
+static void dos_seed(void)
+{
+    if (dos_seeded) return;
+    dos_seeded = 1;
+    dos_current_dir(dos_dir[dos_drive], sizeof dos_dir[0]);
+}
+
+/* Host path of a drive's directory: drive root plus the DOS-visible path. */
+static void dos_host_dir(int drive, const char *dir, char *out, size_t n)
+{
+#ifdef _WIN32
+    snprintf(out, n, "%c:\\%s", 'A' + drive, dir);
+#else
+    snprintf(out, n, "/%s", dir);
+#endif
+}
+
+static int dos_chdir(const char *dir)
+{
+    char host[512];
+    dos_host_dir(dos_drive, dir, host, sizeof host);
+    return chdir(host);
+}
+
+/* Apply a DOS path to a drive's directory string: absolute paths start at the
+ * drive root, ".." climbs (clamped at the root), and "C:" is accepted when it
+ * names the current drive.  Returns 0, or -1 for a path we cannot model. */
+static int dos_apply_path(int drive, const char *path, char *out, size_t n)
+{
+    const char *p = path;
+    size_t o = 0;
+
+    if (p[0] && p[1] == ':') {
+        int d = toupper((unsigned char)p[0]) - 'A';
+        if (d != drive) return -1;          /* one host cwd, see 28 */
+        p += 2;
+    }
+    if (*p == '\\' || *p == '/') {
+        p++;                                /* absolute: from the drive root */
+    } else {
+        while (dos_dir[drive][o] && o + 1 < n) { out[o] = dos_dir[drive][o]; o++; }
+    }
+    out[o] = 0;
+
+    while (*p) {
+        char comp[64];
+        size_t cl = 0;
+        const char *start;
+
+        while (*p == '\\' || *p == '/') p++;
+        if (!*p) break;
+        start = p;
+        while (*p && *p != '\\' && *p != '/') p++;
+        while (start < p && cl + 1 < sizeof comp) comp[cl++] = *start++;
+        comp[cl] = 0;
+
+        if (!strcmp(comp, ".")) continue;
+        if (!strcmp(comp, "..")) {
+            while (o && out[o - 1] != '\\') o--;
+            if (o) o--;
+            out[o] = 0;
+            continue;
+        }
+        if (o) {
+            if (o + 1 >= n) return -1;
+            out[o++] = '\\';
+        }
+        if (o + cl >= n) return -1;
+        memcpy(out + o, comp, cl);
+        o += cl;
+        out[o] = 0;
+    }
+    return 0;
 }
 
 /* Build a $-terminated string starting at DS:DX and print it. */
@@ -244,9 +333,6 @@ static int dos_slot_alloc(void)
 static uint32_t dta;
 static int dta_valid;
 
-/* Current drive, A=0.  The original keeps it in ds:0x621C5C, set by 0Eh and
- * read by 19h; C: is what emu8086 starts on. */
-static int dos_drive = 2;
 
 static uint32_t dta_addr(void)
 {
@@ -446,8 +532,11 @@ static void int21(void)
 
     case 0x0E:                                  /* select disk, DL */
         /* Original: 0x5DC310 stores DL in ds:0x621C5C, then the arm sets
-         * AL=0x19 (0x5277AD) - 25 logical drives. */
+         * AL=0x19 (0x5277AD) - 25 logical drives.  Every drive keeps its own
+         * current directory, so the host cwd follows the switch. */
+        dos_seed();
         dos_drive = cpu.r[DX] & 0xFF;
+        if (dos_drive < DOS_DRIVES) dos_chdir(dos_dir[dos_drive]);
         setAThi(0x19);
         break;
 
@@ -455,6 +544,27 @@ static void int21(void)
         /* Original: 0x5DC390 returns ds:0x621C5C, arm puts it in AL. */
         setAThi(dos_drive);
         break;
+
+    case 0x3B: {                                /* change directory */
+        char path[160], want[160];
+
+        /* Original (0x52829A-0x52837C): DS:DX goes through the EA prologue and
+         * CHANGE_VIRTUAL_SUBDIRECTORY (0x5DD420); non-zero sets +0x3A and
+         * AX=0, zero sets +0x38 and AX=3 (path not found). */
+        if (dos_guest_name(path, sizeof path) != 0) {
+            dos_file_error(3);
+            break;
+        }
+        dos_seed();
+        if (dos_apply_path(dos_drive, path, want, sizeof want) != 0 ||
+            dos_chdir(want) != 0) {
+            dos_file_error(3);
+            break;
+        }
+        strcpy(dos_dir[dos_drive], want);
+        cpu.r[0] = 0;
+        cpu.flags &= ~F_CF;
+        break; }
 
     case 0x47: {                                /* get current directory */
         char path[64];
@@ -466,8 +576,10 @@ static void int21(void)
          * status word +0x38 = FFFF, AH=0, AL=0x0F.  Success (0x5284D5) writes
          * the ASCIIZ at DS:SI through 0x5DCA30, marks +0x3A, AH=0, AL=1. */
         if (drive > 26) { dos_file_error(0x0F); break; }
-        if (drive == 0 || drive == dos_drive) dos_current_dir(path, sizeof path);
-        else path[0] = 0;                       /* other drive: its root */
+        dos_seed();
+        if (drive == 0) drive = dos_drive;      /* 0 = default drive */
+        strncpy(path, dos_dir[drive], sizeof path - 1);
+        path[sizeof path - 1] = 0;              /* other drives: root or 3Bh */
         p = seg_off_to_phys(cpu.sr[DS], cpu.r[SI]);
         for (i = 0; path[i] && i < 63; i++) poke8(p + (uint32_t)i, path[i]);
         poke8(p + (uint32_t)i, 0);
