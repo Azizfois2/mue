@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""INT 21h file services regression: 3Ch/3Dh/3Eh/3Fh/40h/41h/42h/4Eh/4Fh
-and 1Ah (DTA).
+"""INT 21h file services regression: 3Ch/3Dh/3Eh/3Fh/40h/41h/42h/43h/4Eh/4Fh/
+56h, and 1Ah (DTA).
 
 Each guest runs in a scratch directory, so the files it creates are the
 oracle: the host reads them back.  Derived from FINDINGS 5.1 (3C/3D ->
@@ -348,6 +348,91 @@ pop di
 ret
 """
 
+# 56h rename: the old name goes away and the new one keeps the contents.
+T_RENAME = PROLOG + """
+mov ah,3ch
+mov cx,0
+lea dx,fold
+int 21h
+mov bx,ax
+mov ah,40h
+mov cx,2
+lea dx,msg
+int 21h
+mov ah,3eh
+int 21h
+mov ax,cs
+mov es,ax
+mov ah,56h
+lea dx,fold
+lea di,fnew
+int 21h
+pushf
+pop bp
+ret
+fold db 'old.txt',0
+fnew db 'new.txt',0
+msg db 'hi'
+"""
+
+T_RENAME_MISS = PROLOG + """
+mov ax,cs
+mov es,ax
+mov ah,56h
+lea dx,fnope
+lea di,fx
+int 21h
+pushf
+pop si
+ret
+fnope db 'nope.txt',0
+fx db 'x.txt',0
+"""
+
+# 43h: get (AL=0) then set read-only (AL=1) then get again.
+T_ATTR = PROLOG + """
+mov ah,43h
+mov al,0
+lea dx,fnew
+int 21h
+mov bx,cx
+pushf
+pop di
+mov ah,43h
+mov al,1
+mov cx,1
+lea dx,fnew
+int 21h
+pushf
+pop si
+mov ah,43h
+mov al,0
+lea dx,fnew
+int 21h
+mov bp,cx
+ret
+fnew db 'new.txt',0
+"""
+
+T_ATTR_ERR = PROLOG + """
+mov ah,43h
+mov al,0
+lea dx,fnope
+int 21h
+mov bp,ax
+pushf
+pop di
+mov ah,43h
+mov al,2
+lea dx,fnope
+int 21h
+mov bx,ax
+pushf
+pop si
+ret
+fnope db 'nope.txt',0
+"""
+
 # Handle 1 is stdout: the bytes must reach the console, not a file.
 T_STDOUT = PROLOG + """
 mov ah,40h
@@ -481,6 +566,43 @@ def main():
         di = reg(out, "DI")
         check("stdin-eof-returns-zero", ax == 0, ax)
         check("stdin-eof-cf-clear", di is not None and not (di & 1), di)
+
+        rc, out = run(mue, T_RENAME, d)
+        bp = reg(out, "BP")
+        check("rename-succeeds", bp is not None and not (bp & 1), bp)
+        check("rename-old-name-gone", host("old.txt") is None, host("old.txt"))
+        check("rename-keeps-contents", host("new.txt") == b"hi",
+              host("new.txt"))
+
+        rc, out = run(mue, T_RENAME_MISS, d)
+        ax = reg(out, "AX")
+        si = reg(out, "SI")
+        check("rename-missing-not-found", ax == 2, ax)
+        check("rename-missing-cf", si is not None and (si & 1), si)
+
+        rc, out = run(mue, T_ATTR, d)
+        bx = reg(out, "BX")
+        di = reg(out, "DI")
+        si = reg(out, "SI")
+        bp = reg(out, "BP")
+        check("attrs-get-file-archive", bx == 0x20, hex(bx) if bx is not None else None)
+        check("attrs-get-cf-clear", di is not None and not (di & 1), di)
+        check("attrs-set-succeeds", si is not None and not (si & 1), si)
+        check("attrs-readonly-readable", bp is not None and (bp & 1), bp)
+        try:                                        # let the cleanup work
+            os.chmod(os.path.join(d, "new.txt"), 0o666)
+        except OSError:
+            pass                                    # the checks already failed
+
+        rc, out = run(mue, T_ATTR_ERR, d)
+        bp = reg(out, "BP")
+        di = reg(out, "DI")
+        bx = reg(out, "BX")
+        si = reg(out, "SI")
+        check("attrs-missing-not-found", bp == 2, bp)
+        check("attrs-missing-cf", di is not None and (di & 1), di)
+        check("attrs-bad-subfunction", bx == 1, bx)
+        check("attrs-bad-subfunction-cf", si is not None and (si & 1), si)
 
         rc, out = run(mue, T_STDOUT, d)
         txt = guest_text(out)

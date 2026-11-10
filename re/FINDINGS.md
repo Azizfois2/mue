@@ -1323,7 +1323,8 @@ standard DOS one. The `CF`/`AX` error convention was originally written here
 as INFERRED; it has since been checked against the dispatcher and the original
 **does not do that** - it answers in `AX` alone, with different codes, and
 never raises `CF`. 21 has the evidence and what the clone does instead.
-Handle 0 (stdin) is covered in 20; `AH=41` and `AH=4E`/`4F` in 19.
+Handle 0 (stdin) is covered in 20; `AH=41` and `AH=4E`/`4F` in 19;
+`AH=43` and `AH=56` in 22.
 
 Regression `src/check_int21.py` (14 checks, wired into `make test`): each
 guest runs in a scratch directory and the host reads the files back, so the
@@ -1505,3 +1506,44 @@ correctly; it does not make the clone byte-identical to emu8086 here.
 
 The divergence is confined to the failure branch - success paths already match
 the original (`AX` = handle/bytes/position).
+
+## 22. INT 21h 43h (attributes) and 56h (rename) (IMPLEMENTED)
+
+Both were unimplemented, so the file API could create, read, write, seek,
+delete and enumerate, but not rename or inspect attributes.
+
+Attribution from 5.1 is CONFIRMED: `43 -> 0x5E16C0`, `56 -> 0x5DF2D0` (the
+"rename" handler, reached twice through the EA prologue `0x54A0C0` for the two
+names). Their result branches follow the convention verified in 21:
+
+| AH | success | failure AX | evidence |
+|---|---|---|---|
+| `43` | `+0x3A` marked | `0x0001` | `0x529A14` ok, `0x529A26` mark + `AL=1` at `0x529A59` |
+| `56` | `+0x3A` marked | `0x0002` | `0x529EFC` ok, `0x529F0E` mark + `AL=2` at `0x529F41` |
+
+Implemented in `src/dos.c`:
+
+- `AH=43` `AL=0`: `CX` = `0x10` for a directory, else `0x20` (archive), plus
+  `0x01` when the host file is read-only.
+- `AH=43` `AL=1`: sets/clears read-only. That is the only DOS attribute bit a
+  host file can actually carry, so it is mapped onto the host's write
+  permission (`_chmod` / `chmod`); the other bits are accepted and ignored.
+  Any other `AL` is invalid function (1).
+- `AH=56`: ASCIIZ `DS:DX` renamed to the ASCIIZ at `ES:DI`, through `rename()`.
+  Note the second segment: `ES`, not `DS`, which is what the EA prologue in
+  the original sets up.
+- `AH=4E`/`4F` now report the same attribute bits (`0x20|0x01` for a read-only
+  file) instead of a flat `0x20`, so 43 and 4E cannot disagree.
+
+Failure codes follow the clone's DOS convention (2 not found, 3 path, 5
+access, 1 invalid function), which is the deliberate divergence described in
+21.3; the original's fixed codes are in the table above.
+
+Regressions added to `src/check_int21.py` (50 checks): rename moves the file
+and keeps its contents, rename of a missing name is 2+CF, get reports `0x20`,
+set read-only then get reports bit 0, missing file is 2+CF, and `AL=2` is 1+CF.
+Proved to bite: stubbing `rename()` and dropping the read-only bit fail
+`rename-succeeds`/`rename-old-name-gone`/`rename-keeps-contents` and
+`attrs-readonly-readable` respectively. The test also caught itself crashing
+on a missing file instead of reporting - fixed by making the permission
+restore tolerant.

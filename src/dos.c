@@ -16,6 +16,13 @@
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
+#define DOS_IREAD   _S_IREAD
+#define DOS_IWRITE  _S_IWRITE
+#define dos_chmod   _chmod
+#else
+#define DOS_IREAD   S_IRUSR
+#define DOS_IWRITE  S_IWUSR
+#define dos_chmod   chmod
 #endif
 #include "cpu.h"
 #include "alu.h"
@@ -142,12 +149,13 @@ static void dos_file_error(int code)
     setAX(code);
 }
 
-/* Copy the ASCIIZ name at DS:DX into out.  Returns 0 on success, -1 on an
+/* Copy an ASCIIZ name out of guest memory.  Returns 0 on success, -1 on an
  * empty name or one longer than a DOS path can be. */
-static int dos_guest_name(char *out, size_t n)
+static int dos_name_at(uint16_t seg, uint16_t off, char *out, size_t n)
 {
-    uint32_t p = seg_off_to_phys(cpu.sr[DS], cpu.r[DX]);
+    uint32_t p = seg_off_to_phys(seg, off);
     size_t i = 0;
+
     for (;;) {
         int c = peek8(p + (uint32_t)i);
         if (c == 0) break;
@@ -156,6 +164,11 @@ static int dos_guest_name(char *out, size_t n)
     }
     out[i] = 0;
     return i == 0 ? -1 : 0;
+}
+
+static int dos_guest_name(char *out, size_t n)
+{
+    return dos_name_at(cpu.sr[DS], cpu.r[DX], out, n);
 }
 
 /* Open FILE for handle h, or NULL if h is not an open file. */
@@ -318,7 +331,10 @@ static int find_match(void)
         if (isdir && !(find_attr & 0x10)) continue;   /* dirs need 0x10 */
         if (!isdir && (find_attr & 0x08)) continue;   /* volume labels only */
         if (seen++ < find_index) continue;
-        dta_fill(de->d_name, &st, isdir ? 0x10 : 0x20);
+        /* Same attribute bits AH=43 reports, so the two calls agree. */
+        dta_fill(de->d_name, &st,
+                 isdir ? 0x10
+                       : (0x20 | ((st.st_mode & S_IWRITE) ? 0 : 0x01)));
         hit = 1;
     }
     closedir(dp);
@@ -568,6 +584,48 @@ static void int21(void)
 
         if (dos_guest_name(name, sizeof name) != 0) { dos_file_error(3); break; }
         if (remove(name) != 0) { dos_file_error(2); break; }
+        cpu.flags &= ~F_CF;
+        break; }
+
+    case 0x43: {                                /* get/set attributes (AL) */
+        char name[128];
+        struct stat st;
+        int sub = cpu.r[AX] & 0xFF;
+
+        /* Original: 43 -> 0x5E16C0, success marks +0x3A (0x529A14), failure
+         * returns AX=0x0001 (0x529A26/0x529A59). */
+        if (sub > 1) { dos_file_error(1); break; }
+        if (dos_guest_name(name, sizeof name) != 0) { dos_file_error(3); break; }
+        if (stat(name, &st) != 0) { dos_file_error(2); break; }
+        if (sub == 0) {                         /* get -> CX */
+            int attr = (st.st_mode & S_IFDIR) ? 0x10 : 0x20;
+            if (!(st.st_mode & S_IWRITE)) attr |= 0x01;
+            cpu.r[CX] = (uint16_t)attr;
+            cpu.flags &= ~F_CF;
+            break;
+        }
+        /* Set: the only DOS bit a host file can carry is read-only. */
+        if (dos_chmod(name, (cpu.r[CX] & 0x01) ? DOS_IREAD
+                                               : (DOS_IREAD | DOS_IWRITE))) {
+            dos_file_error(5);
+            break;
+        }
+        cpu.flags &= ~F_CF;
+        break; }
+
+    case 0x56: {                                /* rename DS:DX -> ES:DI */
+        char from[128], to[128];
+        struct stat st;
+
+        /* Original: 56 -> 0x5DF2D0, success marks +0x3A (0x529EFC), failure
+         * returns AX=0x0002 (0x529F0E/0x529F41). */
+        if (dos_guest_name(from, sizeof from) != 0) { dos_file_error(3); break; }
+        if (dos_name_at(cpu.sr[ES], cpu.r[DI], to, sizeof to) != 0) {
+            dos_file_error(3);
+            break;
+        }
+        if (stat(from, &st) != 0) { dos_file_error(2); break; }
+        if (rename(from, to) != 0) { dos_file_error(5); break; }
         cpu.flags &= ~F_CF;
         break; }
 
