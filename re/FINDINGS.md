@@ -497,8 +497,8 @@ plus `INT %02X`-style templates at `0x447F78/0x44800C/0x448094`.
 | `16` | AH=`00,01` | kb-buffer OCX vtable sink `+0x750/0x754`; fail template `0x4479B4` at `0x524BDF` |
 | `17` | - | direct `CALL 0x550B40` ("wrong parameter...") |
 | `1A` | AH=`00` (time-of-day; host clock `fmul [0x409828]` -> `>>1` div-2 BCD chain -> CH/CL/DH/DL; CX/DX read-path variant) | fail template `0x4479D4` at `0x5252EE`; see 5.5 |
-| `19` | - | reboot: `[ecx+0x4C]=0xFFFF; [0x621218]=0xFFFF; CALL [eax+0x7AC]` |
-| `20` | - | terminate: same `0x4C/0x621218=0xFFFF` + `[eax+0x7AC]` (identity of that sink is still open, 21.2) |
+| `19` | - | reboot: `[ecx+0x4C]=0xFFFF; [0x621218]=0xFFFF; CALL [eax+0x7AC]` - `+0x4C` is a halt word, **not** the carry flag (21.2), and `0x621218` is the marker the run loop tests (24.2); `[eax+0x7AC]` is a UI report, also **not** a halt (24.1) |
+| `20` | - | terminate: same `0x4C/0x621218=0xFFFF` + `[eax+0x7AC]` (sink settled in 24) |
 | `21` | 47 AHs: `00,01,02,05,06,07,08,09,0A,0B,0C,0D,0E,17,19,1A,1F,25,2A,2C,2E,30,35,36,39,3A,3B,47,3C,3D,3E,3F,40,41,42,4D,54,56,4C,4E,4F,57,23,33,48,49,4A` | doc lists 27; the other 20 (00,0D,17,1A,1F,23,2E,30,33,36,43,48,49,4A,4D,4E,4F,54,56,57) still have compare-and-handle bodies in the binary; fail template `0x447EB0` at `0x52A2D4`; shared exit `0x52A52A: jmp 0x52A934` |
 | `33` | AX=`0000/0001/0002/0003` (mouse; template `0x453680` `int 33h/AX=0` at `0x5EEFB5/0x5EF1B8`) | else `not supported INT 21h/33h AL=` (`0x448798`); reg-dump block at `0x52A549` pushes fields `+0xBA..+0xC1` |
 

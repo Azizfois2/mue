@@ -401,7 +401,6 @@ static int encode_insn(asm_t *a, const char *mnem_in, char **ops, int nops)
 {
     operand_t d, s;
     char m[32];
-    int code;
 
     snprintf(m, sizeof(m), "%s", mnem_in);
 

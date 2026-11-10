@@ -449,6 +449,14 @@ REJECT_80186(64) REJECT_80186(65) REJECT_80186(66) REJECT_80186(67)
 REJECT_80186(68) REJECT_80186(69) REJECT_80186(6a) REJECT_80186(6b)
 REJECT_80186(6c) REJECT_80186(6d) REJECT_80186(6e) REJECT_80186(6f)
 
+/* Explicit table: the opcode table used to compute h_60 + (i - 0x60), which
+ * relies on the linker keeping those functions in order and leaves all but
+ * h_60 unreferenced. */
+static void (*const reject_80186[16])(void) = {
+    h_60, h_61, h_62, h_63, h_64, h_65, h_66, h_67,
+    h_68, h_69, h_6a, h_6b, h_6c, h_6d, h_6e, h_6f
+};
+
 /* 70-7F : short conditional jumps */
 #define JCC(n, cc) static void h_j##n(void) { \
     int8_t d = fetch_s8(); \
@@ -777,7 +785,7 @@ static void op_table_init(void)
     SET(0x16, s16); SET(0x17, s17); SET(0x1e, s1e); SET(0x1f, s1f);
 
     { int i;
-      for (i = 0x60; i <= 0x6f; i++) OP[i] = h_60 + (i - 0x60); }
+      for (i = 0x60; i <= 0x6f; i++) OP[i] = reject_80186[i - 0x60]; }
     OP[0x70]=h_j70; OP[0x71]=h_j71; OP[0x72]=h_j72; OP[0x73]=h_j73;
     OP[0x74]=h_j74; OP[0x75]=h_j75; OP[0x76]=h_j76; OP[0x77]=h_j77;
     OP[0x78]=h_j78; OP[0x79]=h_j79; OP[0x7a]=h_j7a; OP[0x7b]=h_j7b;

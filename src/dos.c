@@ -118,7 +118,6 @@ void dos_flush(FILE *f)
 
 /* ---- helpers --------------------------------------------------------- */
 static void setAX(int v) { cpu.r[0] = (uint16_t)v; }
-static void setAXhi(int v) { cpu.r[0] = (uint16_t)((cpu.r[0] & 0x00FF) | ((v & 0xFF) << 8)); }
 static void setAThi(int v) { cpu.r[0] = (uint16_t)((cpu.r[0] & 0xFF00) | (v & 0xFF)); }
 
 /* Build a $-terminated string starting at DS:DX and print it. */

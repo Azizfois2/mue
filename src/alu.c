@@ -205,7 +205,6 @@ uint16_t alu_shift(int op, uint16_t v, unsigned count, int width)
 {
     uint32_t mask = (width == 8) ? 0xFFu : 0xFFFFu;
     uint32_t top  = (width == 8) ? 0x80u : 0x8000u;
-    uint32_t n = mask + 1;
     uint32_t x = v & mask;
     unsigned i;
 

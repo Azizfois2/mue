@@ -66,11 +66,6 @@ void emit_bytes(asm_t *a, const uint8_t *p, int n)
 }
 
 /* ---- labels ---------------------------------------------------------- */
-static int lab_cmp(const void *x, const void *y)
-{
-    return strcmp(((const label_t *)x)->name, ((const label_t *)y)->name);
-}
-
 label_t *find_label(asm_t *a, const char *name)
 {
     int i;

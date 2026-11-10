@@ -66,16 +66,6 @@ static const char *trim_copy(const char *s)
     return buf;
 }
 
-static void strip_spaces(char *s)
-{
-    char *d = s;
-    while (*s) {
-        if (!isspace((unsigned char)*s)) *d++ = *s;
-        s++;
-    }
-    *d = 0;
-}
-
 /* ---- operand classification ------------------------------------------ */
 /* Recognised size keywords in front of a memory operand. */
 static int size_keyword(const char *s, int *size, const char **rest)
