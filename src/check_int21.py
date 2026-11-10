@@ -33,8 +33,14 @@ def run(mue, src, cwd, stdin_data=None):
     a = os.path.join(cwd, "t.asm")
     with open(a, "w") as f:
         f.write(src)
-    p = subprocess.run([mue, a], input=stdin_data, capture_output=True,
-                       timeout=60, cwd=cwd)
+    # stdin is closed unless the check supplies one: a guest that waits for a
+    # keystroke must hit end-of-input, never block the suite.
+    if stdin_data is None:
+        p = subprocess.run([mue, a], stdin=subprocess.DEVNULL,
+                           capture_output=True, timeout=60, cwd=cwd)
+    else:
+        p = subprocess.run([mue, a], input=stdin_data, capture_output=True,
+                           timeout=60, cwd=cwd)
     return p.returncode, (p.stdout + p.stderr).decode("utf-8", "replace")
 
 
@@ -433,6 +439,38 @@ ret
 fnope db 'nope.txt',0
 """
 
+# INT 16h AH=01 waits for a key and leaves it for the next AH=00.
+T_INT16_PEEK = PROLOG + """
+mov ah,1
+int 16h
+pushf
+pop di
+mov bx,ax
+mov ah,0
+int 16h
+mov cx,ax
+ret
+"""
+
+# With no input at all it must report "no key" rather than wait forever.
+T_INT16_NONE = PROLOG + """
+mov ah,1
+int 16h
+pushf
+pop di
+mov bx,ax
+ret
+"""
+
+# INT 21h AH=01 echoes what it reads, in order.
+T_INT21_01 = PROLOG + """
+mov ah,1
+int 21h
+mov ah,1
+int 21h
+ret
+"""
+
 # Handle 1 is stdout: the bytes must reach the console, not a file.
 T_STDOUT = PROLOG + """
 mov ah,40h
@@ -603,6 +641,26 @@ def main():
         check("attrs-missing-cf", di is not None and (di & 1), di)
         check("attrs-bad-subfunction", bx == 1, bx)
         check("attrs-bad-subfunction-cf", si is not None and (si & 1), si)
+
+        rc, out = run(mue, T_INT16_PEEK, d, b"K")
+        bx = reg(out, "BX")
+        cx = reg(out, "CX")
+        di = reg(out, "DI")
+        check("int16-peek-returns-key", bx == 0x4B00,
+              hex(bx) if bx is not None else None)
+        check("int16-peek-zf-clear", di is not None and not (di & 0x40), di)
+        check("int16-peek-does-not-consume", cx == 0x4B00,
+              hex(cx) if cx is not None else None)
+
+        rc, out = run(mue, T_INT16_NONE, d, b"")
+        bx = reg(out, "BX")
+        di = reg(out, "DI")
+        check("int16-no-input-returns-zero", bx == 0, bx)
+        check("int16-no-input-sets-zf", di is not None and (di & 0x40), di)
+
+        rc, out = run(mue, T_INT21_01, d, b"QZ")
+        txt = guest_text(out)
+        check("int21-01-reads-in-order", txt.strip() == "QZ", repr(txt))
 
         rc, out = run(mue, T_STDOUT, d)
         txt = guest_text(out)

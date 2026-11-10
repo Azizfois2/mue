@@ -1617,3 +1617,29 @@ The core now executes both through the existing `grp2(width, 0, 1)` path
 `sar ax,4` of `8000h` -> `F800h`, the count-0 no-op, and the 8-bit `C0` form.
 The real assembler's own output for these was checked against the shipped
 `.list` fixtures, which use `D0`/`D1` for a count of 1.
+
+### 20.1 Console reads now wait instead of reporting "no key" (IMPLEMENTED)
+
+`kb_pop()` returned -1 as soon as the queue was empty and stdin was a
+terminal, so a guest doing `INT 16h AH=01` saw "no key" instantly and
+`INT 21h AH=01` saw Ctrl-Z. Both now wait for a key:
+
+- `kb_refill()` tops the queue up from the host when it is empty.
+- `kb_pop()` consumes; `kb_peek()` waits and returns the next key *without*
+  consuming it, so `AH=01` still leaves the character for the following
+  `AH=00`.
+- Only a redirected stdin can end (EOF); a terminal never does, so a guest
+  run from a pipe or file still finishes instead of hanging.
+
+Covered by `src/check_int21.py`: `int16-peek-returns-key`,
+`int16-peek-zf-clear`, `int16-peek-does-not-consume` (the key survives into
+`AH=00`), and `int16-no-input-returns-zero`/`-sets-zf` for the exhausted-input
+case. The harness now runs guests with `stdin=DEVNULL` by default, so a guest
+that waits can never hang `make test`.
+
+**Not demonstrated here:** this shell's console reports `isatty(0)` true but
+returns EOF immediately from `fgetc` (checked with a standalone C probe:
+`isatty=64`, `fgetc=-1`), so the waiting path cannot be exercised in this
+environment; what the regression pins is the EOF fallback and the peek
+semantics. On a real console the read waits for a line (console input is
+line-buffered, so a key followed by Enter).

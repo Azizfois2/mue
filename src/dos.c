@@ -54,15 +54,17 @@ void dos_feed_stdin(const char *text)
     while (*text) { dos_push_key(*text); text++; }
 }
 
-/* One byte from the host, so `mue prog.asm < input` works.  A terminal is
- * never touched: the emulator must not block waiting for a keypress nobody
- * asked for. */
+/* One byte from the host, so `mue prog.asm < input` works.
+ *
+ * On a terminal this waits for a key: the console calls are supposed to block
+ * until something is typed, not report "no key" the instant the buffer is
+ * empty.  A redirected stream returns EOF once exhausted, so a guest run from
+ * a file or a pipe is never left waiting. */
 static int host_stdin_byte(void)
 {
     static int binary;
     int c;
 
-    if (isatty(0)) return -1;
 #ifdef _WIN32
     /* Text mode would eat the CR before the guest ever sees it. */
     if (!binary) { _setmode(_fileno(stdin), _O_BINARY); binary = 1; }
@@ -71,13 +73,33 @@ static int host_stdin_byte(void)
     return c == EOF ? -1 : c;
 }
 
+/* Queue one host byte when the buffer is empty.  Returns 0 at end of input,
+ * which only a redirected stdin can reach. */
+static int kb_refill(void)
+{
+    int c;
+    if (kb_head != kb_tail) return 1;
+    c = host_stdin_byte();
+    if (c < 0) return 0;
+    dos_push_key(c);
+    return kb_head != kb_tail;
+}
+
+/* Pop a key, waiting for one when nothing is buffered. */
 static int kb_pop(void)
 {
     int v;
-    if (kb_head == kb_tail) return host_stdin_byte();
+    if (!kb_refill()) return -1;
     v = kb[kb_head];
     kb_head = (kb_head + 1) & 0xFF;
     return v;
+}
+
+/* Look at the next key without consuming it, waiting for one first. */
+static int kb_peek(void)
+{
+    if (!kb_refill()) return -1;
+    return kb[kb_head];
 }
 
 /* ---- screen ---------------------------------------------------------- */
@@ -890,11 +912,12 @@ static void int16(void)
         cpu.r[0] = (uint16_t)((c << 8) | 0);
         cpu.flags &= ~F_ZF;
         break; }
-    case 0x01: case 0x11:
-        if (kb_head != kb_tail) { cpu.flags &= ~F_ZF;
-            cpu.r[0] = (uint16_t)((kb[kb_head] << 8) | 0); }
+    case 0x01: case 0x11: {                 /* peek: wait, but do not consume */
+        int c = kb_peek();                  /* blocks on a terminal */
+        if (c >= 0) { cpu.flags &= ~F_ZF;
+            cpu.r[0] = (uint16_t)((c << 8) | 0); }
         else { cpu.flags |= F_ZF; cpu.r[0] = 0; }
-        break;
+        break; }
     default: break;
     }
 }
