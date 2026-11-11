@@ -2209,9 +2209,11 @@ covers one- and two-digit values and is the authoritative one.)
   - The child's initial state: CS=DS=ES=SS = its window, IP=0x100, SP=0xFFFE,
     IF set, its own default DTA (the parent's is restored afterwards).
   - **PSP** (the `AL=0` DOS 3.x parameter block at ES:BX): `int 20h` at offset
-    0, the window's top of memory at +2, the environment segment at +0x2C,
-    `int 21h; retf` at +0x50 (so a child can leave through `ret`), the counted
-    command tail plus the terminating CR at +0x80, and zeroed FCB pointers.
+    0, the window's top of memory at +2, the parent PSP segment at +0x16, the
+    job file table at +0x18 with its size/pointer at +0x32/+0x34 (32), the
+    environment segment at +0x2C, `int 21h; retf` at +0x50 (so a child can
+    leave through `ret`), the counted command tail plus the terminating CR at
+    +0x80, and zeroed FCB pointers.
   - **Command tail**: the counted string the parameter block points at is
     copied into `PSP:0x80` verbatim (length clamped to 127) followed by 0x0Dh,
     exactly as DOS does, so `INT 21h AH=9` on `PSP:0x81` prints the arguments
@@ -2314,3 +2316,84 @@ puts `FOO=BAR` into the child's environment block.
 Not affected: the emulator's REP handling (`cpu.rep_kind`), which already
 repeated A4..AF correctly - verified with a standalone `rep movsb` guest that
 prints the copied string. The bug was entirely in the assembler.
+
+## 32. The PSP's parent segment, job file table and inherited handles (IMPLEMENTED)
+
+4Bh used to hand a child a PSP with only the `int 20h`, top-of-memory, tail and
+environment fields. Three more of DOS's fields are now filled in, because a
+program that inspects its own PSP (or hands handles to a child) reads them.
+
+### The layout the clone writes
+
+    +0x00  CD 20            int 20h (leave through it)
+    +0x02  top of memory    the window's end, seg+0x1000
+    +0x16  parent PSP       the caller's PSP segment
+    +0x18  20 bytes         job file table
+    +0x2C  environment      segment of the copy (30)
+    +0x32  0x0014           size of the table, in bytes
+    +0x34  0x0018, seg      far pointer to it
+    +0x50  CD 21 CB         int 21h; retf
+    +0x80  counted tail + CR
+
+Parent segment: the segment of the PSP belonging to whoever called 4Bh - the
+program `mue` loaded (`0x0100`, see main.c) or the window of the enclosing
+child. In a nested chain that is what makes 0x16 differ per level: `0xF000` for
+the first child's child, and so on. There is no COMMAND.COM above the program
+`mue` runs, so the boot PSP's 0x16 points at itself; DOS would point it at the
+shell.
+
+Job file table: 20 one-byte entries in DOS's own encoding - 0xFF free, 0x80+h
+for a character device (so handles 0-2 are 0x80, 0x81, 0x82 and AUX/PRN follow
+in 3 and 4), and 0..0x7F for a slot in the file table. The clone's handles are
+5+i for `dos_files[i]` (5.1), so entry 5+i holds the byte i: the table is the
+clone's file table, seen through the same numbering the guest already uses.
+
+Inheritance: 4Bh copies the live table into every child, so every handle the
+parent has open is open in the child, and reading it continues from the same
+position - which is what DOS does and what a program that passes a handle to a
+child depends on. `psp-child-layout` and `exec-inherits-handles` pin it.
+
+### Keeping it current, and the limit of one global table
+
+`dos_psp` names the process whose table is current, so 3Ch/3Dh set the byte for
+the handle they just opened and 3Eh clears it - in the PSP of whoever is
+running, the boot program or a child. `psp-boot-jft` checks the boot program's
+own table after a 3Ch.
+
+The clone has one host file table shared by every process, not one per PSP.
+Two consequences, both deliberate:
+
+- A child closing a handle the parent passed down closes it for the parent too.
+  Real DOS would leave the parent's copy open. Modelling that needs per-process
+  entries with a shared file position, which is a bigger change than this PSP
+  work, and no check here depends on it.
+- Handles a child opens and never closes are dropped when it returns (slots
+  that were free before the exec are closed and freed afterwards). DOS loses
+  those too - a child cannot leak a handle into its parent - so this matches,
+  and it stops a nested exec that opens a file from exhausting the table
+  (`exec-child-handles-do-not-leak`: after the child's unclosed open, the
+  parent's next open must still get handle 6).
+
+### Checks
+
+`psp-boot-jft` (the boot program's 0x16 points at itself and its table has the
+device entries, the new file in 5, 0xFF in 6, size 20, offset 0x18, pointer to
+its own segment), `psp-child-layout` (a child's table from 4Bh, its own segment
+at 0x36, parent 0x0100 at 0x16), `psp-parent-segment` and `psp-parent-nested`
+(the child reports the high byte of 0x16 through its exit code: 0x01 for the
+boot parent, 0xF0 for a child at 0xF000 two levels down),
+`exec-inherits-handles` (the child reads 5 bytes from the handle the parent
+opened and prints them) and `exec-child-handles-do-not-leak`.
+
+Verified to bite: deleting `poke16(base + 0x16, dos_psp)` fails
+`psp-child-layout` (6), `exec-inherits-handles`, `psp-parent-segment` and
+`psp-parent-nested`; deleting `dos_jft_fill(seg)` fails `psp-child-layout` (1)
+and `exec-inherits-handles`; deleting the 3Ch `dos_jft_set` fails
+`psp-boot-jft` (3, the entry for a handle the parent just opened still reads
+0xFF); and disabling the end-of-exec cleanup fails
+`exec-child-handles-do-not-leak` with `(7, 0)`.
+
+Getting the tests wrong twice was instructive: `mov ah,4bh` leaves whatever AL
+held (5, from the preceding open), so the handler rightly refused the overlay
+form and the child never ran - the failure looked like a broken PSP rather than
+a broken guest. The `AL=0` form needs `mov ax,4b00h`.

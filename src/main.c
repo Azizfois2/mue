@@ -43,6 +43,7 @@ static void load_com(const uint8_t *p, int n)
     poke16(seg_off_to_phys(cpu.sr[SS], 0xFFFE), 0x0000);
     cpu.ip     = 0x0100;
     cpu.phys   = seg_off_to_phys(cpu.sr[CS], cpu.ip);
+    dos_boot_psp();                         /* its PSP at 0x0100:0 */
 }
 
 int main(int argc, char **argv)

@@ -433,6 +433,57 @@ static int dos_slot_alloc(void)
     return -1;
 }
 
+/* ---- the PSP, and the job file table inside it ----------------------- */
+/* DOS keeps every process's handle table - the "job file table" - at PSP:0x18:
+ * 20 one-byte entries, 0xFF for a free one, 0x80+n for a character device, and
+ * 0..0x7F for a slot in the system file table.  The clone's handles are 5+i for
+ * dos_files[i] (sec. 5.1), so entry 5+i holds i, entries 0-4 hold 0x80+h the way
+ * DOS numbers CON/AUX/PRN, and PSP:0x32/0x34 hold the table's size and offset.
+ *
+ * dos_psp is whose PSP is current - the program main.c loaded, or the window of
+ * the child 4Bh is running - so 3C/3D/3E keep the right table honest and a
+ * child finds the handles it inherited already marked open. */
+#define DOS_BOOT_PSP 0x0100
+#define DOS_JFT_OFF  0x18
+#define DOS_JFT_SIZE 20
+
+static uint16_t dos_psp = DOS_BOOT_PSP;
+
+static void dos_jft_set(uint16_t psp, int h, uint8_t v)
+{
+    if (h < 0 || h >= DOS_JFT_SIZE) return;
+    poke8(((uint32_t)psp << 4) + DOS_JFT_OFF + (uint32_t)h, v);
+}
+
+/* The entry a handle should have here: 0xFF when it is not open. */
+static uint8_t dos_jft_byte(int h)
+{
+    int i = h - DOS_FIRST_HANDLE;
+    if (h < DOS_FIRST_HANDLE) return (uint8_t)(0x80 + h);   /* CON, AUX, PRN */
+    if (i < DOS_FILES && dos_files[i]) return (uint8_t)i;
+    return 0xFF;
+}
+
+/* Write the whole table, plus the DOS 3.x size and far-pointer fields. */
+static void dos_jft_fill(uint16_t psp)
+{
+    uint32_t base = (uint32_t)psp << 4;
+    int h;
+    for (h = 0; h < DOS_JFT_SIZE; h++) dos_jft_set(psp, h, dos_jft_byte(h));
+    poke16(base + 0x32, DOS_JFT_SIZE);          /* table size, in bytes */
+    poke16(base + 0x34, DOS_JFT_OFF);           /* and where it starts */
+    poke16(base + 0x36, psp);
+}
+
+/* The program `mue` runs has a PSP too.  There is no COMMAND.COM above it, so
+ * its parent segment points at itself.  main.c calls this once per load. */
+void dos_boot_psp(void)
+{
+    dos_psp = DOS_BOOT_PSP;
+    poke16(((uint32_t)DOS_BOOT_PSP << 4) + 0x16, DOS_BOOT_PSP);
+    dos_jft_fill(DOS_BOOT_PSP);
+}
+
 /* ---- INT 21h find-first / find-next ---------------------------------- */
 /* The original keeps the DTA in one flat address (0x621C48), defaulting it to
  * 0x7080 = its PSP alias 0x700:0x0080 (0x5E2532), and fills the DOS 2.x
@@ -709,9 +760,13 @@ static void int21(void)
         int saved_req = dos_exit_requested, saved_code = dos_exit_code;
         uint32_t saved_dta = dta;
         int saved_dta_valid = dta_valid, saved_depth = dos_exec_depth;
-        int child_exit, cmd_len, i;
+        int child_exit, cmd_len, i, fi;
         uint16_t seg, env_seg = 0;
+        uint16_t saved_psp = dos_psp;
+        FILE *saved_files[DOS_FILES];
         uint32_t base, pb, cmd_phys, env_phys, env_len, j;
+
+        memcpy(saved_files, dos_files, sizeof saved_files);
 
         /* Original: no 4Bh arm either (see 30), so it reports "not supported"
          * and returns.  A child process is a divergence, implemented the DOS
@@ -772,6 +827,12 @@ static void int21(void)
         MEM[base + 0x51] = 0x21;
         MEM[base + 0x52] = 0xCB;
         poke16(base + 2, (uint16_t)(seg + 0x1000));   /* top of memory */
+        poke16(base + 0x16, dos_psp);           /* parent PSP */
+
+        /* The job file table: every handle open here is open in the child too,
+         * because 4Bh inherits them, so the child can use PSP:0x18+5 to find
+         * the handle it was given. */
+        dos_jft_fill(seg);
 
         /* ---- environment: the caller's strings plus DOS's two trailing
          * records (a word 1, the full path, a word 0), copied into a block of
@@ -822,6 +883,7 @@ static void int21(void)
         dos_exit_requested = 0;
         dos_exit_code = 0;
         dos_exec_depth = saved_depth + 1;
+        dos_psp = seg;                          /* its PSP is current now */
 
         cpu_run(2000000);
 
@@ -832,6 +894,17 @@ static void int21(void)
         dos_exit_requested = saved_req;
         dos_exit_code = saved_code;
         dos_exec_depth = saved_depth;
+        dos_psp = saved_psp;
+
+        /* Handles the child opened and never closed are its own; a DOS process
+         * cannot leak them into the parent, and the clone's table is shared by
+         * every process (sec. 32), so drop them here. */
+        for (fi = 0; fi < DOS_FILES; fi++) {
+            if (!saved_files[fi] && dos_files[fi]) {
+                fclose(dos_files[fi]);
+                dos_files[fi] = NULL;
+            }
+        }
         if (env_seg) dos_arena_free(env_seg);
         setAX((uint16_t)(child_exit & 0xFF));
         cpu.flags &= ~F_CF;
@@ -976,6 +1049,7 @@ static void int21(void)
         if (!f) { dos_file_error(5); break; }
         dos_files[i] = f;
         dos_fmode[i] = 2;
+        dos_jft_set(dos_psp, DOS_FIRST_HANDLE + i, (uint8_t)i);
         cpu.flags &= ~F_CF;
         setAX(DOS_FIRST_HANDLE + i);
         break; }
@@ -993,6 +1067,7 @@ static void int21(void)
         if (!f) { dos_file_error(2); break; }
         dos_files[i] = f;
         dos_fmode[i] = mode;
+        dos_jft_set(dos_psp, DOS_FIRST_HANDLE + i, (uint8_t)i);
         cpu.flags &= ~F_CF;
         setAX(DOS_FIRST_HANDLE + i);
         break; }
@@ -1004,6 +1079,7 @@ static void int21(void)
         if (!f) { dos_file_error(6); break; }
         fclose(f);
         dos_files[i] = NULL;
+        dos_jft_set(dos_psp, cpu.r[BX], 0xFF);  /* free again in this PSP */
         cpu.flags &= ~F_CF;
         break; }
 
