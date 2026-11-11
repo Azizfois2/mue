@@ -2598,3 +2598,59 @@ Verified to bite: giving the child a NULL sink for the duration of the exec
 fails both exec checks - the file holds `14` and the child's `23` appears on
 the screen; routing only handle 1 and leaving 09h/02h on the console fails
 `stdout-redirect-file` with `B` and `stdout-redirect-off-screen` with `AC`.
+
+## 38. The MZ writer without `.stack`: CS and the @data word (CONFIRMED, fixed)
+
+A `.model` source with no `.stack` produced an image whose header said CS=0 and
+whose `mov ax,@data` immediate stayed 0x10, so the program loaded at the right
+place but started inside its own data with DS pointing a paragraph past it. The
+`.stack` case worked only because it happened to make both numbers right.
+
+Two causes, both in `exe_wrap_ex`:
+
+- **CS was only written inside the relocation branch**, and that branch only ran
+  when `stack_size > 0`. With no stack the header kept the 0 it was
+  initialised with, while `.code` still began at 0x10 - the entry point landed
+  on the `'MZ$'` bytes instead of the first instruction. CS is now always
+  `code_start / 16`, the offset `.code` aligned to.
+- **The @data word assumed a 0x100-byte stack.** The assembler emits `@data` as
+  the constant 0x10, which is the data segment's paragraph offset only when
+  .data begins 0x100 bytes into the image. With no stack .data begins the
+  image, so the word has to be 0; with `.stack 200h` it would have to be 0x20,
+  which the old code got wrong too. The writer now writes `stack_size / 16`
+  into that word and lets the loader's relocation add the load segment.
+
+Finding that word no longer depends on a guess either: the assembler records
+the payload offset of the first 16-bit `mov r16,@data` immediate
+(`asm_t.reloc_off`, exported as `asm_last_reloc_off()`, -1 when the code never
+names @data), and `exe_wrap_ex` takes it as `data_imm` beside `code_start`. The
+relocation entry is that offset split into segment/offset, where it used to be
+a hard-coded `1 : code_start/16`. A source that never mentions @data now gets
+no relocation entry at all, where the old code emitted one for any `.stack`
+source and would have corrupted word 1 of code that did not start there.
+
+`asm_last_reloc_off()` had been declared in asm.h since the beginning without a
+definition, and `asm_t.reloc_off` was never set - the writer was working from
+`asm_last_code_start()` plus the assumption.
+
+### Checks
+
+`mz-writer-no-stack-cs` (the byte at the header's CS:IP is a 0xB8 `mov
+r16,imm16`) and `mz-writer-no-stack-data` (one relocation entry, pointing at a
+0xB8-immediate word whose value is 0), then `exec-mz-model-child`: the same
+`.model` file is exec'd by a parent through 4Bh, so the assembler, the writer
+and the loader are tested together - the child prints `MZDATA` from .data.
+
+The emu8086 fixtures still round-trip byte for byte (44 pairs, including the
+`.stack` EXE), because for a 0x100-byte stack the new code computes the same
+0x13:0001 entry and the same 0x10 word it used to.
+
+Verified to bite: restoring the stack-only CS fails `mz-writer-no-stack-cs` with
+0 and `exec-mz-model-child` with garbled output, while the fixtures still pass;
+skipping the @data write fails `mz-writer-no-stack-data` with a word of 0x10 and
+makes the child print zeros.
+
+Not fixed here, and older than this work: a source with neither `org` nor
+`.model` assembles with its labels based at 0 while `mue` loads it at 0x100, so
+data references miss. Every check and example carries `org 100h`, so it has not
+surfaced.

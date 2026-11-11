@@ -93,7 +93,9 @@ int main(int argc, char **argv)
         /* A `.model` source targets an MZ EXE: wrap the code in a header the
          * way emu8086 does (re/FINDINGS.md sec. 11). Flat sources stay flat. */
         if (asm_last_was_exe()) {
-            img = exe_wrap_ex(out, outlen, asm_last_stack_size(), asm_last_code_start(), &imglen);
+            img = exe_wrap_ex(out, outlen, asm_last_stack_size(),
+                              asm_last_code_start(), asm_last_reloc_off(),
+                              &imglen);
             if (!img) { free(out); fprintf(stderr, "out of memory\n"); return 1; }
             free(out);
             out = img; outlen = imglen;

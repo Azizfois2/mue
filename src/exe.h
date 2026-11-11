@@ -33,9 +33,12 @@
 uint8_t *exe_wrap(const uint8_t *code, int len, int *out_len);
 
 /* As exe_wrap(), but also describing a `.stack N` segment laid out ahead of the
- * code (stack_size > 0) and where the relocatable `mov ax,@data` immediate sits
- * inside the code image (reloc_off, or -1 for none). */
+ * code (stack_size > 0), where `.code` begins in the image (code_start, which
+ * sets CS) and where the relocatable `mov ax,@data` immediate sits (data_imm,
+ * or -1 when the code never names @data).  The relocation entry covers that
+ * word and its initial value is the data segment's paragraph offset within the
+ * image - stack_size/16, or 0 without a stack. */
 uint8_t *exe_wrap_ex(const uint8_t *code, int len, int stack_size,
-                     int reloc_off, int *out_len);
+                     int code_start, int data_imm, int *out_len);
 
 #endif /* MUE_EXE_H */

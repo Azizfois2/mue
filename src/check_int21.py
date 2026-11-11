@@ -1058,6 +1058,40 @@ cname db 'sread.com',0
 pmsg db 'P$'
 """
 
+# A `.model` source with no `.stack`: .data starts the image and .code follows
+# it, so CS must be 1 (0x10/16) and the @data word must start as 0 - the load
+# segment itself - for `mov ds,ax` to find the data.
+MZMODEL_ASM = """
+.model small
+.data
+msg db 'MZDATA$'
+.code
+mov ax,@data
+mov ds,ax
+mov ah,9
+mov dx,offset msg
+int 21h
+mov ax,4c00h
+int 21h
+end
+"""
+
+T_EXEC_MZ_MODEL = PROLOG + """
+mov ax,4b00h
+lea dx,cname
+mov bx,offset pblk
+push ds
+pop es
+int 21h
+mov bp,ax
+ret
+pblk dw 0
+dd 0
+dd 0
+dd 0
+cname db 'mzm.exe',0
+"""
+
 # Reads the next line from the inherited stdin and prints it.
 SREAD_ASM = PROLOG + """
 mov ah,3fh
@@ -1802,6 +1836,31 @@ def main():
         rc, out = run(mue, T_EXEC_MZ_MEM, d)
         check("exec-mz-insufficient-memory", (reg(out, "BP") or 0) & 0xFF == 8,
               reg(out, "BP"))
+
+        # Writer: a `.model` source without `.stack` must still get a CS that
+        # points at the code and an @data word that starts at 0.
+        with open(os.path.join(d, "mzm.asm"), "w") as f:
+            f.write(MZMODEL_ASM)
+        subprocess.run([mue, "-a", "mzm.asm", "mzm.exe"], cwd=d,
+                       capture_output=True, timeout=60)
+        raw = open(os.path.join(d, "mzm.exe"), "rb").read()
+        hdr = int.from_bytes(raw[0x08:0x0A], "little") * 16
+        cs = int.from_bytes(raw[0x16:0x18], "little")
+        nrel = int.from_bytes(raw[0x06:0x08], "little")
+        rel = int.from_bytes(raw[0x18:0x1A], "little")
+        roff = int.from_bytes(raw[rel:rel + 2], "little")
+        rseg = int.from_bytes(raw[rel + 2:rel + 4], "little")
+        at = hdr + (rseg << 4) + roff
+        check("mz-writer-no-stack-cs",
+              cs != 0 and raw[hdr + (cs << 4)] == 0xB8, (cs, raw[hdr:][:2]))
+        check("mz-writer-no-stack-data",
+              nrel == 1 and raw[at - 1] == 0xB8 and
+              int.from_bytes(raw[at:at + 2], "little") == 0,
+              (nrel, roff, rseg, raw[at - 1:at + 2]))
+
+        rc, out = run(mue, T_EXEC_MZ_MODEL, d)
+        check("exec-mz-model-child", "MZDATA" in guest_text(out),
+              repr(guest_text(out)[:40]))
 
         # A child that leaves through 31h: its AL must reach the 4Bh caller.
         with open(os.path.join(d, "tsr.asm"), "w") as f:

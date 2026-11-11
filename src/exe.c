@@ -30,13 +30,19 @@ static void put16(uint8_t *p, unsigned v)
 
 uint8_t *exe_wrap(const uint8_t *code, int len, int *out_len)
 {
-    return exe_wrap_ex(code, len, 0, -1, out_len);
+    return exe_wrap_ex(code, len, 0, 0, -1, out_len);
 }
 
 uint8_t *exe_wrap_ex(const uint8_t *code, int len, int stack_size,
-                     int reloc_off, int *out_len)
+                     int code_start, int data_imm, int *out_len)
 {
-    int nreloc = (stack_size > 0) ? 1 : 0;
+    /* One relocation entry when the code names @data: it turns that word into
+     * the segment where .data actually was loaded.  `.stack N` puts N bytes of
+     * 0x54 ahead of .data, so the data segment is N/16 paragraphs into the
+     * image - 0 when there is no stack, which is what a `.model` source
+     * without one needs (FINDINGS 38). */
+    int nreloc = (data_imm >= 0) ? 1 : 0;
+    int data_paras = (stack_size > 0) ? stack_size / 16 : 0;
     int total = EXE_HDR_BYTES + len;
     uint8_t *img;
 
@@ -60,7 +66,9 @@ uint8_t *exe_wrap_ex(const uint8_t *code, int len, int stack_size,
     put16(img + 0x10, (unsigned)stack_size); /* sp: top of stack segment      */
     put16(img + 0x12, 0);               /* checksum: filled in below          */
     put16(img + 0x14, 0);               /* ip                                 */
-    put16(img + 0x16, 0);               /* cs                                 */
+    /* CS is where .code begins, whether or not a stack came first; leaving it
+     * 0 put a no-stack program's entry point inside its own data. */
+    put16(img + 0x16, (unsigned)(code_start > 0 ? code_start / 16 : 0));
     put16(img + 0x18, 0x1E);            /* reloc table offset                 */
     put16(img + 0x1A, 0);               /* overlay                            */
 
@@ -70,17 +78,20 @@ uint8_t *exe_wrap_ex(const uint8_t *code, int len, int stack_size,
     put16(img + 0x1C, 1);
 
     if (nreloc) {
-        /* One entry at 0x1E: offset : segment of the @data immediate.
-         * `cs` is the code segment in paragraphs (its offset within the
-         * image divided by 16); div.exe_ resolves to 0x13. */
-        int seg = (reloc_off >= 0) ? (reloc_off / 16) : 0;
-        put16(img + 0x1E, 1);           /* reloc offset within segment        */
-        put16(img + 0x20, (unsigned)seg); /* reloc segment                    */
-        put16(img + 0x16, (unsigned)seg); /* cs                               */
+        /* One entry at 0x1E naming the @data immediate: offset within its
+         * segment, and the segment (a paragraph count from the load segment).
+         * div.exe_'s word sits at 0x131, so 0x13:0001. */
+        put16(img + 0x1E, (unsigned)(data_imm % 16));
+        put16(img + 0x20, (unsigned)(data_imm / 16));
     }
 
     if (len)
         memcpy(img + EXE_HDR_BYTES, code, (size_t)len);
+
+    /* The word starts as the data segment's paragraph offset; the loader adds
+     * the load segment to it.  No stack means .data begins the image, so 0. */
+    if (nreloc && data_imm + 2 <= len)
+        put16(img + EXE_HDR_BYTES + data_imm, (unsigned)data_paras);
 
     /* Checksum: computed as (0xFFFF - word_sum) with this field zeroed, which
      * reproduces every shipped emu8086 .exe_ image exactly.  An odd trailing

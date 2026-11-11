@@ -186,6 +186,16 @@ static int emit_alu(asm_t *a, int opbase, operand_t *d, operand_t *s, int w)
     return 0;
 }
 
+/* `mov ax,@data` bakes a segment number into the code, and an MZ image has to
+ * relocate that word to wherever the program was loaded.  Remember where the
+ * word sits in the payload; the writer puts it in the header's relocation
+ * table (exe.h).  Only the first one counts: that is the data segment. */
+static void note_data_immediate(asm_t *a, const char *text)
+{
+    if (a->reloc_off || !text || strcmp(text, "@data")) return;
+    a->reloc_off = a->outlen;
+}
+
 /* mov / test / xchg share the rm<->reg shapes */
 static int emit_mov(asm_t *a, operand_t *d, operand_t *s)
 {
@@ -234,7 +244,8 @@ static int emit_mov(asm_t *a, operand_t *d, operand_t *s)
     }
     if (is_reg(d) && s->kind == OP_IMM) {
         if (w == 8) { emit8(a, (uint8_t)(0xB0 + d->reg)); emit8(a, (uint8_t)s->imm); }
-        else        { emit8(a, (uint8_t)(0xB8 + d->reg)); emit16(a, (uint16_t)s->imm); }
+        else        { emit8(a, (uint8_t)(0xB8 + d->reg)); note_data_immediate(a, s->text);
+                      emit16(a, (uint16_t)s->imm); }
         return 1;
     }
     if (is_mem(d) && s->kind == OP_IMM) {
@@ -1249,6 +1260,7 @@ static int asm_last_saw_model = 0;
 static int asm_last_saw_org   = 0;
 static int asm_last_stack     = 0;
 static int asm_last_cstart    = 0;
+static int asm_last_reloc     = -1;
 
 /* =====================================================================
  * Two-pass driver
@@ -1261,6 +1273,7 @@ static int pass_over(asm_t *a, char **lines, int nlines)
     a->saw_org  = 0;
     a->saw_model = 0;
     a->stack_size = 0;
+    a->reloc_off  = 0;
     a->code_start = 0;
     a->nmac     = 0;          /* macros are re-collected every pass */
     a->in_macro = 0;
@@ -1471,6 +1484,7 @@ int asm_assemble_file(const char *path, int want_com, uint8_t **out, int *outlen
     asm_last_saw_org   = a.saw_org;
     asm_last_stack     = a.stack_size;
     asm_last_cstart    = a.code_start;
+    asm_last_reloc     = a.reloc_off > 0 ? a.reloc_off : -1;
     return 1;
 }
 
@@ -1492,4 +1506,11 @@ int asm_last_stack_size(void)
 int asm_last_code_start(void)
 {
     return asm_last_cstart;
+}
+
+/* Payload offset of the `mov ax,@data` immediate, or -1 when the code never
+ * names @data - in which case no relocation is needed. */
+int asm_last_reloc_off(void)
+{
+    return asm_last_reloc;
 }
