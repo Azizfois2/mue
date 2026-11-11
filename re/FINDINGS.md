@@ -2235,10 +2235,10 @@ covers one- and two-digit values and is the authoritative one.)
 
 Note for future work: 4Ch's AL is recorded in `dos_exit_code` but never becomes
 the process status (`mue` still exits 0), so a 31h exit code is only observable
-from a 4Bh parent - that is what `tsr-code-reaches-exec-caller` relies on. If
+from a 4Bh parent - that is what `tsr-code-reaches-exec-caller` relies on (and
+that check therefore runs with `MUE_EXEC=1`; see FINDINGS 44). If
 the process status is ever wired to the guest's exit code, every suite's idea of
 "the run succeeded" changes with it.
-
 ### The compatibility switch
 
 `MUE_INT21_MEM_NOOP=1` makes 48h/49h/4Ah do exactly what the original does:
@@ -2249,12 +2249,13 @@ that checks flags or expects a segment sees the same "no answer" emu8086 gives
 
 ### Checks
 
-`tsr-terminates` (`mov bx,0DEADh` after the call never runs), `exec-runs-child-first`
+`tsr-falls-through` (`mov bx,0DEADh` after the call DOES run, because there is
+no 31h arm - FINDINGS 43), `exec-runs-child-first`
 (the child's output precedes the parent's), `exec-reports-child-exit-code`
 (AX=5 from a child that exits with 4Ch/AL=5), `exec-error-answers` (a missing
 program answers AX=2 and an AL=1 overlay request answers AX=1, both with CF),
-`tsr-code-reaches-exec-caller` (a child that leaves through 31h/AL=5 gives the
-parent AX=5), `mem-noop-compat-flag` (with the switch on, AX/BX/CF come back
+`tsr-code-reaches-exec-caller` (a child that issues 31h and then exits through
+4Ch/AL=5 gives the parent AX=5), `mem-noop-compat-flag` (with the switch on, AX/BX/CF come back
 exactly as set: AX=0x4800, BX=0x5678, CF still set) and
 `mem-noop-off-by-default` (without it the same guest gets a segment in AX and CF
 clear).
@@ -2273,8 +2274,8 @@ by guests assembled with `mue -a` into the scratch directory at check time:
 - `exec-args-returns-child-code`: the same guest, whose child exits 4Ch/AL=0,
   gets AX=0 back.
 
-Verified to bite: emptying the 31h case fails `tsr-terminates` (BX=0xDEAD) and
-`tsr-code-reaches-exec-caller`; returning 0 instead of the child's exit code
+Verified to bite: forcing the 31h case to halt fails `tsr-falls-through`
+(BX=0xDEAD) and `tsr-code-reaches-exec-caller`; returning 0 instead of the child's exit code
 fails `exec-reports-child-exit-code`; making `dos_mem_noop()` always return 0
 fails `mem-noop-compat-flag` with the arena's AX/BX; putting back the old
 one-level rule (`if (dos_exec_depth) -> AX=8`) fails `exec-nested` with
@@ -3110,3 +3111,33 @@ evidence as any other. Here the honest finding was reachable in one grep -
 the arm's absence - and I had written the comfortable conclusion instead.
 When an item is closed by reasoning rather than by decoding or by running
 both implementations, it is not closed.
+
+## 45. Doc debt: the findings text named checks that no longer exist
+
+Auditing the other env-gated arms for the FINDINGS 44 mistake turned up no
+wrong behaviour, but it did find that section 29 still listed `tsr-terminates`
+as a live check. That name was renamed to `tsr-falls-through` when 31h was
+corrected (FINDINGS 43), and `tsr-code-reaches-exec-caller` no longer describes
+a child leaving *through* 31h either - 31h does not terminate anything.
+
+The behaviour was right; the documentation of which checks protect it was
+stale. That matters more than it looks: a future reader looking for
+`tsr-terminates` finds nothing, and the natural conclusion is that the check
+was deleted rather than renamed, i.e. that 31h is unguarded.
+
+Two other env-gated arms were audited and are **not** the 4Bh pattern:
+
+- **`MUE_INT21_MEM_NOOP`** - 48h/49h/4Ah. The default is a real DOS arena;
+  the flag opts *in* to reproducing the original's silence (decoded in
+  FINDINGS 29: the handlers return without touching AX/BX/CF). Faithful
+  default, divergence opt-in - the correct polarity.
+- **`MUE_FLOPPY`**, **`MUE_NOSLEEP`**, **`MUE_STDIN_TEXT`** - test hooks that
+  change *where input comes from* or *how long to wait*, not what the guest
+  observes. No fidelity claim involved.
+
+Only 4Bh had the bad polarity (invented behaviour as the default) plus a
+finding that claimed it was unobservable. `MUE_EXEC` is now the one flag where
+"on" means "less faithful", and it says so at the use site.
+
+Rule adopted: every env-gated arm must state, at the point of use, which side
+of the flag is the faithful one.
