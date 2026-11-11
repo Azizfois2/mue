@@ -32,7 +32,7 @@ def winpath(p):
     return p
 
 
-def run(mue, src, workdir=None):
+def run(mue, src, workdir=None, stdin=b""):
     """Assemble and run with workdir as cwd; return (rc, out, err)."""
     with tempfile.TemporaryDirectory() as d:
         a = winpath(os.path.join(d, "t.asm"))
@@ -41,8 +41,8 @@ def run(mue, src, workdir=None):
         p = subprocess.run([mue, "-a", a, b], capture_output=True, timeout=60)
         if p.returncode != 0 or not os.path.exists(b):
             return 1, "", (p.stdout + p.stderr).decode("utf-8", "replace")
-        p = subprocess.run([mue, "-r", b], capture_output=True, timeout=60,
-                           cwd=workdir)
+        p = subprocess.run([mue, "-r", b], input=stdin, capture_output=True,
+                           timeout=60, cwd=workdir)
         return (p.returncode,
                 p.stdout.decode("utf-8", "replace"),
                 p.stderr.decode("utf-8", "replace"))
@@ -223,11 +223,51 @@ ret
     cf = (reg(out, "BP") & 1) if reg(out, "BP") is not None else None
     check("filedate-bad-handle-sets-cf", cf == 1, cf)
 
-    # --- INT 21h AH=0Ch / 0Dh flush -------------------------------------
-    for ah in ("0Ch", "0Dh"):
-        rc, out, err = run(mue, "org 100h\nmov ah,%s\nint 21h\nmov si,1\nret\n" % ah)
-        check("flush-%s-no-report" % ah, "not supported" not in err,
-              err.strip()[:60])
+    # --- INT 21h AH=0Ch clears the key buffer and re-dispatches on AH=AL --
+    # Not a file flush: 0x5275DA zeroes ds:0x621270, and 0x527749 re-enters
+    # the INT 21h dispatcher unless AL is one of 06/07/08/0A.
+    rc, out, err = run(mue, """org 100h
+mov ax,0C30h
+int 21h
+mov si,ax
+ret
+""")
+    si = reg(out, "SI")
+    check("flush-0Ch-reinvokes-AH-AL", si is not None and (si & 0xFF) == 5, si)
+    check("flush-0Ch-no-report", "not supported" not in err, err.strip()[:60])
+
+    # AL=09h must actually print, proving the re-dispatch ran.
+    rc, out, err = run(mue, """org 100h
+mov ax,0C09h
+mov dx,offset m
+int 21h
+ret
+m db "INVOKED$"
+""")
+    check("flush-0Ch-runs-09h", "INVOKED" in out, out[:60])
+
+    # The direct-console services (06/07/08/0A) are deliberately NOT
+    # re-entered, because reading a key after clearing the buffer is wrong.
+    rc, out, err = run(mue, """org 100h
+mov ax,0C06h
+int 21h
+mov si,ax
+ret
+""", stdin=b"Q")
+    si = reg(out, "SI")
+    check("flush-0Ch-skips-06h", si is not None and (si & 0xFF00) == 0x0C00, si)
+
+    # --- INT 21h AH=0Dh is a pure no-op (`jmp 0x52a52a`) -----------------
+    rc, out, err = run(mue, """org 100h
+mov ax,0D09h
+mov dx,offset m
+int 21h
+ret
+m db "MUST-NOT-PRINT$"
+""")
+    check("disk-reset-0Dh-does-nothing", "MUST-NOT-PRINT" not in out, out[:60])
+    check("disk-reset-0Dh-no-report", "not supported" not in err,
+          err.strip()[:60])
 
     # --- INT 10h AH=11h is a silent no-op in the original ----------------
     rc, out, err = run(mue, """org 100h

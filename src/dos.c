@@ -250,6 +250,9 @@ static void setAX(int v) { cpu.r[0] = (uint16_t)v; }
 /* Declared here because INT 21h's own fail arm needs it long before the
  * definition further down next to the video and floppy services. */
 static void unsupported_ah(const char *service, int ah);
+/* INT 21h AH=0Ch re-enters the dispatcher with AH=AL (see the 0x527749 call),
+ * so the handler needs its own prototype. */
+static void int21(void);
 /* Writes AL.  The name is historical - it does NOT touch AH, which is why
  * every AL-returning service calls it. */
 static void setAL(int v) { cpu.r[0] = (uint16_t)((cpu.r[0] & 0xFF00) | (v & 0xFF)); }
@@ -1790,16 +1793,32 @@ static void int21(void)
         dos_file_error(1);                      /* bad subfunction */
         break; }
 
-    case 0x0C:                                  /* clear buffer, invoke AL */
-    case 0x0D:                                  /* flush, invoke AL */
-        /* CONFIRMED arms at 0x5275BC / 0x52775B.  DOS's "flush then call
-         * AH=AL" idiom.  The clone honours the flush half. */
+    case 0x0C:                                  /* flush then invoke AH=AL */
+        /* CONFIRMED from the arm at 0x5275BC.  It is NOT a file flush:
+         *   0x5275DA  mov WORD PTR ds:0x621270,0   -> clear the key buffer
+         *   0x527636  call [edx+0x7b0]             -> host console flush
+         *   0x5276A7..0x527706                     -> test AL against 6,7,8,0A
+         *   0x527715  mov [ecx+0xbb],al            -> AH = AL
+         *   0x527749  call [eax+0x9d4]             -> re-dispatch INT 21h
+         * The AL values 06/07/08/0A are the direct-console I/O services, and
+         * those are skipped (they read keys, which a flushed buffer must not
+         * consume), so only the other AH values are re-entered. */
+        kb_head = kb_tail = 0;                  /* ds:0x621270 = 0 */
         {
-            int i;
-            for (i = 0; i < DOS_FILES; i++)
-                if (dos_files[i]) fflush(dos_files[i]);
-            cpu.flags &= ~F_CF;
+            int al = cpu.r[AX] & 0xFF;
+            if (al != 0x06 && al != 0x07 && al != 0x08 && al != 0x0A) {
+                cpu.r[AX] = (uint16_t)((al << 8) | (cpu.r[AX] & 0x00FF));
+                int21();                        /* re-dispatch on AH=AL */
+            }
         }
+        break;
+
+    case 0x0D:                                  /* disk reset: pure no-op */
+        /* CONFIRMED: the arm at 0x52775B is `jmp 0x52a52a` and nothing else -
+         * it goes straight to the epilogue.  An earlier version of the clone
+         * flushed every open write handle here, which the original does not
+         * do.  Disk reset means "commit buffered writes", and emu8086 writes
+         * straight through, so there is nothing to commit. */
         break;
 
     case 0x23:                                  /* get break flag */

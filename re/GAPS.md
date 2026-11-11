@@ -41,7 +41,7 @@ reverting the 2Eh/54h arms makes `verify-flag-no-report` fail.
 | INT 21h AH=2Eh/54h verify flag | one byte, `dos_verify_flag`, round-trips |
 | INT 21h AH=17h rename | real `rename()`; needed `DX`->`DI` too, not just `DS`->`ES` |
 | INT 21h AH=57h file date | added `dos_fname[]` to remember each handle's host path, then `_stat` + DOS packed CX/DX |
-| INT 21h AH=0Ch/0Dh | flushes every open write handle |
+| INT 21h AH=0Ch/0Dh | 0Ch clears the key buffer and re-dispatches on AH=AL (skipping 06/07/08/0A); 0Dh is a pure no-op |
 | INT 21h AH=23h/33h | break flag constant 0; Ctrl-Break get/set round-trips |
 | INT 10h AH=11h | silent no-op, matching the original's jump-to-epilogue |
 | INT 10h AH=0Ch/0Dh text mode | no diagnostic outside graphics modes |
@@ -70,14 +70,21 @@ missing INT 21h arm whose original implementation is substantial.
 flag, and any DOS-compatibility probe calling it gets a spurious "unsupported"
 report. Cheap to close and they are a matched pair.
 
-### 1.3 INT 21h AH=0Ch / 0Dh - clear buffer and flush, then invoke a function
+### 1.3 INT 21h AH=0Ch / 0Dh - CLOSED, and my first reading was wrong
 
-`0x5275BC` / `0x52775B`. `0Dh` calls `FUN_005dc310` then stores AL at
-`+0xBA`; `0Ch` reaches a `WORD PTR [edx+0x7B0]`.
+I originally described these as "clear buffer and flush, then invoke" and
+implemented a `fflush()` of every write handle. Re-reading `0x5275BC`
+properly shows neither is a file flush:
 
-**Why it matters:** low. These exist mostly so a guest can issue
-"flush then do X" atomically with AL holding the real function. No shipped
-example uses them.
+- **`0Ch`** zeroes the keyboard count at `ds:0x621270` (`0x5275DA`), calls a
+  host console flush (`[edx+0x7B0]`, `0x527636`), then tests AL against
+  `06 07 08 0A` (`0x5276A7`-`0x527706`) and - unless AL is one of those -
+  sets `AH = AL` (`0x527715`) and **re-enters the INT 21h dispatcher**
+  (`call [eax+0x9D4]`, `0x527749`). So it is "flush the console, then run
+  the real function"; the four skipped values are the direct-console
+  services, which would consume a key right after the buffer was cleared.
+- **`0Dh`** is `jmp 0x52A52A` (`0x52776E`) - straight to the epilogue,
+  nothing at all. The clone was *doing more* than the original.
 
 ### 1.4 INT 21h AH=17h - rename file  `0x5277C0`
 

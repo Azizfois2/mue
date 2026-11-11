@@ -2970,11 +2970,32 @@ found while testing the mode gate. The arm called `cga_pixel()` and threw the
 return value away, so "read pixel" left AL at whatever the guest had put
 there. BIOS says AL = colour. Now `AX` low byte is set from the read.
 
-**INT 21h AH=0Ch/0Dh** implement the flush half only. The "then invoke AH=AL"
-half is not done: emu8086's arms (`0x5275BC`/`0x52775B`) reach
-`FUN_005dc310` and a `WORD PTR [edx+0x7B0]`, which was not decoded. No
-shipped example uses these, so the difference is latent - recorded here so
-it is not mistaken for complete.
+**INT 21h AH=0Ch/0Dh were WRONG on the first pass, and are now correct.**
+I shipped them as "fflush every open write handle" and wrote it up as
+"implement the flush half only". That was a misreading of the disassembly,
+not a limitation. Reading `0x5275BC` properly:
+
+- `0x5275DA` `mov WORD PTR ds:0x621270,0` - clears the **keyboard** count,
+  not a file buffer.
+- `0x527636` `call [edx+0x7B0]` - host **console** flush.
+- `0x5276A7`-`0x527706` test AL against `06 07 08 0A` and skip the rest.
+- `0x527715` `mov [ecx+0xBB],al` then `0x527749` `call [eax+0x9D4]` -
+  **AH = AL and re-enter the INT 21h dispatcher**.
+
+The four exempt values are the direct-console services (06h/07h/08h/0Ah);
+re-entering them right after clearing the buffer would block on a key that
+was just thrown away. So the arm is "flush the console, then run the function
+named in AL" - and that is what the clone now does, recursively calling
+`int21()`.
+
+And `0Dh` is not a flush either: `0x52776E` is `jmp 0x52A52A`, the epilogue,
+with nothing in between. The clone was *doing more than the original* - a
+divergence in the opposite direction from a missing feature, and one that no
+examples cover, which is exactly why it survived.
+
+Lesson worth keeping: "the arm calls something I have not decoded, so I will
+implement half of it" is how a wrong behaviour gets shipped with a comment
+that makes it look deliberate.
 
 **A test-harness bug worth its own line.** `check_gaps.py` first failed
 rename with AX=3 while the same guest worked by hand. Cause: the snippet had
