@@ -661,6 +661,12 @@ static int find_match(void)
     return hit;
 }
 
+/* Little-endian word out of a file image, for the MZ header. */
+static unsigned dos_img16(const uint8_t *p)
+{
+    return (unsigned)p[0] | ((unsigned)p[1] << 8);
+}
+
 /* ---- INT 21h --------------------------------------------------------- */
 static void int21(void)
 {
@@ -788,8 +794,9 @@ static void int21(void)
         int saved_req = dos_exit_requested, saved_code = dos_exit_code;
         uint32_t saved_dta = dta;
         int saved_dta_valid = dta_valid, saved_depth = dos_exec_depth;
-        int child_exit, cmd_len, i, fi;
-        uint16_t seg, env_seg = 0;
+        int child_exit, cmd_len, i, fi, is_mz = 0;
+        uint16_t seg, load_seg, env_seg = 0;
+        uint16_t e_ip = 0x100, e_cs = 0, e_ss = 0, e_sp = 0xFFFE;
         uint16_t saved_psp = dos_psp;
         FILE *saved_files[DOS_FILES];
         uint32_t base, pb, cmd_phys, env_phys, env_len, j;
@@ -799,8 +806,8 @@ static void int21(void)
         /* Original: no 4Bh arm either (see 30), so it reports "not supported"
          * and returns.  A child process is a divergence, implemented the DOS
          * way for the one form that can work here: AL=0, load and execute a
-         * .COM with a parameter block (ES:BX).  AL=1/3 (overlay) and MZ images
-         * are refused. */
+         * .COM or MZ image with a parameter block (ES:BX).  AL=1/3 (overlay)
+         * are refused; MZ support is in 34. */
         if ((cpu.r[0] & 0xFF) != 0) { dos_file_error(1); break; }
         if (dos_exec_depth >= DOS_CHILD_LEVELS) { dos_file_error(8); break; }
         if (dos_guest_name(name, sizeof name) != 0) { dos_file_error(3); break; }
@@ -821,17 +828,65 @@ static void int21(void)
             fclose(f); free(img); dos_file_error(11); break;
         }
         fclose(f);
-        if (n >= 2 && img[0] == 'M' && img[1] == 'Z') {
-            free(img);
-            dos_file_error(11);                 /* MZ: not a .COM */
-            break;
-        }
-        if (n > 0xFF00) n = 0xFF00;
+        is_mz = (n >= 2 && img[0] == 'M' && img[1] == 'Z');
+        if (!is_mz && n > 0xFF00) n = 0xFF00;
 
         seg = dos_child_seg();
+        load_seg = (uint16_t)(seg + 0x10);      /* the module starts one
+                                                 * paragraph after the PSP */
         base = (uint32_t)seg << 4;
         memset(MEM + base, 0, 0x10000);
-        memcpy(MEM + base + 0x100, img, (size_t)n);
+
+        if (!is_mz) {
+            memcpy(MEM + base + 0x100, img, (size_t)n);
+        } else {
+            /* MZ (EXE): the header says how long the module is, where the
+             * relocation table is, and what CS:IP / SS:SP start as.  Every
+             * relocation is a segment word that has to have the load segment
+             * added, which is the whole reason an EXE cannot simply be
+             * copied (FINDINGS 34).  The header layout is the one exe.h
+             * documents from the writing side. */
+            unsigned cblp = dos_img16(img + 0x02), cp = dos_img16(img + 0x04);
+            unsigned nrel = dos_img16(img + 0x06), hpar = dos_img16(img + 0x08);
+            unsigned mina = dos_img16(img + 0x0A);
+            unsigned rel  = dos_img16(img + 0x18);
+            long hdr = (long)hpar * 16;
+            long total, isize;
+
+            total = (cp ? (long)(cp - 1) * 512 : 0) +
+                    (cblp ? (long)cblp : 512);
+            isize = total - hdr;
+            if (hdr < 0x1C || hdr > n || isize <= 0 || hdr + isize > n ||
+                (long)rel + 4L * (long)nrel > n) {
+                free(img);
+                dos_file_error(11);             /* invalid EXE format */
+                break;
+            }
+            if (isize + (long)mina * 16 > 0x10000 - 0x100) {
+                free(img);
+                dos_file_error(8);              /* insufficient memory */
+                break;
+            }
+            memcpy(MEM + base + 0x100, img + hdr, (size_t)isize);
+            for (i = 0; i < (int)nrel; i++) {
+                unsigned off = dos_img16(img + rel + 4 * i);
+                unsigned sgm = dos_img16(img + rel + 4 * i + 2);
+                uint32_t at;
+
+                if ((long)off + 2 > isize || ((long)sgm << 4) + off + 2 > isize) {
+                    free(img);
+                    dos_file_error(11);
+                    break;
+                }
+                at = base + 0x100 + ((uint32_t)sgm << 4) + off;
+                poke16(at, (uint16_t)(peek16(at) + load_seg));
+            }
+            if (i < (int)nrel) break;           /* bad relocation, no cleanup */
+            e_cs = dos_img16(img + 0x16);
+            e_ip = dos_img16(img + 0x14);
+            e_ss = dos_img16(img + 0x0E);
+            e_sp = dos_img16(img + 0x10);
+        }
         free(img);
 
         /* ---- minimal PSP, from the caller's parameter block ------------
@@ -897,10 +952,20 @@ static void int21(void)
         }
 
         saved = cpu;
-        cpu.sr[ES] = cpu.sr[CS] = cpu.sr[SS] = cpu.sr[DS] = seg;
-        cpu.ip = 0x100;
-        cpu.phys = seg_off_to_phys(seg, 0x100);
-        cpu.r[SP] = 0xFFFE;
+        if (is_mz) {
+            /* DOS gives an EXE its PSP in DS and ES, and CS:IP / SS:SP exactly
+             * as the header describes them, relative to the load segment. */
+            cpu.sr[CS] = (uint16_t)(load_seg + e_cs);
+            cpu.sr[SS] = (uint16_t)(load_seg + e_ss);
+            cpu.sr[DS] = cpu.sr[ES] = seg;
+            cpu.ip = e_ip;
+            cpu.r[SP] = e_sp;
+        } else {
+            cpu.sr[ES] = cpu.sr[CS] = cpu.sr[SS] = cpu.sr[DS] = seg;
+            cpu.ip = 0x100;
+            cpu.r[SP] = 0xFFFE;
+        }
+        cpu.phys = seg_off_to_phys(cpu.sr[CS], cpu.ip);
         cpu.flags = F_IF;
         cpu.halted = 0;
         cpu.exit_code = 0;

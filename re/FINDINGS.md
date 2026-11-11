@@ -2446,3 +2446,62 @@ Another assembler trap, found while writing these: `mov bx,offset 200h`
 assembles to zero - `offset` of a numeric literal is not the literal - so the
 child wrote its `'$'` terminator at 0. `mov bx,200h` is an immediate and
 works.
+
+## 34. 4Bh loads MZ images, not just .COM (IMPLEMENTED, divergent)
+
+The original has no 4Bh arm at all (sec. 30), so this whole child-process path
+is already a divergence. It used to stop at the second byte of the file: an
+image starting `MZ` was refused with error 11, because a .COM can be copied to
+PSP:0x100 and an EXE cannot. This section covers what loading one takes.
+
+The header is the one `exe.h` documents from the writing side. 4Bh reads the
+byte counts at 0x02/0x04, the relocation count and table at 0x06/0x18, the
+header size at 0x08, minalloc at 0x0A, SS:SP at 0x0E/0x10, CS:IP at 0x16/0x14
+and loads the module (file size minus header paragraphs) at `loadseg =
+PSP + 0x10`, i.e. one paragraph after the PSP, which is where DOS puts it.
+
+Three things a loader has to do that a copy does not:
+
+- **Relocations.** Each entry is an offset/segment pair naming a word inside
+  the loaded module; the load segment is added to that word. This is what makes
+  `mov ax,@data` work, and it is the reason a wrong loader prints garbage
+  instead of failing loudly. Malformed entries (outside the module) are error
+  11 rather than a stray write.
+- **Header registers.** CS:IP and SS:SP are relative to `loadseg`, and an EXE
+  gets the PSP segment in DS and ES - unlike a .COM, where every segment
+  register starts equal to CS.
+- **minalloc.** The header's minimum allocation has to fit beside the image in
+  the child's 64K window; if it cannot, error 8 (insufficient memory). The
+  clone gives the child its fixed window either way, so `maxalloc` is not
+  consulted: whatever the window has left is the child's heap, and PSP:0x02
+  still reports the top of memory (sec. 32).
+
+A truncated file, a header smaller than 0x1C bytes, or a module that claims to
+be longer than the file is error 11.
+
+### Checks
+
+`mz_image()` in check_int21.py builds the header around a module assembled
+flat by mue, so every field is controlled:
+
+- `exec-mz-loads`: header CS:IP points at module offset 0x10 and SS:SP at
+  0x0127; the first instruction's immediate is covered by a relocation entry,
+  so after loading it is the load segment and `mov ds,ax; mov dx,0; int 21h`
+  prints the `'MZ$'` at module offset 0. The guest also prints the low nibble
+  of SP, making the observed text `MZ7P` (the `P` is the parent's).
+- `exec-mz-returns-child-code`: the same child leaves through `mov ax,4c07h`,
+  and the 4Bh caller sees 7 in AX.
+- `exec-mz-insufficient-memory`: `minalloc = 0x1000` paragraphs cannot fit the
+  window, so AX comes back 8.
+
+Verified to bite: skipping the relocation write fails `exec-mz-loads` (the
+child prints zeros from segment 0 instead of `MZ`); dropping the memory-fit
+test fails `exec-mz-insufficient-memory` with 7 (the child ran); ignoring the
+header's CS:IP/SS:SP fails `exec-mz-loads` and
+`exec-mz-returns-child-code`.
+
+One trap on the test side: the page count at 0x04 covers the *whole file*,
+header included, so a 45-byte module is 2 pages with 45 bytes in the last one.
+Counting only the module makes the computed module size negative and the
+loader rightly rejects the header - which is how the first version of the
+check failed.

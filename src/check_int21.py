@@ -928,6 +928,93 @@ mov al,0
 int 21h
 """
 
+# The module of the MZ child below, assembled flat (base 0) and then wrapped in
+# a header written by mz_image(): 'MZ$' sits at module offset 0, the code at
+# 0x10, and the first instruction's immediate is what the relocation fixes up.
+MZCHILD_ASM = """
+db 'MZ$'
+db 0,0,0,0,0,0,0,0,0,0,0,0,0
+mov ax,0
+mov ds,ax
+mov dx,0
+mov ah,9
+int 21h
+mov ax,sp
+and al,0fh
+add al,'0'
+mov dl,al
+mov ah,2
+int 21h
+mov ax,4c07h
+int 21h
+"""
+
+
+def mz_image(module, minalloc=0, ss=3, sp=0x0127, cs=1, ip=0):
+    """Wrap a load module in an MZ header with one relocation entry.
+
+    The entry is (segment cs, offset 1): the immediate of `mov ax,0`, which
+    must come back as the load segment after loading.
+    """
+    hdr = bytearray(0x200)
+    total = 0x200 + len(module)          # the header is part of the file size
+    hdr[0:2] = b"MZ"
+    hdr[2:4] = (total % 512).to_bytes(2, "little")        # bytes last page
+    hdr[4:6] = ((total + 511) // 512).to_bytes(2, "little")  # page count
+    hdr[6:8] = (1).to_bytes(2, "little")                 # one relocation
+    hdr[8:10] = (0x20).to_bytes(2, "little")             # header paragraphs
+    hdr[0x0A:0x0C] = minalloc.to_bytes(2, "little")
+    hdr[0x0C:0x0E] = (0xFFFF).to_bytes(2, "little")
+    hdr[0x0E:0x10] = ss.to_bytes(2, "little")
+    hdr[0x10:0x12] = sp.to_bytes(2, "little")
+    hdr[0x14:0x16] = ip.to_bytes(2, "little")
+    hdr[0x16:0x18] = cs.to_bytes(2, "little")
+    hdr[0x18:0x1A] = (0x1E).to_bytes(2, "little")        # relocation table
+    hdr[0x1E:0x20] = (1).to_bytes(2, "little")           # ... offset
+    hdr[0x20:0x22] = cs.to_bytes(2, "little")            # ... segment
+    return bytes(hdr) + module
+
+
+# 4Bh of an MZ child: ES:BX is the parameter block, and AX comes back as the
+# child's exit code (7).
+T_EXEC_MZ = PROLOG + """
+mov ax,4b00h
+lea dx,mzc
+mov bx,offset pblk
+push ds
+pop es
+int 21h
+mov si,ax
+mov ah,9
+lea dx,pmsg
+int 21h
+ret
+pblk dw 0
+dd 0
+dd 0
+dd 0
+mzc db 'mzch.exe',0
+pmsg db 'P$'
+"""
+
+# The same call with an image that asks for more memory than a child window
+# has: AX must come back 8.
+T_EXEC_MZ_MEM = PROLOG + """
+mov ax,4b00h
+lea dx,bigc
+mov bx,offset pblk
+push ds
+pop es
+int 21h
+mov bp,ax
+ret
+pblk dw 0
+dd 0
+dd 0
+dd 0
+bigc db 'big.exe',0
+"""
+
 # 3Fh on a redirected handle 0: the bytes are read, not echoed.
 T_STDIN_SILENT = PROLOG + """
 mov ah,3fh
@@ -1496,6 +1583,31 @@ def main():
         rc, out = run(mue, T_STDIN_STATUS, d, stdin_data=b"x")
         check("stdin-status-redirected-ready",
               (reg(out, "BP") or 0) & 0xFF == 0xFF, reg(out, "BP"))
+
+        # 4Bh of an MZ image: the header's CS:IP (code at module offset 0x10)
+        # and SS:SP (SP low nibble) come through, the relocation makes the
+        # first immediate the load segment so DS:0 prints 'MZ', and AX is the
+        # child's exit code 7.
+        with open(os.path.join(d, "mzc.asm"), "w") as f:
+            f.write(MZCHILD_ASM)
+        subprocess.run([mue, "-a", "mzc.asm", "mzc.bin"], cwd=d,
+                       capture_output=True, timeout=60)
+        module = open(os.path.join(d, "mzc.bin"), "rb").read()
+        with open(os.path.join(d, "mzch.exe"), "wb") as f:
+            f.write(mz_image(module))
+        with open(os.path.join(d, "big.exe"), "wb") as f:
+            f.write(mz_image(module, minalloc=0x1000))
+
+        rc, out = run(mue, T_EXEC_MZ, d)
+        check("exec-mz-loads",
+              guest_text(out).replace("\r", "").strip() == "MZ7P",
+              repr(guest_text(out)[:60]))
+        check("exec-mz-returns-child-code", (reg(out, "SI") or 0) & 0xFF == 7,
+              reg(out, "SI"))
+
+        rc, out = run(mue, T_EXEC_MZ_MEM, d)
+        check("exec-mz-insufficient-memory", (reg(out, "BP") or 0) & 0xFF == 8,
+              reg(out, "BP"))
 
         # A child that leaves through 31h: its AL must reach the 4Bh caller.
         with open(os.path.join(d, "tsr.asm"), "w") as f:
