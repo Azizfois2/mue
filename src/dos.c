@@ -909,7 +909,16 @@ static void int21(void)
         MEM[base + 0x50] = 0xCD;                /* int 21h; retf */
         MEM[base + 0x51] = 0x21;
         MEM[base + 0x52] = 0xCB;
-        poke16(base + 2, (uint16_t)(seg + 0x1000));   /* top of memory */
+        {
+            /* PSP:0x02 is the first paragraph past the program's block.  The
+             * topmost window ends at the megabyte, where that value does not
+             * fit in a word: report the last paragraph instead of wrapping to
+             * 0x0000, so a child computing its free memory (top - PSP) still
+             * gets a positive, under-estimated answer (FINDINGS 35). */
+            uint32_t top = (uint32_t)seg + 0x1000;
+
+            poke16(base + 2, (uint16_t)(top > 0xFFFF ? 0xFFFF : top));
+        }
         poke16(base + 0x16, dos_psp);           /* parent PSP */
 
         /* The job file table: every handle open here is open in the child too,

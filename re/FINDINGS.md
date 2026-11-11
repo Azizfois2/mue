@@ -2505,3 +2505,27 @@ header included, so a 45-byte module is 2 pages with 45 bytes in the last one.
 Counting only the module makes the computed module size negative and the
 loader rightly rejects the header - which is how the first version of the
 check failed.
+
+## 35. A child's top of memory clamps instead of wrapping (IMPLEMENTED)
+
+PSP:0x02 holds the segment one paragraph past the program's block, and a
+program sizes itself against it (`available = top - PSP` paragraphs). A child
+window is 64K starting at 0xF000, 0xE000, ... (sec. 32), so for the topmost one
+`PSP + 0x1000` is 0x10000, which does not fit in the word: the old code stored
+the truncated 0x0000, and any child computing its free memory got a large
+*negative* number (0x0000 - 0xF000) instead of "64K minus my PSP".
+
+The topmost window now reports 0xFFFF - the last paragraph it really has. That
+keeps the subtraction positive and under-estimates by one paragraph, which is
+the safe direction. Every other level still gets the exact next paragraph
+(0xE000 -> 0xF000), so only the window that ends at the megabyte is clamped.
+
+### Checks
+
+`psp-child-top-of-memory`: a child in the 0xF000 window reads its own
+PSP:0x02 and exits with the high byte, so the parent sees 0xFF.
+`psp-grandchild-top-of-memory`: the same program one level down (0xE000)
+reports 0xF0, so the clamp did not become a blanket replacement.
+
+Verified to bite: restoring the plain `(uint16_t)(seg + 0x1000)` fails
+`psp-child-top-of-memory` with 0 while the grandchild check still passes.

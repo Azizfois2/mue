@@ -829,6 +829,67 @@ dd 0
 pname db 'pchild.com',0
 """
 
+# A child's PSP:0x02 is the first paragraph past its block.  The topmost
+# window ends at the megabyte, where the segment does not fit in a word: it
+# must report 0xFFFF (0xFF in the high byte) and not wrap to 0x0000.
+TOP_ASM = PROLOG + """
+mov bx,0
+mov ax,[bx+2]
+mov al,ah
+mov ah,4ch
+int 21h
+"""
+
+T_EXEC_TOP = PROLOG + """
+mov ax,4b00h
+lea dx,cname
+mov bx,offset pblk
+push ds
+pop es
+int 21h
+mov bp,ax
+ret
+pblk dw 0
+dd 0
+dd 0
+dd 0
+cname db 'top.com',0
+"""
+
+# One level down, so the child of this child sits in the 0xE000 window and its
+# top of memory is still an exact 0xF000.
+MID_ASM = PROLOG + """
+mov ax,4b00h
+lea dx,cname
+mov bx,offset pblk
+push ds
+pop es
+int 21h
+mov ah,4ch
+int 21h
+pblk dw 0
+dd 0
+dd 0
+dd 0
+cname db 'top.com',0
+"""
+
+T_EXEC_TOP_MID = PROLOG + """
+mov ax,4b00h
+lea dx,cname
+mov bx,offset pblk
+push ds
+pop es
+int 21h
+mov bp,ax
+ret
+pblk dw 0
+dd 0
+dd 0
+dd 0
+cname db 'mid.com',0
+"""
+
 T_EXEC_PARENT_NEST = PROLOG + """
 mov ax,4b00h
 lea dx,pname
@@ -1529,7 +1590,8 @@ def main():
         check("psp-boot-jft", ax == 0, ax)
 
         for nm, src in (("cpsp", CPSP_ASM), ("pchild", CPSP_PARENT_ASM),
-                        ("c1p", C1P_ASM), ("opener", OPENER_ASM)):
+                        ("c1p", C1P_ASM), ("opener", OPENER_ASM),
+                        ("top", TOP_ASM), ("mid", MID_ASM)):
             with open(os.path.join(d, nm + ".asm"), "w") as f:
                 f.write(src)
             subprocess.run([mue, "-a", nm + ".asm", nm + ".com"], cwd=d,
@@ -1550,6 +1612,15 @@ def main():
         check("psp-parent-segment", reg(out, "BP") == 1, reg(out, "BP"))
         rc, out = run(mue, T_EXEC_PARENT_NEST, d)
         check("psp-parent-nested", reg(out, "BP") == 0xF0, reg(out, "BP"))
+
+        # Top of memory: 0xFFFF in the topmost window (it ends at the
+        # megabyte), the exact 0xF000 one level down.
+        rc, out = run(mue, T_EXEC_TOP, d)
+        check("psp-child-top-of-memory", (reg(out, "BP") or 0) & 0xFF == 0xFF,
+              reg(out, "BP"))
+        rc, out = run(mue, T_EXEC_TOP_MID, d)
+        check("psp-grandchild-top-of-memory",
+              (reg(out, "BP") or 0) & 0xFF == 0xF0, reg(out, "BP"))
 
         # A child's unclosed handles die with it; the parent's slot 1 is free
         # again, so the next open gets handle 6 and not 7.
