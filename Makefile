@@ -81,6 +81,9 @@ test: $(BIN) $(TBIN)
 	@echo "== assembler diagnostics: rejected vs. accepted forms =="
 	@cd src && $(SKIPOK) "$(PYTHON)" check_asmdiag.py
 	@echo
+	@echo "== INT 10h subfunctions checked by side effect =="
+	@cd src && $(SKIPOK) "$(PYTHON)" check_int10sem.py
+	@echo
 	@echo "== INT 21h file services =="
 	@cd src && $(SKIPOK) "$(PYTHON)" check_int21.py
 	@echo

@@ -3226,3 +3226,45 @@ That is the useful part: the two errors were not in the code, they were in
 how I looked at it. A check that asserts "no complaint was printed" catches a
 missing arm; it cannot catch an arm that runs and does nothing. Those need the
 side effect, so that is what the section now records.
+
+## 48. INT 10h AH=13h ignored BL, so every string was drawn in the wrong colour
+
+Same treatment as section 47, applied to INT 10h: check each documented
+subfunction by what it is supposed to *change*, not by whether a complaint was
+printed. `src/check_int10sem.py`, 15 checks covering all 13 documented AH
+values.
+
+**One real bug, and the check that found it had to read the attribute.**
+AH=13h wrote `attr = 0x07` for every character when the string carried no
+attribute bytes, ignoring BL. emu8086's own reference is explicit:
+
+> BL = attribute if string contains only characters (bit 1 of AL is zero)
+
+So `AL=01h` and `AL=00h` drew text in the default grey regardless of what the
+caller asked for, while `AL=02h`/`AL=03h` looked correct because they take the
+attribute from the string itself. The bug was therefore invisible in the modes
+that already worked and in anything that only checked the characters.
+
+A check that asserted "the string appeared" passed on the broken code. Only
+asserting the attribute byte (`0x4E` in the high half of the `AH=08h` result)
+caught it. Negative control: restoring `attr = 0x07` fails
+`10h-13h-string-attribute-applied` with `0x0758` instead of `0x4E58`.
+
+**Three of my own errors, all the same shape as section 47's.**
+Reading a value at the wrong moment or from the wrong register:
+
+- `AH=0Fh` returns the page in **AL** (`AX=0301`), not BH. I read BH and got 0.
+  AH=0Fh is not in emu8086's reference either, so the page is now proved the
+  way a guest would: set page 0's cursor to (9,9), switch to page 1, move
+  page 1's cursor, then read both back and require different answers.
+- `AH=13h` with AL=01h **advances the cursor to the end of the string**, so
+  reading at the cursor afterwards correctly returns the blank that follows.
+  The test has to rewind first.
+- The page test as first written never read page 0 back at all, so the "pages
+  are independent" check was asserting against a register nobody had set.
+
+**What this pair of sections (47 and 48) establishes.** A "nothing was
+complained about" check catches a missing arm. It cannot catch an arm that
+runs and does the wrong thing, which is what AH=13h was doing. Those need the
+side effect, and specifically the *whole* side effect - for 13h, both the
+character and its attribute.

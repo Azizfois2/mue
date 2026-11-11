@@ -2220,8 +2220,15 @@ static void int10(void)
             cur_row[cur_page] = (cpu.r[DX] >> 8) & 0xFF;
             cur_col[cur_page] = cpu.r[DX] & 0xFF;
             for (i = 0; i < cells; i++) {
-                int attr = 0x07;
+                /* BL is the attribute when the string carries none - bit 1 of
+                 * AL clear means "string is characters only, take the
+                 * attribute from BL" (emu8086's own text: "BL = attribute if
+                 * string contains only characters (bit 1 of AL is zero)").
+                 * Defaulting to 0x07 ignored BL, so AH=13h AL=01h drew text
+                 * in the wrong colour while AL=02h/03h looked right. */
+                int attr;
                 unsigned char *cell;
+                attr = (int)(cpu.r[BX] & 0xFF);      /* BL */
                 ch = peek8(p++);
                 /* With bit1 set every second byte is an attribute: consume it
                  * and give it to the cell instead of printing it. */
