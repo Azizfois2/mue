@@ -206,7 +206,14 @@ static int e_primary(ex_t *e)
                 if (*e->p != '_') { hv = hv * 16 + (unsigned)hexval((unsigned char)*e->p); ndig++; }
                 e->p++;
             }
-            if (*e->p == 'h' || *e->p == 'H') { e->p++; return (int)(hv & 0xFFFF); }
+            if (*e->p == 'h' || *e->p == 'H') {
+                /* Keep the full 32-bit value: "dd 12345678h" is a legal
+                 * doubleword (examples/double_word.asm), so the width check
+                 * belongs to the instruction that consumes the immediate
+                 * (immediate_overflows), not here. */
+                e->p++;
+                return (int)hv;
+            }
             if (*e->p == 'b' || *e->p == 'B') {
                 int b = 0, binoks = 1;
                 const char *q = start;
@@ -221,6 +228,24 @@ static int e_primary(ex_t *e)
                 return (int)(hv & 0xFFFF);
             }
             if (*e->p == 'd' || *e->p == 'D') { e->p++; return (int)(hv & 0xFFFF); }
+            /* Octal: emu8086 accepts a trailing 'o'/'O' (and 'q'/'Q'), as in
+             * "mov cl, 10o" -> 8.  The scanner above already consumed the
+             * digits as hex, so re-scan the same run as base 8.  Without this
+             * the literal was junk that only assembled because a failed
+             * operand used to be dropped silently. */
+            if (*e->p == 'o' || *e->p == 'O' || *e->p == 'q' || *e->p == 'Q') {
+                int ov = 0;
+                const char *q = start;
+                while (q < e->p) {
+                    if (*q != '_') {
+                        if (*q < '0' || *q > '7') { e->ok = 0; break; }
+                        ov = ov * 8 + (*q - '0');
+                    }
+                    q++;
+                }
+                e->p++;
+                return (int)ov;
+            }
             /* decimal only if every consumed char was 0-9 */
             {
                 int all_dec = 1;

@@ -1389,13 +1389,13 @@ static void int21(void)
         break;
 
     case 0x31:                                  /* terminate and stay resident */
-        /* Original: there is no 31h arm in the dispatcher (see 30), so it
-         * prints "not supported yet" and carries on.  Residency has no
-         * meaning here - one program, one prompt-less run - so the clone ends
-         * the program the way 4Ch does and ignores DX.  Divergence. */
-        dos_exit_requested = 1;
-        dos_exit_code = cpu.r[0] & 0xFF;
-        cpu.halted = 1;
+        /* There is NO 31h arm in the original's dispatcher (verified against
+         * the [ebp-0x288] chain), so it falls through the whole compare chain
+         * into the generic report and CARRIES ON - the guest keeps running.
+         * The clone used to halt here, which silently ended a program that the
+         * original would have continued.  Residency cannot be modelled, so
+         * report exactly as the original does and return. */
+        unsupported_ah("INT 21h", ah);
         break;
 
     case 0x35:                                  /* get interrupt vector */
@@ -2096,7 +2096,9 @@ static void int10(void)
         break;
     case 0x08:                                  /* read char/attr at cursor */
         {
-            unsigned char *cell = vram_cell(cur_row[cur_page], cur_col[cur_page]);
+            /* BIOS: the page is BH, not the globally selected page. */
+            int pg = (cpu.r[BX] >> 8) & 0xFF;
+            unsigned char *cell = vram_cell_page(pg, cur_row[pg], cur_col[pg]);
             cpu.r[AX] = (uint16_t)((cell[1] << 8) | cell[0]);
         }
         break;
@@ -2104,13 +2106,18 @@ static void int10(void)
         {
             int ch   = cpu.r[AX] & 0xFF;
             int attr = cpu.r[BX] & 0xFF;        /* BL */
+            /* BIOS: BH selects the page to write to.  The clone used the
+             * globally selected page, so a guest that wrote page 1 with
+             * BH=1 landed on whichever page AH=05h had last chosen. */
+            int pg   = (cpu.r[BX] >> 8) & 0xFF;
             int n    = cpu.r[CX];
             int i;
 
+            if (pg >= VIDEO_PAGES) pg = VIDEO_PAGES - 1;
             /* In text mode AH=0A writes the character only: the cell keeps
              * the attribute it already had, and BL is ignored. */
-            for (i = 0; i < n && cur_col[cur_page] + i < VIDEO_COLS; i++) {
-                unsigned char *cell = vram_cell(cur_row[cur_page], cur_col[cur_page] + i);
+            for (i = 0; i < n && cur_col[pg] + i < VIDEO_COLS; i++) {
+                unsigned char *cell = vram_cell_page(pg, cur_row[pg], cur_col[pg] + i);
                 cell[0] = (unsigned char)ch;
                 if (ah == 0x09) cell[1] = (unsigned char)attr;
                 video_putc(ch);

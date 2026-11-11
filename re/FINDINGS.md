@@ -3008,3 +3008,64 @@ and "works in the harness" differ in exactly the assembly prologue.
 Gate after the pass: CPU ALL PASS, `.list` 46/46, roundtrip 44/44, RUN 85/85,
 EXAMPLES 85/85, and every `check_*.py` green including the new
 `check_gaps.py` (22 checks).
+
+## 43. GAPS.md sec. 5 closed: TSR falls through, 0Ah page was wrong, and the
+##     assembler was silently dropping instructions
+
+**INT 21h AH=31h was terminating the program.** There is no `31h` arm in the
+`[ebp-0x288]` chain, so the original falls through to the generic
+"not supported yet" report and *keeps executing*. The clone set
+`cpu.halted = 1`. A guest that issued 31h and then did more work was silently
+truncated. Now it reports and returns. Two pre-existing checks in
+`check_int21.py` (`tsr-terminates`, `tsr-code-reaches-exec-caller`) had
+encoded the clone's invention as the expectation and were updated.
+
+**INT 10h AH=08/09/0A ignored BH.** BIOS takes the target page in BH, but the
+clone used the globally selected page from AH=05h. Writing page 1 with
+`BH=1` therefore landed on whatever page AH=05h had last chosen. Verified by
+negative control (writing to `cur_page` again makes page 0 receive the
+character). AH=0Eh is deliberately *not* changed - its documentation says
+"the printing is always done to current active page".
+
+**INT 20h/4Ch exit codes: no divergence.** `0x529F53` never reads AL. It
+stores the halt marker and returns, so the original does not propagate AL to
+the process status, and neither does the clone. `dos_exit_code` feeds only
+the 4Bh child, which is a clone-only capability.
+
+**The assembler was silently dropping instructions.** `parse_operand`
+returning 0 was treated as "nothing to do" at eight call sites, so
+`mov ax,undefined_sym` emitted no bytes for that instruction and printed
+nothing - the file still "assembled". Turning that into an error
+(`<op> can not be evaluated: '<text>' undefined variable or over 16 bits`,
+and `overflow! - cannot be evaluated:` for a value too wide) immediately broke
+14 of the 85 examples, and every break was a real gap that had been hidden:
+
+- **octal literals** - `mov cl, 10o` is 8 (`5_sample.asm`). There was no
+  octal path at all; the digits had been consumed as hex.
+- **`cs:sym` destinations** - `mov cs:make_minus, 0`. The segment override was
+  only stripped for bracketed operands, so the bare `cs:name` form made
+  `eval_expr` choke on the colon (`Calculator.asm`, `factorial.asm`).
+- **`b.`/`w.` size prefixes** - `mov bl, b.temp` and `mov w. week, al`
+  (`HexConvertor.asm`, `datefile.asm`). These are emu8086 symbol-size
+  prefixes, not part of the name, and the space after the dot is optional.
+- **late `name = expr`** - the handler derived the symbol name from `rest`
+  instead of `word` when the line had no `#`, so `eq - src` went negative and
+  the name came out **empty**: nothing was defined and every later use failed
+  (`cmpsb.asm`). Also, `=` symbols were stored with `size = 0` rather than the
+  `-1` that `define_const` uses for constants, so `mov cx, size` assembled as
+  a memory load (`8B 0E`) instead of an immediate (`B9`).
+- **unsized symbol destination** - `effective_size()` defaulted any memory
+  destination with an immediate source to 8 bits, so `mov foo, 300` was
+  rejected. It now picks the narrowest width that holds the value
+  (`far_call-2.asm` stores `seg printme`).
+- **`dd` truncated to 16 bits** - the high half was emitted as zero.
+
+**A note on how this surfaced.** I set out to fix item 7 (assembler error
+recovery) expecting a small diagnostics change. The strictness is what found
+six latent assembler bugs, because until then a bad parse looked exactly like
+a successful one. `check_asmdiag.py` now asserts both directions - 6 rejections
+and 7 acceptances - and the acceptances assert bytes, so "it assembled" cannot
+be satisfied by emitting nothing.
+
+Gate: `.list` 46/46, roundtrip 44/44, examples 85/85, RUN 85/85, all
+`check_*.py` green.

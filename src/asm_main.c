@@ -79,7 +79,14 @@ static int effective_size(const operand_t *a, const operand_t *b)
 {
     if (a->size) return a->size;
     if (b && b->size) return b->size;
-    if (a->kind == OP_MEM && b && b->kind == OP_IMM) return 8;
+    /* A bare symbol destination ("mov foo, 300") carries no size, because
+     * data labels are recorded without one.  Defaulting straight to 8 bits
+     * rejected any value above 127 that is perfectly fine in a word slot
+     * (examples/far_call-2.asm stores `seg printme`, about 0x100, into a
+     * dw).  Pick the narrowest width that holds the value instead, which
+     * matches what the original does for an unsized symbol. */
+    if (a->kind == OP_MEM && b && b->kind == OP_IMM)
+        return (b->imm < -128 || b->imm > 255) ? 16 : 8;
     return 0;
 }
 
@@ -131,6 +138,8 @@ static int emit_modrm(asm_t *a, const operand_t *rm, int regf, int w)
  * Returns bytes emitted (0 if the mnemonic was not recognised).
  * ===================================================================*/
 
+static int immediate_overflows(asm_t *a, const operand_t *s, int bits);
+
 static int emit_alu(asm_t *a, int opbase, operand_t *d, operand_t *s, int w)
 {
     int wbit = (w == 16) ? 1 : 0;
@@ -151,6 +160,7 @@ static int emit_alu(asm_t *a, int opbase, operand_t *d, operand_t *s, int w)
         return emit_modrm(a, d, s->reg, w);
     }
     if (is_reg(d) && s->kind == OP_IMM) {
+        if (immediate_overflows(a, s, w)) return 0;
         if (d->reg == 0 && !wbit) {                        /* AL,ib */
             emit8(a, (uint8_t)(opbase + 4));
             emit8(a, (uint8_t)s->imm);
@@ -197,6 +207,21 @@ static void note_data_immediate(asm_t *a, const char *text)
 }
 
 /* mov / test / xchg share the rm<->reg shapes */
+/* Reject a value the destination field cannot hold.  The original's error
+ * table has "overflow! - cannot be evaluated:" for exactly this, and without
+ * the check a wide literal was truncated silently (mov ax,99999999999h came
+ * out as B8 99 99).  Returns 0 when the value fits. */
+static int immediate_overflows(asm_t *a, const operand_t *s, int bits)
+{
+    long long v = s->imm;
+    long long lo = (bits == 8) ? -128 : -32768;
+    long long hi = (bits == 8) ? 255 : 65535;
+    if (v >= lo && v <= hi) return 0;
+    asm_error(a, "overflow! - cannot be evaluated: '%s'",
+              s->text ? s->text : "?");
+    return 1;
+}
+
 static int emit_mov(asm_t *a, operand_t *d, operand_t *s)
 {
     int w = effective_size(d, s);
@@ -243,12 +268,14 @@ static int emit_mov(asm_t *a, operand_t *d, operand_t *s)
         return emit_modrm(a, s, d->reg, w);
     }
     if (is_reg(d) && s->kind == OP_IMM) {
+        if (immediate_overflows(a, s, w)) return 0;
         if (w == 8) { emit8(a, (uint8_t)(0xB0 + d->reg)); emit8(a, (uint8_t)s->imm); }
         else        { emit8(a, (uint8_t)(0xB8 + d->reg)); note_data_immediate(a, s->text);
                       emit16(a, (uint16_t)s->imm); }
         return 1;
     }
     if (is_mem(d) && s->kind == OP_IMM) {
+        if (immediate_overflows(a, s, w)) return 0;
         emit_seg_prefix(a, d);
         emit8(a, (uint8_t)(wbit ? 0xC7 : 0xC6));
         emit_modrm(a, d, 0, w);
@@ -633,10 +660,22 @@ static int encode_insn(asm_t *a, const char *mnem_in, char **ops, int nops)
         if (nops != 2) { asm_error(a, "in/out need 2 operands"); return 0; }
         if (!strcmp(m, "in")) {
             /* in  reg, port */
-            if (!parse_operand(a, ops[0], &r) || !parse_operand(a, ops[1], &p)) return 0;
+            if (!parse_operand(a, ops[0], &r) || !parse_operand(a, ops[1], &p)) {
+            /* The original reports an operand it cannot evaluate rather than
+             * dropping the instruction: "<op> cannot be evaluated: <text>
+             * undefined variable or over 16 bits" (strings at the assembler's
+             * error table).  Returning 0 silently used to assemble the
+             * instruction to nothing, so `mov ax,undef_sym` produced no bytes
+             * and no diagnostic. */
+            asm_line_error(a, a->errline, "%s can not be evaluated: '%s' undefined variable "
+                         "or over 16 bits", m, nops > 1 ? ops[1] : ops[0]);
+            return 0; }
         } else {
             /* out port, reg */
-            if (!parse_operand(a, ops[0], &p) || !parse_operand(a, ops[1], &r)) return 0;
+            if (!parse_operand(a, ops[0], &p) || !parse_operand(a, ops[1], &r)) {
+            asm_line_error(a, a->errline, "%s can not be evaluated: '%s' undefined variable "
+                         "or over 16 bits", m, nops > 1 ? ops[1] : ops[0]);
+            return 0; }
         }
         {
             int wbit = (r.kind == OP_REG8) ? 0 : 1;
@@ -654,7 +693,10 @@ static int encode_insn(asm_t *a, const char *mnem_in, char **ops, int nops)
     /* lea / lds / les */
     if (!strcmp(m, "lea")) {
         if (nops != 2) { asm_error(a, "lea needs 2 operands"); return 0; }
-        if (!parse_operand(a, ops[0], &d) || !parse_operand(a, ops[1], &s)) return 0;
+        if (!parse_operand(a, ops[0], &d) || !parse_operand(a, ops[1], &s)) {
+            asm_line_error(a, a->errline, "%s can not be evaluated: '%s' undefined variable "
+                         "or over 16 bits", m, nops > 1 ? ops[1] : ops[0]);
+            return 0; }
         if (!is_reg(&d)) { asm_error(a, "lea needs a register destination"); return 0; }
         /* "lea reg, symbol" (or "symbol+d") uses the symbol's address;
          * emu8086 folds it into a plain immediate move.  The operand text is
@@ -679,7 +721,10 @@ static int encode_insn(asm_t *a, const char *mnem_in, char **ops, int nops)
     }
     if (!strcmp(m, "lds") || !strcmp(m, "les")) {
         if (nops != 2) { asm_error(a, "lea needs 2 operands"); return 0; }
-        if (!parse_operand(a, ops[0], &d) || !parse_operand(a, ops[1], &s)) return 0;
+        if (!parse_operand(a, ops[0], &d) || !parse_operand(a, ops[1], &s)) {
+            asm_line_error(a, a->errline, "%s can not be evaluated: '%s' undefined variable "
+                         "or over 16 bits", m, nops > 1 ? ops[1] : ops[0]);
+            return 0; }
         if (!is_reg(&d)) { asm_error(a, "lea needs a register destination"); return 0; }
         emit_seg_prefix(a, &s);
         emit8(a, m[0] == 'l' && m[1] == 'e' ? 0x8D : (m[1] == 'd' ? 0xC5 : 0xC4));
@@ -772,18 +817,27 @@ static int encode_insn(asm_t *a, const char *mnem_in, char **ops, int nops)
     /* mov / test / xchg */
     if (!strcmp(m, "mov")) {
         if (nops != 2) { asm_error(a, "mov needs 2 operands"); return 0; }
-        if (!parse_operand(a, ops[0], &d) || !parse_operand(a, ops[1], &s)) return 0;
+        if (!parse_operand(a, ops[0], &d) || !parse_operand(a, ops[1], &s)) {
+            asm_line_error(a, a->errline, "%s can not be evaluated: '%s' undefined variable "
+                         "or over 16 bits", m, nops > 1 ? ops[1] : ops[0]);
+            return 0; }
         return emit_mov(a, &d, &s);
     }
     if (!strcmp(m, "test")) {
         if (nops != 2) { asm_error(a, "test needs 2 operands"); return 0; }
-        if (!parse_operand(a, ops[0], &d) || !parse_operand(a, ops[1], &s)) return 0;
+        if (!parse_operand(a, ops[0], &d) || !parse_operand(a, ops[1], &s)) {
+            asm_line_error(a, a->errline, "%s can not be evaluated: '%s' undefined variable "
+                         "or over 16 bits", m, nops > 1 ? ops[1] : ops[0]);
+            return 0; }
         return emit_test(a, &d, &s);
     }
     if (!strcmp(m, "xchg")) {
         int w;
         if (nops != 2) { asm_error(a, "xchg needs 2 operands"); return 0; }
-        if (!parse_operand(a, ops[0], &d) || !parse_operand(a, ops[1], &s)) return 0;
+        if (!parse_operand(a, ops[0], &d) || !parse_operand(a, ops[1], &s)) {
+            asm_line_error(a, a->errline, "%s can not be evaluated: '%s' undefined variable "
+                         "or over 16 bits", m, nops > 1 ? ops[1] : ops[0]);
+            return 0; }
         w = effective_size(&d, &s);
         if (is_reg(&d) && is_reg(&s) && w == 16) {
             if (d.reg == 0) { emit8(a, (uint8_t)(0x90 + s.reg)); return 1; }
@@ -804,7 +858,10 @@ static int encode_insn(asm_t *a, const char *mnem_in, char **ops, int nops)
         if (find_mnem(m, &c) && c >= 0 && c < 0x40 && (c & 7) == 0) {
             int w;
             if (nops != 2) { asm_error(a, "%s needs 2 operands", m); return 0; }
-            if (!parse_operand(a, ops[0], &d) || !parse_operand(a, ops[1], &s)) return 0;
+            if (!parse_operand(a, ops[0], &d) || !parse_operand(a, ops[1], &s)) {
+            asm_line_error(a, a->errline, "%s can not be evaluated: '%s' undefined variable "
+                         "or over 16 bits", m, nops > 1 ? ops[1] : ops[0]);
+            return 0; }
             w = effective_size(&d, &s);
             if (!w) w = 16;
             return emit_alu(a, c, &d, &s, w);
@@ -886,10 +943,20 @@ static int emit_data(asm_t *a, const char *dir, char *rest)
             }
             v = eval_expr(a, it, &ok);
             if (!ok) { asm_line_error(a, a->errline, "bad data value '%s'", it); continue; }
+            /* A value too wide for the directive is an error, not a silent
+             * truncation: "db 12345" used to emit 0x39. */
+            if (!strcmp(dir, "db") && (v < -128 || v > 255)) {
+                asm_line_error(a, a->errline, "overflow! - cannot be evaluated: '%s'", it);
+                continue;
+            }
+            if (!strcmp(dir, "dw") && (v < -32768 || v > 65535)) {
+                asm_line_error(a, a->errline, "overflow! - cannot be evaluated: '%s'", it);
+                continue;
+            }
             if (!strcmp(dir, "db"))      emit8(a, (uint8_t)v);
             else if (!strcmp(dir, "dw")) emit16(a, (uint16_t)v);
             else { emit8(a, (uint8_t)v); emit8(a, (uint8_t)(v >> 8));
-                   emit8(a, 0); emit8(a, 0); }
+                   emit8(a, (uint8_t)(v >> 16)); emit8(a, (uint8_t)(v >> 24)); }
         }
     }
     return 1;
@@ -1263,8 +1330,12 @@ void process_line(asm_t *a, char *raw, int lineno)
             return;
         }
 
-        /* emu8086 control comments such as "#make_bin#" carry no code */
-        if (word[0] == '#' && !strchr(rest, '=')) return;
+        /* emu8086 control comments such as "#make_bin#" carry no code.  A
+         * "#name=value" line also has no spaces, so the '=' lands inside
+         * `word` rather than `rest` and must be looked for in both - testing
+         * only `rest` treated "#size=2" as a control comment and defined
+         * nothing. */
+        if (word[0] == '#' && !strchr(rest, '=') && !strchr(word, '=')) return;
 
         /* "#name=value" equ form: define a symbol, emit nothing */
         if (word[0] == '#' || strchr(rest, '=')) {
@@ -1273,17 +1344,29 @@ void process_line(asm_t *a, char *raw, int lineno)
             if (eq) {
                 char nm[64];
                 int ok, v;
-                size_t n = (size_t)(eq - (eq >= word + strlen(word) ? rest : word));
-                const char *src = (strchr(word, '=') ? word : rest);
-                n = (size_t)(eq - src);
+                /* The name is whatever precedes '='.  "#size=2" has no
+                 * spaces, so the '=' is inside `word` and the name is
+                 * word[0..eq).  "size = 2" has the '=' in `rest`, so the
+                 * name is the whole of `word`.  Deriving `src` from
+                 * `rest` in the second case yielded an empty name (the
+                 * subtraction went negative), which silently defined
+                 * nothing and left the symbol unusable. */
+                const char *src = strchr(word, '=') ? word : word;
+                size_t n = strchr(word, '=') ? (size_t)(eq - word)
+                                            : strlen(word);
                 if (n >= sizeof(nm)) n = sizeof(nm) - 1;
                 memcpy(nm, src, n); nm[n] = 0;
                 lower_str(nm);
                 if (nm[0] == '#') memmove(nm, nm + 1, strlen(nm));
                 v = eval_expr(a, eq + 1, &ok);
                 if (ok && nm[0]) {
-                    if (!find_label(a, nm)) add_label(a, nm, (uint16_t)v, 0, 0);
-                    else find_label(a, nm)->value = (uint16_t)v;
+                    /* size = -1 marks a constant, matching define_const().
+                     * Recording it as 0 made "mov cx, size" assemble as a
+                     * memory load (8B 0E) instead of the immediate (B9), so
+                     * an equ-defined length was read from the wrong place. */
+                    if (!find_label(a, nm)) add_label(a, nm, (uint16_t)v, -1, 0);
+                    else { find_label(a, nm)->value = (uint16_t)v;
+                           find_label(a, nm)->size = -1; }
                 }
                 return;
             }

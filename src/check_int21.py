@@ -782,6 +782,11 @@ mov ah,31h
 mov al,5
 mov dx,100h
 int 21h
+; 31h does not end the program in the original - it reports "not supported"
+; and continues - so the child has to leave through 4Ch explicitly.
+mov ah,4ch
+mov al,5
+int 21h
 msg db 'child$'
 """
 
@@ -1967,9 +1972,13 @@ def main():
         check("getdir-invalid-drive", cx == 0x0F, cx)
         check("getdir-invalid-drive-cf", di is not None and (di & 1), di)
 
-        # 31h: the handler must end the program, not fall through.
+        # 31h (TSR): the original has NO arm for it in the [ebp-0x288] chain,
+        # so it falls through to the generic "not supported yet" report and
+        # the guest keeps running.  This check used to demand BX == 0, i.e.
+        # that the clone halted - pinning the clone's own invention, not the
+        # original's behaviour (FINDINGS 43).
         rc, out = run(mue, T_TSR, d)
-        check("tsr-terminates", reg(out, "BX") == 0, reg(out, "BX"))
+        check("tsr-falls-through", reg(out, "BX") == 0xDEAD, reg(out, "BX"))
 
         # 4Bh: child program, loaded and run, its output before the parent's.
         with open(os.path.join(d, "child.asm"), "w") as f:
@@ -2171,7 +2180,9 @@ def main():
         check("exec-overlay-needs-address",
               (reg(out, "BP") or 0) == 0x109, reg(out, "BP"))
 
-        # A child that leaves through 31h: its AL must reach the 4Bh caller.
+        # A child that issues 31h and then exits through 4Ch: its code must
+        # reach the 4Bh caller.  (31h itself does not terminate anything -
+        # see the tsr-falls-through check above.)
         with open(os.path.join(d, "tsr.asm"), "w") as f:
             f.write(CHILD_TSR_ASM)
         subprocess.run([mue, "-a", "tsr.asm", "tsr.com"], cwd=d,

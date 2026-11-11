@@ -76,6 +76,12 @@ static int size_keyword(const char *s, int *size, const char **rest)
         { "near ptr ",  16 }, { "qword ptr ", 64 },
         { "byte ",  8 }, { "word ", 16 }, { "dword ", 32 },
         { "far ",  32 }, { "near ", 16 },
+        /* emu8086's symbol size prefixes: "mov bl, b.temp" reads the byte
+         * of the word symbol `temp`, and "mov w. week, al" writes the word
+         * at `week` (note the space is optional).  examples/HexConvertor.asm
+         * and examples/datefile.asm are written exactly that way. */
+        { "byte.",  8 }, { "word.",  16 }, { "dword.", 32 }, { "qword.", 64 },
+        { "b.",     8 }, { "w.",     16 }, { "d.",     32 }, { "q.",     64 },
     };
     unsigned i;
     for (i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
@@ -222,7 +228,28 @@ int parse_operand(asm_t *a, const char *text, operand_t *op)
     /* bare expression: immediate, or a symbol used as a direct address */
     {
         int ok;
-        int v = eval_expr(a, rest, &ok);
+        int v;
+        char segbuf[8] = {0};
+        const char *body = rest;
+
+        /* `mov cs:foo, 0` names a memory destination with a segment override
+         * but no brackets.  The override has to be stripped and recorded
+         * before eval_expr() sees the colon, which it cannot parse - the
+         * whole operand used to be rejected, so Calculator.asm and
+         * factorial.asm ("MOV CS:make_minus, 0") failed to assemble. */
+        {
+            const char *c = strchr(rest, ':');
+            if (c && !strchr(rest, '[')) {
+                size_t n = (size_t)(c - rest);
+                int sreg = -1;
+                if (n < sizeof(segbuf)) {
+                    memcpy(segbuf, rest, n); segbuf[n] = 0;
+                    sreg = sreg_index(segbuf);
+                }
+                if (sreg >= 0) { op->seg = sreg; body = c + 1; }
+            }
+        }
+        v = eval_expr(a, body, &ok);
         if (ok) {
             /* A symbol used alone is a memory operand, but an "equ" constant
              * and an immediate expression are values.  `rest` may carry a
@@ -231,10 +258,11 @@ int parse_operand(asm_t *a, const char *text, operand_t *op)
              * displacement, never for a plain arithmetic expression. */
             char lead[256];
             size_t k = 0;
-            while (rest[k] && (isalnum((unsigned char)rest[k]) || rest[k] == '_' ||
-                               rest[k] == '@' || rest[k] == '$' || rest[k] == '?') &&
+            const char *rest2 = body;
+            while (rest2[k] && (isalnum((unsigned char)rest2[k]) || rest2[k] == '_' ||
+                               rest2[k] == '@' || rest2[k] == '$' || rest2[k] == '?') &&
                    k < sizeof(lead) - 1)
-                lead[k] = rest[k], k++;
+                lead[k] = rest2[k], k++;
             lead[k] = 0;
 
             label_t *l = k ? find_label(a, lead) : NULL;
@@ -242,7 +270,7 @@ int parse_operand(asm_t *a, const char *text, operand_t *op)
              * pure +/- displacement.  "count*2" must stay an immediate. */
             int only_disp = 0;
             if (l) {
-                const char *q = rest + k;
+                const char *q = body + k;
                 only_disp = 1;
                 while (*q) {
                     if (isspace((unsigned char)*q) || *q == '+' || *q == '-' ||
@@ -263,8 +291,14 @@ int parse_operand(asm_t *a, const char *text, operand_t *op)
             op->imm = v;
             return 1;
         }
+        /* eval_expr() refused the expression.  The usual reason is a symbol
+         * that is not defined yet; the original words that "... cannot be
+         * evaluated: <text> undefined variable or over 16 bits", and a value
+         * too wide for the field is reported as "overflow! - cannot be
+         * evaluated:".  Signalling failure here is what turns a silently
+         * dropped instruction into a reported error. */
+        return 0;
     }
-    return 0;
 }
 
 /* ---- ModRM encoding -------------------------------------------------- */

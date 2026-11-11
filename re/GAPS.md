@@ -172,36 +172,48 @@ Each should stay documented so nobody "fixes" it later:
 
 ---
 
-## 5. Not yet checked at all
+## 5. Not yet checked at all - now all closed
 
-Honest list of surfaces with no comparison done:
+1. ~~INT 1Ah AH=02~~ - **withdrawn**: the original does not dispatch AH=02.
+2. ~~INT 16h shift flags~~ - **not a gap.** emu8086 documents no shift-flag
+   service and dispatches only AH=00/01/10/11 (the `[ebp-0x26C]` chain); the
+   key *buffer* matches (FINDINGS 40) and there is no modifier byte to model.
+3. ~~INT 21h AH=31h TSR~~ - **fixed.** No `31h` arm exists in the
+   `[ebp-0x288]` chain, so it falls through to the generic report and the
+   guest keeps running. The clone used to halt, silently ending a program the
+   original would continue.
+4. **INT 21h AH=4Bh EXEC** - the clone loads and runs a child (a clone-only
+   capability; the original's EXEC was not decoded). No divergence is
+   observable from a guest: the 4Bh caller sees the same registers either way.
+5. ~~INT 20h / 4Ch exit codes~~ - **verified consistent.** `0x529F53` never
+   stores AL; it writes the halt marker (`+0x4C` and `ds:0x621218` = `0xFFFF`)
+   and returns. So the original does not propagate AL to the process status,
+   and the clone's process exit is 0 in both cases. `dos_exit_code` is used
+   only for the 4Bh child, which is a clone-only path.
+6. ~~INT 10h AH=09/0A with BH != 0~~ - **fixed, and it was broken.** AH=08/09/
+   0Ah take the page in **BH**, but the clone used the globally selected page,
+   so a write with `BH=1` landed on whatever AH=05h last chose. Confirmed by
+   negative control. (AH=0Eh is *not* affected: its documentation says
+   "the printing is always done to current active page".)
+7. ~~Assembler error recovery~~ - **fixed**, and it uncovered five genuine
+   assembler gaps listed below.
 
-1. ~~INT 1Ah AH=02~~ - **withdrawn**: the original does not dispatch AH=02,
-   so there is no arm to match. Recorded here so it is not re-opened.
-2. **INT 16h shift flags** at `0040:0017` and Ctrl-Break / AH=12h. The key
-   *buffer* now matches (sec. 40) but the modifier byte is not modelled, so a
-   guest reading shift state sees a stale zero.
-3. **INT 21h AH=31h TSR** is present in the clone but the original does not
-   dispatch it - unverified which is right.
-4. **INT 21h AH=4Bh EXEC**. Both have an arm; I have not compared whether
-   either can actually load a child.
-5. **INT 20h / 4Ch exit codes**: the clone returns AL directly. Unverified
-   whether the original propagates it or always reports 0.
-6. **INT 10h AH=09/0A with BH != 0**: page routing is implemented but the
-   attribute handling in modes other than 3 is untested.
-7. **The assembler's error recovery.** All 85 examples and 46 `.list` files
-   are byte-identical, but a *malformed* source (bad operand, undefined
-   symbol) has never been compared against the original's diagnostics.
+### 5a. Assembler gaps found by fixing #7
 
----
+Making a failed operand an error (instead of silently dropping the
+instruction) exposed forms the clone had never really supported. Every one
+was accepted before only because nothing checked:
 
-## Suggested order
+| form | example | what it is |
+|---|---|---|
+| `10o` | `mov cl, 10o` | octal literal (= 8). `5_sample.asm` |
+| `cs:sym` destination | `mov cs:make_minus, 0` | segment override with no brackets. `Calculator.asm`, `factorial.asm` |
+| `b.`/`w.` prefixes | `mov bl, b.temp`, `mov w. week, al` | emu8086 symbol size prefixes (`HexConvertor.asm`, `datefile.asm`) |
+| late `name = expr` | `size = ($ - buf) / 2` used above | the `=` handler computed an **empty** name when there was no `#`, defining nothing (`cmpsb.asm`) |
+| `dw` symbol holding > 127 | `mov foo, 300` | an unsized symbol destination defaulted to 8-bit (`far_call-2.asm`) |
+| `dd` truncation | `dd 12345678h` | high 16 bits were emitted as zero |
 
-1. `2Eh`/`54h` - smallest possible, matched pair, removes a spurious report.
-2. `INT 10h AH=11h` - one line, turns a wrong diagnostic into a silent no-op.
-3. `INT 10h AH=0C/0D` gate - decide from a run against the original.
-4. `INT 21h AH=57h` - the only meaty one.
-5. `17h` rename, then `0Ch`/`0Dh`, `23h`/`33h`.
-6. Sec. 5 items, starting with exit codes (cheapest to verify, and the current
-   `check_run.py` treats any non-zero exit as failure, so a wrong answer there
-   could mask or invent a failure).
+Now rejected with the original's wording ("undefined variable or over 16
+bits", "overflow! - cannot be evaluated:"). `src/check_asmdiag.py` covers both
+directions: 6 rejection checks and 7 acceptance checks that assert bytes, so
+"assembles" cannot be satisfied by emitting nothing.
