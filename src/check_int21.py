@@ -882,6 +882,86 @@ cname db 'c.txt',0
 oname db 'opener.com',0
 """
 
+# Redirected stdin must survive an exec: the parent takes the first line, the
+# child the next one, and neither is echoed (stdin here is a file, not a
+# console).
+T_EXEC_STDIN = PROLOG + """
+mov ah,3fh
+mov bx,0
+mov cx,6
+mov dx,200h
+int 21h
+mov ax,4b00h
+lea dx,cname
+mov bx,offset pblk
+push ds
+pop es
+int 21h
+mov bp,ax
+mov ah,9
+lea dx,pmsg
+int 21h
+ret
+pblk dw 0
+dd 0
+dd 0
+dd 0
+cname db 'sread.com',0
+pmsg db 'P$'
+"""
+
+# Reads the next line from the inherited stdin and prints it.
+SREAD_ASM = PROLOG + """
+mov ah,3fh
+mov bx,0
+mov cx,6
+mov dx,200h
+int 21h
+mov bx,200h
+add bx,ax
+mov byte ptr [bx],'$'
+mov ah,9
+mov dx,200h
+int 21h
+mov ah,4ch
+mov al,0
+int 21h
+"""
+
+# 3Fh on a redirected handle 0: the bytes are read, not echoed.
+T_STDIN_SILENT = PROLOG + """
+mov ah,3fh
+mov bx,0
+mov cx,3
+mov dx,200h
+int 21h
+mov ah,2
+mov dl,'K'
+int 21h
+ret
+"""
+
+# 0Ah on a redirected stdin: same rule for the buffered line reader.
+T_STDIN_LINE_SILENT = PROLOG + """
+mov ah,0ah
+lea dx,buf
+int 21h
+mov ah,2
+mov dl,'K'
+int 21h
+ret
+buf db 8,0,0,0,0,0,0,0,0
+"""
+
+# 0Bh must say a redirected stream has input waiting, even though the queue is
+# filled lazily.
+T_STDIN_STATUS = PROLOG + """
+mov ah,0bh
+int 21h
+mov bp,ax
+ret
+"""
+
 T_EXEC_TSR = PROLOG + """
 mov ah,4bh
 mov al,0
@@ -1393,6 +1473,29 @@ def main():
         check("exec-child-handles-do-not-leak",
               reg(out, "BX") == 6 and reg(out, "BP") == 0,
               (reg(out, "BX"), reg(out, "BP")))
+
+        # Redirected stdin across an exec: the parent consumes the first line,
+        # the child the second, and a file is never echoed.
+        with open(os.path.join(d, "sread.asm"), "w") as f:
+            f.write(SREAD_ASM)
+        subprocess.run([mue, "-a", "sread.asm", "sread.com"], cwd=d,
+                       capture_output=True, timeout=60)
+        rc, out = run(mue, T_EXEC_STDIN, d, stdin_data=b"first\rsecond\r")
+        txt = guest_text(out).replace("\r", "")
+        check("exec-child-reads-stdin", txt.strip() == "secondP", repr(txt))
+        check("exec-child-stdin-no-echo", "first" not in txt, repr(txt))
+
+        rc, out = run(mue, T_STDIN_SILENT, d, stdin_data=b"abc")
+        txt = guest_text(out).replace("\r", "")
+        check("stdin-redirect-not-echoed", txt.strip() == "K", repr(txt))
+
+        rc, out = run(mue, T_STDIN_LINE_SILENT, d, stdin_data=b"abc\r")
+        txt = guest_text(out).replace("\r", "")
+        check("stdin-line-not-echoed", txt.strip() == "K", repr(txt))
+
+        rc, out = run(mue, T_STDIN_STATUS, d, stdin_data=b"x")
+        check("stdin-status-redirected-ready",
+              (reg(out, "BP") or 0) & 0xFF == 0xFF, reg(out, "BP"))
 
         # A child that leaves through 31h: its AL must reach the 4Bh caller.
         with open(os.path.join(d, "tsr.asm"), "w") as f:

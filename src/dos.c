@@ -87,6 +87,22 @@ static int kb_refill(void)
     return kb_head != kb_tail;
 }
 
+/* Is stdin a terminal?  DOS echoes console input and does not echo a file, so
+ * every read path has to know which it has.  Cached: a run's redirection
+ * cannot change under the guest. */
+static int dos_stdin_console(void)
+{
+    static int on = -1;
+    if (on < 0) {
+#ifdef _WIN32
+        on = _isatty(_fileno(stdin)) ? 1 : 0;
+#else
+        on = isatty(fileno(stdin)) ? 1 : 0;
+#endif
+    }
+    return on;
+}
+
 /* Pop a key, waiting for one when nothing is buffered. */
 static int kb_pop(void)
 {
@@ -361,16 +377,23 @@ static void read_buffered(uint16_t buf_off)
     uint32_t p = seg_off_to_phys(cpu.sr[DS], buf_off);
     int maxlen = peek8(p);
     int i = 0;
+    int echo = dos_stdin_console();        /* a redirected line is not echoed */
     (void)maxlen;
 
     for (;;) {
         int c = kb_pop();
         if (c < 0) break;
-        if (c == '\r' || c == '\n') { dos_putc('\n'); break; }
-        if (c == 8) { if (i > 0) { i--; dos_puts("\b \b"); } continue; }
+        if (c == '\r' || c == '\n') {
+            if (echo) dos_putc('\n');
+            break;
+        }
+        if (c == 8) {
+            if (i > 0) { i--; if (echo) dos_puts("\b \b"); }
+            continue;
+        }
         poke8(p + 2 + (uint32_t)i, (uint8_t)c);
         i++;
-        dos_putc(c);
+        if (echo) dos_putc(c);
         if (i > 250) break;
     }
     poke8(p + 1, (uint8_t)i);
@@ -651,6 +674,8 @@ static void int21(void)
         break;
 
     case 0x01: {                                /* read char with echo */
+        /* A console function: it echoes even when stdin is redirected, which
+         * is what the original does here (check int21-01-reads-in-order). */
         int c = kb_pop();
         if (c < 0) c = 0x1A;
         dos_putc(c);
@@ -688,6 +713,9 @@ static void int21(void)
         break;
 
     case 0x0B:                                  /* check input status */
+        /* A redirected stream is always "ready" until it ends: the queue is
+         * refilled lazily, so an empty queue is not an empty input here. */
+        if (!dos_stdin_console()) kb_refill();
         setAThi(kb_head != kb_tail ? 0xFF : 0x00);
         break;
 
@@ -1090,8 +1118,10 @@ static void int21(void)
         FILE *f;
 
         /* Handle 0 is the console: DOS stops at CR and keeps it in the
-         * buffer, and echoes what it read. */
+         * buffer, and echoes what it read - but only to a console, so a
+         * redirected stream is read silently (FINDINGS 33). */
         if (h == 0) {
+            int echo = dos_stdin_console();
             p = seg_off_to_phys(cpu.sr[DS], cpu.r[DX]);
             n = cpu.r[CX];
             if (p + n > (uint32_t)0x100000) { dos_file_error(5); break; }
@@ -1100,8 +1130,11 @@ static void int21(void)
                 if (c < 0) break;
                 poke8(p + done, (uint8_t)c);
                 done++;
-                if (c == 0x0D) { dos_putc('\n'); break; }
-                dos_putc(c);
+                if (c == 0x0D) {
+                    if (echo) dos_putc('\n');
+                    break;
+                }
+                if (echo) dos_putc(c);
             }
             cpu.flags &= ~F_CF;
             setAX((int)done);               /* 0 = end of input */

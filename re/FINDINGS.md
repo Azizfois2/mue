@@ -2397,3 +2397,52 @@ Getting the tests wrong twice was instructive: `mov ah,4bh` leaves whatever AL
 held (5, from the preceding open), so the handler rightly refused the overlay
 form and the child never ran - the failure looked like a broken PSP rather than
 a broken guest. The `AL=0` form needs `mov ax,4b00h`.
+
+## 33. Standard input is one queue for the whole run, and only a console echoes (IMPLEMENTED)
+
+The keyboard is a single process-global ring (`kb`, `kb_head`, `kb_tail`) that
+the host stream refills lazily in `kb_refill`, one byte at a time as the guest
+runs out. Nothing in the 4Bh path saves or resets it, so an exec'd child
+inherits its parent's stdin position for free: after the parent has consumed
+the first line, the child's 3Fh on handle 0 returns the next one. That is the
+DOS behaviour (`exec-child-reads-stdin`: the parent reads `first`, the child
+prints `second`). It also means a child cannot rewind its parent's input, and
+input the child leaves unread is still there when the parent resumes.
+
+Echo was wrong. Every read path echoed its bytes with `dos_putc`, so a
+redirected stream was copied to stdout the guest never asked for - visible as
+`first`, blank line, `secondsecondP` from a two-line program, where DOS prints only the
+guest's own output. `dos_stdin_console()` caches `isatty` on stdin (with
+`_isatty` under `_WIN32`) and the 3Fh handle-0 loop and the 0Ah line reader
+gate their echo on it; a console still echoes, and 3Fh still stops after CR.
+`int21-01-reads-in-order` keeps AH=01 echoing unconditionally: functions
+01h-0Ch are the console group and the original's arm for 01h echoes whatever
+it reads (FINDINGS 11), so that stays as it was.
+
+0Bh had the matching bug: it reported `kb_head != kb_tail` on a queue that is
+filled lazily, so a redirected stream always looked empty. It now refills
+first when stdin is not a console.
+
+`dos_feed_stdin` (the scripted-text entry point) still has no callers; the
+checks reach stdin through the host stream instead.
+
+### Checks
+
+`exec-child-reads-stdin` (parent reads `first` + CR, execs a child that reads
+`second` + CR and prints it; the suite sees `secondP`), `exec-child-stdin-no-echo`
+(the same run must not contain `first`), `stdin-redirect-not-echoed` (3Fh
+reads `abc`, the guest prints `K`, output is exactly `K`),
+`stdin-line-not-echoed` (same through 0Ah) and
+`stdin-status-redirected-ready` (0Bh on a stream with one byte pending gives
+AL=0xFF).
+
+Verified to bite: forcing `dos_stdin_console()` to return 1 fails all five,
+with the old text `first`, blank line, `secondsecondP` and `abcK`; making `kb_refill`
+return EOF while a child runs (a child with no inherited stdin) fails
+`exec-child-reads-stdin` alone, with the child printing nothing before the
+parent's `P`.
+
+Another assembler trap, found while writing these: `mov bx,offset 200h`
+assembles to zero - `offset` of a numeric literal is not the literal - so the
+child wrote its `'$'` terminator at 0. `mov bx,200h` is an immediate and
+works.
