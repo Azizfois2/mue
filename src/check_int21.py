@@ -347,6 +347,85 @@ f2 db 's2.txt',0
 """
 
 # End of input is not an error: AX=0, CF clear.
+# A scripted stdin that spans three lines and an exec: the parent reads the
+# first line, the child reads the second and the third.  Each 3Fh read stops
+# after CR, so one call is one line and the stream must carry on across 4Bh.
+SL_ASM = PROLOG + """
+mov ah,3fh
+mov bx,0
+mov cx,5
+mov dx,210h
+int 21h
+mov si,ax
+mov ah,3ch
+mov cx,0
+lea dx,f1
+int 21h
+mov bx,ax
+mov ah,40h
+mov cx,si
+mov dx,210h
+int 21h
+mov ah,3eh
+int 21h
+mov ah,3fh
+mov bx,0
+mov cx,5
+mov dx,220h
+int 21h
+mov si,ax
+mov ah,3ch
+mov cx,0
+lea dx,f2
+int 21h
+mov bx,ax
+mov ah,40h
+mov cx,si
+mov dx,220h
+int 21h
+mov ah,3eh
+int 21h
+mov ah,4ch
+mov al,0
+int 21h
+f1 db 'c1.txt',0
+f2 db 'c2.txt',0
+"""
+
+T_SCRIPT_EXEC = PROLOG + """
+mov ah,3fh
+mov bx,0
+mov cx,5
+mov dx,200h
+int 21h
+mov si,ax
+mov ah,3ch
+mov cx,0
+lea dx,f1
+int 21h
+mov bx,ax
+mov ah,40h
+mov cx,si
+mov dx,200h
+int 21h
+mov ah,3eh
+int 21h
+mov ax,4b00h
+lea dx,cname
+mov bx,offset pblk
+push ds
+pop es
+int 21h
+mov bp,ax
+ret
+pblk dw 0
+dd 0
+dd 0
+dd 0
+cname db 'sl.com',0
+f1 db 'p1.txt',0
+"""
+
 # Reads 4 bytes of stdin and writes whatever it got to sc.txt, so the
 # scripted-input checks can look at the text itself and at the count.
 T_STDIN_SCRIPT = PROLOG + """
@@ -1788,6 +1867,24 @@ def main():
               reg(out, "SI"))
         check("stdin-script-beats-host-stream", host("sc.txt") == b"ab",
               host("sc.txt"))
+
+        # One script, several lines, across an exec: the parent takes the first
+        # line and the child reads on from exactly where the parent stopped.
+        with open(os.path.join(d, "sl.asm"), "w") as f:
+            f.write(SL_ASM)
+        subprocess.run([mue, "-a", "sl.asm", "sl.com"], cwd=d,
+                       capture_output=True, timeout=60)
+
+        rc, out = run(mue, T_SCRIPT_EXEC, d,
+                      env={"MUE_STDIN_TEXT": "one\rtwo\rthree"})
+        check("stdin-script-spans-exec", (reg(out, "BP") or 0) == 0,
+              reg(out, "BP"))
+        check("stdin-script-parent-first-line",
+              host("p1.txt") == b"one\r", host("p1.txt"))
+        check("stdin-script-child-second-line",
+              host("c1.txt") == b"two\r", host("c1.txt"))
+        check("stdin-script-child-third-line",
+              host("c2.txt") == b"three", host("c2.txt"))
 
         # Standard output redirected to a file: 09h, 02h and 40h on handle 1
         # all land there, and an exec'd child writes to the same file.

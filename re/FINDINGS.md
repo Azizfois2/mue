@@ -2565,6 +2565,16 @@ Verified to bite: making `kb_refill` read the host unconditionally (the old,
 effectively dead state) fails all four - the count is 0 with no host input and
 4 with `zzzz` on the host.
 
+A script is also one stream across an exec: `stdin-script-spans-exec` gives a
+parent `one\rtwo\rthree` and has it read the first line, then 4Bh a child that
+reads the next two. Since 3Fh stops after CR (sec. 33), each read is one line,
+and the script position carries into the child exactly as the file table does
+(sec. 34): the parent writes `one\r` to `p1.txt`, the child `two\r` and
+`three` to `c1.txt` and `c2.txt`. Verified to bite: calling
+`dos_feed_stdin(NULL)` in the 4Bh path - the child losing the script - fails
+the two child checks while the parent's line still lands, which is what
+distinguishes "the child cannot read" from "the script is wrong".
+
 ## 37. Standard output redirected to a file, and inherited by a child (IMPLEMENTED)
 
 There was no `>`: handle 1 and 2 were hardwired to the screen buffer, so a
