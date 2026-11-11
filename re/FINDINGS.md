@@ -3069,3 +3069,44 @@ be satisfied by emitting nothing.
 
 Gate: `.list` 46/46, roundtrip 44/44, examples 85/85, RUN 85/85, all
 `check_*.py` green.
+
+## 44. INT 21h AH=4Bh EXEC: the original has no arm, so the clone's working
+##     EXEC was a divergence - now opt-in
+
+Section 5 item 4 of GAPS.md was closed by assertion rather than comparison
+("no divergence is observable from a guest"). Checking it properly shows the
+assertion was wrong, and wrong in the flattering direction.
+
+**Evidence that no 4Bh arm exists:**
+
+- `mov ecx,0x4b` appears exactly **once** in the image (`0x54C0B2`). It is
+  followed by `mov [ebp-0x4f0],0xdfff7d` - an unrelated routine, not the
+  AH compare idiom (`mov ecx,N` / `call ds:0x401238` / `cmp [ebp-0x288],al`).
+- emu8086's shipped interrupt reference (`8086_bios_and_dos_interrupts.html`)
+  has no AH=4Bh entry at all.
+- No shipped example calls it. `snake.asm:38` is `left equ 4bh`, an equate.
+
+So a 4Bh call under emu8086 falls through to the generic
+"INT 21h, AH=4Bh - not supported yet." report and execution continues - the
+same funnel as 31h (FINDINGS 43).
+
+**The clone implemented it for real.** It parses a parameter block, loads a
+COM or MZ child, builds a PSP, passes the command tail and environment
+(the checks at `check_int21.py:1998-2010`, `exec-environment`,
+`exec-command-tail`, `exec-nested` all depend on this). A guest calling 4Bh
+would see the child run under the clone and an error return under the
+original. That is a divergence a program can observe, so calling it
+"unobservable" was simply untrue.
+
+**Resolution.** The capability is kept but is off unless `MUE_EXEC=1`, so the
+default reproduces the original. `check_int21.py` now pins *both*: with the
+flag unset the guest must see "not supported" *and* reach the instruction
+after the call (`exec-default-continues`), and with the flag set the child
+must run (`exec-opt-in-runs-child`). Negative control (forcing the branch
+always-on) fails `exec-default-not-supported`.
+
+**Lesson.** "No observable divergence" is a claim that needs the same
+evidence as any other. Here the honest finding was reachable in one grep -
+the arm's absence - and I had written the comfortable conclusion instead.
+When an item is closed by reasoning rather than by decoding or by running
+both implementations, it is not closed.

@@ -971,6 +971,21 @@ static void int21(void)
         break; }
 
     case 0x4B: {                                /* exec a program */
+        /* CLEAR-DIVERGENCE.  The original has no AH=4Bh arm at all: there is
+         * exactly one `mov ecx,0x4b` in the image and it is in an unrelated
+         * routine, no `cmp [ebp-0x288],al` follows it, emu8086's own interrupt
+         * reference does not document AH=4Bh, and no shipped example calls it
+         * (snake.asm's `4bh` is `left equ 4bh`).  So under emu8086 a 4Bh call
+         * hits the generic "not supported yet" report and continues.
+         *
+         * The clone can load and run a child, which is more useful than
+         * emulating the refusal - but it is the clone's behaviour, not the
+         * original's, so it is off unless asked for.  MUE_EXEC=1 turns it on;
+         * the default matches the original. */
+        if (getenv("MUE_EXEC") == NULL || getenv("MUE_EXEC")[0] == 0) {
+            unsupported_ah("INT 21h", ah);
+            break;
+        }
         char name[160], want[160], host[512], path_rec[200];
         FILE *f;
         long n;

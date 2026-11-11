@@ -182,9 +182,17 @@ Each should stay documented so nobody "fixes" it later:
    `[ebp-0x288]` chain, so it falls through to the generic report and the
    guest keeps running. The clone used to halt, silently ending a program the
    original would continue.
-4. **INT 21h AH=4Bh EXEC** - the clone loads and runs a child (a clone-only
-   capability; the original's EXEC was not decoded). No divergence is
-   observable from a guest: the 4Bh caller sees the same registers either way.
+4. ~~INT 21h AH=4Bh EXEC~~ - **resolved: it is a divergence, now opt-in.**
+   Decoded: there is exactly one `mov ecx,0x4b` in the whole image and it sits
+   in an unrelated routine with no `cmp [ebp-0x288],al` after it, so the
+   original has **no 4Bh arm**. emu8086's own interrupt reference does not
+   document AH=4Bh either, and no shipped example calls it (`snake.asm`'s
+   `4bh` is `left equ 4bh`). So under emu8086 a 4Bh call reports
+   "not supported yet" and continues.
+
+   The clone really does load and run a child, which is worth keeping but is
+   **the clone's behaviour, not the original's**. It is therefore off by
+   default (`MUE_EXEC=1` enables it), so the default matches emu8086.
 5. ~~INT 20h / 4Ch exit codes~~ - **verified consistent.** `0x529F53` never
    stores AL; it writes the halt marker (`+0x4C` and `ds:0x621218` = `0xFFFF`)
    and returns. So the original does not propagate AL to the process status,

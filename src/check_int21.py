@@ -34,9 +34,17 @@ def run(mue, src, cwd, stdin_data=None, env=None):
     with open(a, "w") as f:
         f.write(src)
     e = None
+    # 4Bh EXEC is a clone-only capability (FINDINGS 44) and is off by default
+    # so that the default behaviour matches the original, which reports
+    # "not supported" and continues.  The EXEC checks below test that
+    # capability, so they have to ask for it.
+    base = dict(os.environ)
+    base.setdefault("MUE_EXEC", "1")
     if env:
-        e = dict(os.environ)
+        e = dict(base)
         e.update(env)
+    else:
+        e = base
     # stdin is closed unless the check supplies one: a guest that waits for a
     # keystroke must hit end-of-input, never block the suite.
     if stdin_data is None:
@@ -723,6 +731,26 @@ dd 0
 dw 0
 dw 0
 oname db 'ovl.exe',0
+"""
+
+# 4Bh with the clone-only capability switched off: the original reports
+# "not supported" and continues, so the guest must reach `mov bp,77h`.
+T_EXEC_DEFAULT = PROLOG + """
+mov ah,9
+lea dx,pp
+int 21h
+mov ah,4bh
+mov al,0
+lea dx,cname
+int 21h
+mov bp,77h
+mov ah,9
+lea dx,pq
+int 21h
+ret
+cname db 'child.com',0
+pp db 'parent$'
+pq db 'after$'
 """
 
 T_EXEC = PROLOG + """
@@ -1993,6 +2021,20 @@ def main():
         check("exec-reports-child-exit-code",
               reg(out, "BP") == 5, reg(out, "BP"))
         check("exec-error-answers", reg(out, "BX") == 0, reg(out, "BX"))
+
+        # 4Bh is a CLONE-ONLY capability (FINDINGS 44): the original has no
+        # arm for it, so it reports "not supported" and carries on.  Both
+        # behaviours are checked, so neither can drift unnoticed.
+        rc, out = run(mue, T_EXEC_DEFAULT, d, env={"MUE_EXEC": ""})
+        # The refusal is a host diagnostic on stderr, not guest output, so the
+        # combined stream is what carries it.
+        check("exec-default-not-supported",
+              "not supported" in out, repr(out[-120:]))
+        check("exec-default-continues", reg(out, "BP") == 0x77,
+              reg(out, "BP"))
+        rc, out = run(mue, T_EXEC_DEFAULT, d, env={"MUE_EXEC": "1"})
+        check("exec-opt-in-runs-child",
+              "child" in guest_text(out), repr(guest_text(out)))
 
         # Nested exec: the grandchild's exit code has to come back two levels.
         for nm, src in (("c1", C1_ASM), ("c2", C2_ASM), ("c3", C3_ASM)):
