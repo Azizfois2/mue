@@ -31,6 +31,30 @@ static void dump_state(void)
     printf("instructions executed: %ld\n", cpu.icount);
 }
 
+static void load_boot(const uint8_t *p, int n)
+{
+    /* A "#make_boot#" program is a boot sector: emu8086 puts it at 0000:7C00
+     * with CS=DS=ES=SS=0000, which is what `org 7c00h` is for.  Serving it
+     * as a .COM at 0100 instead makes every absolute address in the program
+     * point 0x7B00 bytes too low. */
+    memset(MEM, 0, sizeof(MEM));
+    if (n > 0x10000 - 0x7C00) n = 0x10000 - 0x7C00;
+    memcpy(MEM + 0x7C00, p, (size_t)n);
+    cpu_reset();
+    cpu.sr[CS] = cpu.sr[DS] = cpu.sr[ES] = cpu.sr[SS] = 0x0000;
+    cpu.r[SP]  = 0xFFFE;
+    poke16(seg_off_to_phys(cpu.sr[SS], 0xFFFE), 0x0000);
+    cpu.ip     = 0x7C00;
+    cpu.phys   = seg_off_to_phys(cpu.sr[CS], cpu.ip);
+    dos_boot_psp();
+    {
+        const char *e = getenv("MUE_STDIN_TEXT");
+        const char *o = getenv("MUE_STDOUT_FILE");
+        if (e) dos_feed_stdin(e);
+        if (o) dos_redirect_stdout(o);
+    }
+}
+
 static void load_com(const uint8_t *p, int n)
 {
     memset(MEM, 0, sizeof(MEM));
@@ -120,7 +144,8 @@ int main(int argc, char **argv)
             return 1;
         }
         printf("assembled %d bytes\n", outlen);
-        load_com(out, outlen);
+        if (asm_last_is_boot()) load_boot(out, outlen);
+        else                    load_com(out, outlen);
         free(out);
         cpu_run(2000000);
         dos_flush(stdout);

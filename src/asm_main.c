@@ -471,9 +471,17 @@ static int encode_insn(asm_t *a, const char *mnem_in, char **ops, int nops)
                 int okc, okd;
                 size_t sl = (size_t)(colon - ops[0]);
                 uint16_t segv, offv;
+                /* `far es:[bx]` starts with a segment override and is also a
+                 * plain unqualified target like `[bx]`, i.e. a memory operand
+                 * rather than a seg:off literal. */
+                if (strchr(ops[0], '['))
+                    goto not_a_far_literal;
                 if (sl >= sizeof(segpart)) sl = sizeof(segpart) - 1;
                 memcpy(segpart, ops[0], sl);
                 segpart[sl] = 0;
+                if (!strcmp(segpart, "es") || !strcmp(segpart, "cs") ||
+                    !strcmp(segpart, "ss") || !strcmp(segpart, "ds"))
+                    goto not_a_far_literal;
                 segv = (uint16_t)eval_expr(a, segpart, &okc);
                 offv = (uint16_t)eval_expr(a, colon + 1, &okd);
                 if (!okc || !okd) {
@@ -490,13 +498,45 @@ static int encode_insn(asm_t *a, const char *mnem_in, char **ops, int nops)
                 emit16(a, segv);
                 return 1;
             }
+          not_a_far_literal: ;
+        }
+
+        /* A memory operand has to be recognised BEFORE eval_expr():
+         * `es:[bx]` evaluates to 0 without complaint, and the old order
+         * therefore emitted `call 0` (E8 0000) instead of `call far
+         * es:[bx]` (26 FF 1F).  examples/far_call.asm is written exactly
+         * that way. */
+        {
+            operand_t t;
+            const char *opt = ops[0];
+            int pr, is_far;
+            /* `call far es:[bx]` / `call far [bx]` name the distance as part
+             * of the operand, so record it and drop it before
+             * parse_operand() has to make sense of the rest.  Without this
+             * `call far [bx]` assembled as a near FF /2, which is what the
+             * clone used to do wrong. */
+            is_far = 0;
+            while (!strncmp(opt, "far ", 4) || !strncmp(opt, "far\t", 4)) {
+                is_far = 1; opt += 4;
+            }
+            pr = parse_operand(a, opt, &t);
+            if (pr && t.kind == OP_MEM && (is_far || strchr(opt, '['))) {
+                /* A bare `[addr]` is a jump *through* memory, and the
+                 * original always encodes the far form there; only an
+                 * explicit `call [bx]` without `far` stays near. */
+                int reg = is_far ? (m[0] == 'c' ? 3 : 5) : (m[0] == 'c' ? 2 : 4);
+                emit_seg_prefix(a, &t);
+                emit8(a, 0xFF);
+                emit_modrm(a, &t, reg, 16);
+                return 1;
+            }
         }
 
         v = eval_expr(a, ops[0], &ok);
         if (!ok) {
             operand_t t;
             if (!parse_operand(a, ops[0], &t)) { asm_error(a, "bad target"); return 0; }
-            if (t.kind == OP_REG8 || t.kind == OP_REG16 || t.kind == OP_MEM) {
+            if (t.kind == OP_REG8 || t.kind == OP_REG16) {
                 if (!strcmp(m, "call")) { emit_seg_prefix(a, &t); emit8(a, 0xFF);
                     emit_modrm(a, &t, 2, 16); }
                 else                    { emit_seg_prefix(a, &t); emit8(a, 0xFF);
@@ -1192,6 +1232,9 @@ void process_line(asm_t *a, char *raw, int lineno)
             return;
         }
         if (!strcmp(word, ".model")) { a->saw_model = 1; return; }
+        /* `#make_boot#` marks a boot sector.  emu8086 reads it before it treats
+         * lines as assembly, so the whole line is just the marker. */
+        if (strstr(s, "#make_boot#")) { a->is_boot = 1; return; }
         if (!strcmp(word, ".stack")) {
             /* `.stack 100h` reserves the stack segment at the start of the
              * image; emu8086 fills it with 0x54 ('T').  The segment is laid
@@ -1258,6 +1301,15 @@ void process_line(asm_t *a, char *raw, int lineno)
 int asm_saw_end = 0;
 static int asm_last_saw_model = 0;
 static int asm_last_saw_org   = 0;
+static int asm_last_is_boot_v = 0;
+
+/* A source carrying `#make_boot#` is a boot sector: it is loaded at 0000:7C00
+ * rather than as a .COM at 0100, and examples/timer.asm, robot.asm and
+ * far_call.asm all rely on that. */
+int asm_last_is_boot(void)
+{
+    return asm_last_is_boot_v;
+}
 static int asm_last_stack     = 0;
 static int asm_last_cstart    = 0;
 static int asm_last_reloc     = -1;
@@ -1482,6 +1534,7 @@ int asm_assemble_file(const char *path, int want_com, uint8_t **out, int *outlen
     *outlen = a.outlen;
     asm_last_saw_model = a.saw_model;
     asm_last_saw_org   = a.saw_org;
+    asm_last_is_boot_v = a.is_boot;
     asm_last_stack     = a.stack_size;
     asm_last_cstart    = a.code_start;
     asm_last_reloc     = a.reloc_off > 0 ? a.reloc_off : -1;

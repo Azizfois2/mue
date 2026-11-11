@@ -372,6 +372,18 @@ static h_t OP[256];
 #define H(n, ...) static void h_##n(void) { __VA_ARGS__; }
 #define EMPTY(n)   static void h_##n(void) { cpu.halted = 1; cpu.exit_code = -2; }
 
+/* An opcode byte the original has no arm for is reported and then stepped
+ * over: its core logs "unknown opcode skipped: <n> - not 8086 instruction -
+ * not supported yet." (0x4467EC/0x446820 at 0x516E85/0x516E96) and returns,
+ * so the guest carries on.  That is observable, not assumed: 11 shipped
+ * examples contain PUSHA/POPA, which the original's own assembler encodes as
+ * 60/61 (0x4B18BB -> mov ecx,0x60) even though its emulator refuses to run
+ * them, and those examples do produce output in emu8086. */
+static void h_skip_unknown(int op);
+
+/* ENTER/LEAVE have no arm either, same funnel. */
+#define REJECT_80186(n) static void h_##n(void) { h_skip_unknown(0x##n); }
+
 /* 00-3F : the eight ALU operations in their six standard shapes */
 #define ALU_BLOCK(base, op) \
     H(a##base##0, do_alu_rm_r(op, 8)); \
@@ -389,6 +401,66 @@ ALU_BLOCK(20, ALU_AND)
 ALU_BLOCK(28, ALU_SUB)
 ALU_BLOCK(30, ALU_XOR)
 ALU_BLOCK(38, ALU_CMP)
+
+/* 27/2F/37/3F : BCD adjust after an 8-bit add/subtract.
+ *
+ * DAA/DAS test the low nibble and CF/AF; AAA/AAS also clear the high nibble
+ * because they work on ASCII digits.  All four leave SF/ZF/PF/OF undefined,
+ * so only CF and AF are computed here.  Every shipped example that uses them
+ * (bcd_aaa, bcd_aas, 0_sample_add_huge_numbers) prints the decimal result,
+ * so AX and the carry have to come out right. */
+H(aaa, {                                                  /* 37 */
+    uint8_t al = (uint8_t)(cpu.r[AX] & 0xFF);
+    if ((al & 0x0F) > 9 || (cpu.flags & F_AF)) {
+        al = (uint8_t)(al + 6);
+        cpu.r[AX] = (uint16_t)((cpu.r[AX] & 0xFF00) | al);
+        cpu.r[AX] = (uint16_t)(cpu.r[AX] + 0x0100);      /* AH += 1 */
+        cpu.flags |= F_AF | F_CF;
+    } else {
+        cpu.flags &= ~(F_AF | F_CF);
+    }
+    cpu.r[AX] = (uint16_t)(cpu.r[AX] & 0xFF0F);          /* AL &= 0x0F */ });
+H(aas, {                                                  /* 3F */
+    uint8_t al = (uint8_t)(cpu.r[AX] & 0xFF);
+    if ((al & 0x0F) > 9 || (cpu.flags & F_AF)) {
+        al = (uint8_t)(al - 6);
+        cpu.r[AX] = (uint16_t)((cpu.r[AX] & 0xFF00) | al);
+        cpu.r[AX] = (uint16_t)(cpu.r[AX] - 0x0100);      /* AH -= 1 */
+        cpu.flags |= F_AF | F_CF;
+    } else {
+        cpu.flags &= ~(F_AF | F_CF);
+    }
+    cpu.r[AX] = (uint16_t)(cpu.r[AX] & 0xFF0F); });
+H(daa, {                                                  /* 27 */
+    uint8_t al = (uint8_t)(cpu.r[AX] & 0xFF);
+    int carry = (cpu.flags & F_CF) != 0;
+    if ((al & 0x0F) > 9 || (cpu.flags & F_AF)) {
+        al = (uint8_t)(al + 6);
+        cpu.flags |= F_AF;
+    }
+    if (al > 0x9F || carry) {
+        al = (uint8_t)(al + 0x60);
+        cpu.flags |= F_CF;
+    }
+    cpu.r[AX] = (uint16_t)((cpu.r[AX] & 0xFF00) | al);
+    cpu.flags = (uint16_t)((cpu.flags & ~(F_SF | F_ZF | F_PF))
+                           | (al & 0x80 ? F_SF : 0)
+                           | (al == 0 ? F_ZF : 0)); });
+H(das, {                                                  /* 2F */
+    uint8_t al = (uint8_t)(cpu.r[AX] & 0xFF);
+    int carry = (cpu.flags & F_CF) != 0;
+    if ((al & 0x0F) > 9 || (cpu.flags & F_AF)) {
+        al = (uint8_t)(al - 6);
+        cpu.flags |= F_AF;
+    }
+    if (al > 0x9F || carry) {
+        al = (uint8_t)(al - 0x60);
+        cpu.flags |= F_CF;
+    }
+    cpu.r[AX] = (uint16_t)((cpu.r[AX] & 0xFF00) | al);
+    cpu.flags = (uint16_t)((cpu.flags & ~(F_SF | F_ZF | F_PF))
+                           | (al & 0x80 ? F_SF : 0)
+                           | (al == 0 ? F_ZF : 0)); });
 
 /* 40-4F INC/DEC r16  -- range-addressed in the original, so handlers are
  * generated per register but wired as contiguous blocks in the table. */
@@ -442,12 +514,45 @@ H(s1f, pop_sr(DS));
  * has to follow the new CS, like every other control transfer. */
 H(s0f, { sr_set(CS, pop16()); cpu.phys = seg_off_to_phys(cpu.sr[CS], cpu.ip); });
 
-/* 60-6F : 80186+ forms, rejected to match the original */
-#define REJECT_80186(n) static void h_##n(void) { cpu.halted = 1; cpu.exit_code = -2; }
-REJECT_80186(60) REJECT_80186(61) REJECT_80186(62) REJECT_80186(63)
-REJECT_80186(64) REJECT_80186(65) REJECT_80186(66) REJECT_80186(67)
-REJECT_80186(68) REJECT_80186(69) REJECT_80186(6a) REJECT_80186(6b)
-REJECT_80186(6c) REJECT_80186(6d) REJECT_80186(6e) REJECT_80186(6f)
+/* 60-6F : 80186+ forms.  CONFIRMED from the original: its assembler does
+ * accept PUSHA and emits 60 (0x4B18BB -> mov ecx,0x60), but its CPU core
+ * (FUN_004eff00) has no arm for it and falls into the shared funnel that
+ * reports "unknown opcode skipped: <n> - not 8086 instruction - not
+ * supported yet." (0x516E85/0x516E96/0x516E97).  So the program keeps
+ * running - the byte is skipped, not fatal - which is what 11 shipped
+ * examples rely on (fahrenheit, print_AX, mouse, 3_sample ...). */
+#define SKIP_80186(n) static void h_6_##n(void) { h_skip_unknown(0x##n); }
+SKIP_80186(60) SKIP_80186(61) SKIP_80186(62) SKIP_80186(63)
+SKIP_80186(64) SKIP_80186(65) SKIP_80186(66) SKIP_80186(67)
+SKIP_80186(68) SKIP_80186(69) SKIP_80186(6a) SKIP_80186(6b)
+SKIP_80186(6c) SKIP_80186(6d) SKIP_80186(6e) SKIP_80186(6f)
+
+static void h_skip_unknown(int op)
+{
+    fprintf(stderr,
+            "unknown opcode skipped: %02X - not 8086 instruction "
+            "- not supported yet.\n", op);
+    fflush(stderr);
+}
+
+/* Keep the old names so every reference and comment above still reads the
+ * same way. */
+#define h_60 h_6_60
+#define h_61 h_6_61
+#define h_62 h_6_62
+#define h_63 h_6_63
+#define h_64 h_6_64
+#define h_65 h_6_65
+#define h_66 h_6_66
+#define h_67 h_6_67
+#define h_68 h_6_68
+#define h_69 h_6_69
+#define h_6a h_6_6a
+#define h_6b h_6_6b
+#define h_6c h_6_6c
+#define h_6d h_6_6d
+#define h_6e h_6_6e
+#define h_6f h_6_6f
 
 /* Explicit table: the opcode table used to compute h_60 + (i - 0x60), which
  * relies on the linker keeping those functions in order and leaves all but
@@ -770,6 +875,9 @@ static void op_table_init(void)
     SET(0x28, a280); SET(0x29, a281); SET(0x2a, a282); SET(0x2b, a283); SET(0x2c, a284); SET(0x2d, a285);
     SET(0x30, a300); SET(0x31, a301); SET(0x32, a302); SET(0x33, a303); SET(0x34, a304); SET(0x35, a305);
     SET(0x38, a380); SET(0x39, a381); SET(0x3a, a382); SET(0x3b, a383); SET(0x3c, a384); SET(0x3d, a385);
+
+    /* the four BCD adjust opcodes */
+    SET(0x27, daa); SET(0x2f, das); SET(0x37, aaa); SET(0x3f, aas);
 
     SET(0x40, r400); SET(0x41, r401); SET(0x42, r402); SET(0x43, r403);
     SET(0x44, r404); SET(0x45, r405); SET(0x46, r406); SET(0x47, r407);

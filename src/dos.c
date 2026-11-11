@@ -18,6 +18,7 @@
 #include <direct.h>
 #include <fcntl.h>
 #include <io.h>
+#include <windows.h>
 #define DOS_IREAD   _S_IREAD
 #define DOS_IWRITE  _S_IWRITE
 #define dos_chmod   _chmod
@@ -188,6 +189,10 @@ void dos_flush(FILE *f)
 
 /* ---- helpers --------------------------------------------------------- */
 static void setAX(int v) { cpu.r[0] = (uint16_t)v; }
+
+/* Declared here because INT 21h's own fail arm needs it long before the
+ * definition further down next to the video and floppy services. */
+static void unsupported_ah(const char *service, int ah);
 static void setAThi(int v) { cpu.r[0] = (uint16_t)((cpu.r[0] & 0xFF00) | (v & 0xFF)); }
 
 #define DOS_DRIVES 27
@@ -552,10 +557,44 @@ static void dos_jft_fill(uint16_t psp)
 
 /* The program `mue` runs has a PSP too.  There is no COMMAND.COM above it, so
  * its parent segment points at itself.  main.c calls this once per load. */
+/* CONFIRMED: emu8086 ships a real interrupt vector table in its INT_VECT
+ * file and a stub block in BIOS_ROM at F400:0100.  Every vector except 19h
+ * points at a three-instruction thunk inside it:
+ *
+ *     FFFF        pushf
+ *     CD NN       int NNh
+ *     CF          iret        (retf, so it suits a far call too)
+ *
+ * with the INT 10h vector at F400:0190, INT 21h at F400:0200 and so on.
+ * That is why a guest may `call far es:[40h]` instead of using `int` -
+ * examples/far_call.asm does exactly that.  The clone installs the same
+ * shape so such a jump lands on a thunk that reaches dos_interrupt(). */
+#define IVT_STUB_SEG 0xF400
+static void dos_boot_ivt(void)
+{
+    int n;
+    for (n = 0; n < 256; n++) {
+        uint32_t v = (uint32_t)n * 4;
+        uint32_t thunk = ((uint32_t)IVT_STUB_SEG << 4) + 0x100 + (uint32_t)n * 16;
+        if (n == 0x19) {                        /* a reboot is not callable */
+            poke16(v, 0x0000);
+            poke16(v + 2, 0xFFFF);
+            continue;
+        }
+        poke8 (thunk + 0, 0x9C);                /* pushf  */
+        poke8 (thunk + 1, 0xCD);                /* int    */
+        poke8 (thunk + 2, (uint8_t)n);
+        poke8 (thunk + 3, 0xCF);                /* iret   */
+        poke16(v, (uint16_t)(0x100 + n * 16));
+        poke16(v + 2, IVT_STUB_SEG);
+    }
+}
+
 void dos_boot_psp(void)
 {
     uint32_t base = (uint32_t)DOS_BOOT_PSP << 4;
 
+    dos_boot_ivt();
     dos_psp = DOS_BOOT_PSP;
     poke16(base + 0x16, DOS_BOOT_PSP);
     /* PSP:0x02 is the first paragraph past the program's block, and a guest
@@ -730,6 +769,7 @@ static unsigned dos_img16(const uint8_t *p)
 static void int21(void)
 {
     int ah = (cpu.r[0] >> 8) & 0xFF;
+    static int printer_reported;
 
     switch (ah) {
     case 0x00:                                  /* terminate */
@@ -768,6 +808,20 @@ static void int21(void)
         if (c < 0) c = 0x1A;
         setAThi(c);
         break; }
+
+    case 0x05:                                  /* printer output, DL */
+        /* Original: 05 -> 0x5E1E70, which raises "virtual printer does not
+         * respond." (0x452204 at 0x5E1FEF) and returns AL=0x90 so a guest
+         * that polls keeps going.  There is no printer here, and a spool
+         * file nobody reads would be a fiction, so the clone prints the same
+         * refusal and answers AL=0x90 (FINDINGS 5.1). */
+        if (printer_reported == 0) {
+            printer_reported = 1;
+            fprintf(stderr, "virtual printer does not respond.\n");
+            fflush(stderr);
+        }
+        setAThi(0x90);
+        break;
 
     case 0x09:                                  /* print $-string */
         print_dollar_string();
@@ -1426,6 +1480,52 @@ static void int21(void)
         cpu.flags &= ~F_CF;
         break; }
 
+    case 0x44: {                                /* device I/O control (AL) */
+        /* Only the subfunctions that are meaningful for a console or an
+         * ordinary file: 00/01 get/set device information, 06/07 get/set
+         * input status, 08/09 test-ability, 0A test-ability.  Anything else
+         * is reported through 01 (invalid function). */
+        int sub = cpu.r[AX] & 0xFF;
+        int h   = cpu.r[BX];
+        int dev = (h == 0 || h == 1 || h == 2);
+
+        switch (sub) {
+        case 0x00:                              /* get device information */
+            /* bit7 = character device, bit0 = stdin, bit1 = stdout, bit2 =
+             * CON, bit5 = not binary, so a console handle answers 0x80D3 and
+             * a disk file answers 0x0000. */
+            cpu.r[DX] = dev ? (uint16_t)(0x80D3) : 0;
+            setAX(0);
+            cpu.flags &= ~F_CF;
+            break;
+        case 0x01:                              /* set device information */
+            setAX(0);
+            cpu.flags &= ~F_CF;
+            break;
+        case 0x06: case 0x07:                   /* input status */
+            if (!dev) { dos_file_error(6); break; }
+            if (!dos_stdin_console()) kb_refill();
+            setAThi(kb_head != kb_tail ? 0xFF : 0x00);
+            cpu.r[DX] = 0;
+            cpu.flags &= ~F_CF;
+            break;
+        case 0x08: case 0x0A:                   /* is the handle removable */
+            if (!dev) { dos_file_error(6); break; }
+            setAX(0);
+            cpu.flags &= ~F_CF;
+            break;
+        case 0x09:                              /* is it a remote device */
+            if (!dev) { dos_file_error(6); break; }
+            cpu.r[DX] = 0;                     /* local */
+            setAX(0);
+            cpu.flags &= ~F_CF;
+            break;
+        default:
+            dos_file_error(1);                  /* invalid function */
+            break;
+        }
+        break; }
+
     case 0x43: {                                /* get/set attributes (AL) */
         char name[128];
         struct stat st;
@@ -1502,6 +1602,10 @@ static void int21(void)
         break; }
 
     default:
+        /* Original: an AH with no arm falls through the whole compare chain
+         * into the same "not supported yet" report the other services use
+         * (FINDINGS 30), leaving the registers alone and returning. */
+        unsupported_ah("INT 21h", ah);
         break;
     }
 }
@@ -1518,31 +1622,52 @@ static void int21(void)
  * updates its cell, so AH=08 reports what AH=09/0A/0E/13h put there. */
 #define VIDEO_COLS 80
 #define VIDEO_ROWS 25
-static int cur_row, cur_col;
+#define VIDEO_PAGES 8                  /* mode 3 reserves 8 text pages */
+#define VIDEO_PAGE_BYTES 4096          /* B800:0000 + page*4096 */
+static int cur_row, cur_col, cur_page;
+static int gfx_mode;                   /* 0 = text, 1 = CGA 320x200x4 */
 
-/* CGA order: even byte = character, odd byte = attribute. */
-static unsigned char vram[VIDEO_COLS * VIDEO_ROWS * 2];
+/* CGA order: even byte = character, odd byte = attribute.  One array per
+ * page, so AH=05 can select a page and the guest can fill 0xB800 windows
+ * itself. */
+static unsigned char vram[VIDEO_PAGES][VIDEO_PAGE_BYTES];
 static int vram_ready;
 
 static void vram_init(void)
 {
-    int i;
+    int p, i;
     if (vram_ready) return;
     vram_ready = 1;
-    for (i = 0; i < VIDEO_COLS * VIDEO_ROWS; i++) {
-        vram[i * 2]     = ' ';              /* mode 3 clears to blank/0x07 */
-        vram[i * 2 + 1] = 0x07;
-    }
+    for (p = 0; p < VIDEO_PAGES; p++)
+        for (i = 0; i < VIDEO_COLS * VIDEO_ROWS; i++) {
+            vram[p][i * 2]     = ' ';       /* mode 3 clears to blank/0x07 */
+            vram[p][i * 2 + 1] = 0x07;
+        }
 }
 
-/* Cell at row/col.  A guest can set the cursor out of range through AH=02, so
- * clamp rather than wander off the array. */
-static unsigned char *vram_cell(int row, int col)
+/* Text pages start at page*4096 in a 32K window: page 0 at B800:0000,
+ * page 1 at +4096, and so on.  The guest writes those windows directly, so
+ * the model reads and writes the same offsets the guest does. */
+static unsigned char *vram_page_base(int page)
+{
+    if (page < 0) page = 0; else if (page >= VIDEO_PAGES) page = VIDEO_PAGES - 1;
+    return vram[page];
+}
+
+/* Cell at row/col on the given page (the clone's current page).  A guest can
+ * set the cursor out of range through AH=02, so clamp rather than wander off
+ * the array. */
+static unsigned char *vram_cell_page(int page, int row, int col)
 {
     vram_init();
     if (row < 0) row = 0; else if (row >= VIDEO_ROWS) row = VIDEO_ROWS - 1;
     if (col < 0) col = 0; else if (col >= VIDEO_COLS) col = VIDEO_COLS - 1;
-    return &vram[(row * VIDEO_COLS + col) * 2];
+    return &vram_page_base(page)[(row * VIDEO_COLS + col) * 2];
+}
+
+static unsigned char *vram_cell(int row, int col)
+{
+    return vram_cell_page(cur_page, row, col);
 }
 
 /* AH=06/07: blank `lines` rows of the window (0 = all of it), shifting the
@@ -1615,7 +1740,45 @@ static void int10_write_string_reject(const char *why)
  * dispatcher (FINDINGS 24.2).  Notably these paths do NOT stop the machine. */
 static void unsupported_ah(const char *service, int ah)
 {
+    /* On stderr so a guest's own output stays byte-exact on stdout, but
+     * flushed on its own so a caller reading them combined (and a person
+     * watching) sees the report in the order it happened. */
     fprintf(stderr, "%s, AH=%02Xh - not supported yet.\n", service, ah);
+    fflush(stderr);
+}
+
+/* Mode 13h (VGA 320x200x256) linear: one byte per pixel, 320 bytes a row,
+ * 64000 bytes, at A000:0000.  Stored in its own buffer because it does not
+ * fit a text page and does not overlap B800. */
+static unsigned char vga13[64000];
+
+/* AH=0Ch/0Dh: CGA 320x200 pixel store/fetch.  In that mode each byte covers
+ * four pixels, 80 bytes per row, 8000 bytes per page, and pages are 8K apart
+ * inside the B800 window.  Returns -1 when the mode is not 320x200, which is
+ * what the original reports as unsupported.  colour < 0 reads instead. */
+static int cga_pixel(int page, int x, int y, int colour)
+{
+    unsigned char *base;
+    unsigned char *p;
+    int ofs, shift, old;
+
+    if (x < 0 || x >= 320 || y < 0 || y >= 200) return -1;
+
+    if (gfx_mode == 2) {                        /* mode 13h, one byte/pixel */
+        if (colour < 0) return vga13[y * 320 + x];
+        vga13[y * 320 + x] = (unsigned char)colour;
+        return 0;
+    }
+    if (gfx_mode != 1) return -1;
+    if (page < 0 || page >= 2) page = 0;
+    base = vram_page_base(page);
+    ofs   = y * 80 + (x >> 2);
+    shift = (3 - (x & 3)) * 2;
+    p     = &base[ofs];
+    old   = (*p >> shift) & 3;
+    if (colour < 0) return old;
+    *p = (unsigned char)((*p & ~(3 << shift)) | ((colour & 3) << shift));
+    return old;
 }
 
 static void int10(void)
@@ -1624,6 +1787,17 @@ static void int10(void)
 
     switch (ah) {
     case 0x00:                                  /* set video mode */
+        /* Only mode is tracked, not the full mode table: mode 4/5 put the
+         * clone in the CGA 320x200 four-colour model that AH=0C/0D address,
+         * anything else is text. */
+        /* Mode 13h is VGA, not CGA: 320x200x256 means one byte a pixel. */
+        switch (cpu.r[AX] & 0xFF) {
+        case 0x04: case 0x05: gfx_mode = 1; break;   /* CGA 4-colour */
+        case 0x06: case 0x13: gfx_mode = 2; break;   /* one byte a pixel */
+        default:              gfx_mode = 0; break;   /* text */
+        }
+        cur_page = 0;
+        cur_row = cur_col = 0;
         break;
     case 0x01:                                  /* set cursor shape */
         break;
@@ -1687,6 +1861,25 @@ static void int10(void)
             else if (c == 0x08) { if (cur_col > 0) cur_col--; }
             else                                  cursor_advance_cols(1);
         }
+        break;
+    case 0x0C: case 0x0D:                       /* write / read pixel */
+        {
+            int color = cpu.r[AX] & 0xFF;
+            int page  = (cpu.r[3] >> 8) & 0xFF;   /* BH */
+            int y     = cpu.r[CX];                /* row */
+            int x     = cpu.r[DX];                /* column */
+            if (cga_pixel(page, x, y, ah == 0x0C ? color : -1) < 0)
+                unsupported_ah("INT 10h", ah);
+        }
+        break;
+    case 0x05:                                  /* select active page */
+        cur_page = cpu.r[AX] & 0xFF;
+        if (cur_page >= VIDEO_PAGES) cur_page = VIDEO_PAGES - 1;
+        break;
+    case 0x10:                                  /* palette (mode 4 only) */
+        /* AL=0 set border, 1 set palette (BL), 2 set all, 3 toggle blink.
+         * The clone models mode 3 only, so these change nothing visible; the
+         * point is that a guest which calls them keeps running. */
         break;
     case 0x0F:                                  /* get video mode */
         cpu.r[0] = (uint16_t)((cpu.r[0] & 0x00FF) | (0x03 << 8));
@@ -1871,6 +2064,45 @@ static void int1a(void)
 }
 
 /* ---- dispatcher ------------------------------------------------------ */
+/* INT 15h AH=86h - wait a BCD-free interval in microseconds.
+ *
+ * CONFIRMED from the original (0x524112): ticks = DX + CX*0x10000
+ * (imul eax,eax,0x10000 at 0x52421D), then divided by 1000.0 and handed to
+ * Sleep(), and the arm clears CF/AH on a successful wait.  The clone does
+ * actually sleep, because a guest that asks for one second expects one, and
+ * examples/timer.asm loops on `jc stop` after every call - answering with
+ * CF set would end it after the first character. */
+static void int15(void)
+{
+    int ah = (cpu.r[AX] >> 8) & 0xFF;
+
+    cpu.flags &= ~F_CF;
+    if (ah == 0x86) {
+        uint32_t ticks = cpu.r[DX] + ((uint32_t)cpu.r[CX] << 16);
+        uint32_t ms = ticks / 1000;
+        /* The clone really waits, because a guest asking for one second
+         * expects one (examples/timer counts its characters).  Two things
+         * keep that from being a trap: the wait is capped, and MUE_NOSLEEP
+         * turns it off entirely, which the example sweep needs because
+         * traffic_lights.asm loops on five-second delays. */
+        if (getenv("MUE_NOSLEEP")) ms = 0;
+        if (ms > 1000) ms = 1000;
+#ifdef _WIN32
+        if (ms) Sleep(ms);
+#else
+        if (ms) usleep((useconds_t)ms * 1000);
+#endif
+        setAThi(0);
+        return;
+    }
+    if (ah == 0x00 || ah == 0x01 || ah == 0x91 || ah == 0x90) {
+        setAThi(0);
+        return;
+    }
+    cpu.flags |= F_CF;
+    setAThi(0x86);                          /* function not supported */
+}
+
 /* Returns 1 if the interrupt was serviced here, 0 to forward to the IVT. */
 int dos_interrupt(int n)
 {
@@ -1879,10 +2111,18 @@ int dos_interrupt(int n)
     case 0x10: int10(); return 1;
     case 0x11: cpu.r[0] = 0x0001; return 1;   /* equipment list */
     case 0x12: cpu.r[0] = 0x0280; return 1;   /* conventional memory size */
-    case 0x16: int16(); return 1;
+    case 0x15: int15(); return 1;    case 0x16: int16(); return 1;
     case 0x17: setAThi(0x90); return 1;        /* printer not ready */
     case 0x1A: int1a(); return 1;
-    case 0x19: return 0;                /* reboot: unsupported */
+    case 0x19:                          /* reboot */
+        /* CONFIRMED (0x525549-0x525581): the arm writes 0xFFFF to the
+         * register block's +0x4C word and to ds:0x621218, which is the halt
+         * marker the run loop tests, then logs "restart interrupted...".
+         * So a boot program that has finished (examples/timer ends with
+         * int 19h) stops instead of running into whatever follows. */
+        cpu.halted = 1;
+        cpu.exit_code = 0;
+        return 1;
     case 0x20:                          /* terminate */
         dos_exit_requested = 1;
         cpu.halted = 1;

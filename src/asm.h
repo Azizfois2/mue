@@ -55,6 +55,7 @@ typedef struct {
     int      saw_org;      /* an ORG directive was seen      */
     int      saw_code;     /* ".code" already aligned the ip   */
     int      saw_model;    /* a .model directive was seen (EXE target) */
+    int      is_boot;      /* `#make_boot#` seen: load at 0000:7C00   */
     int      stack_size;   /* bytes reserved by `.stack N` (0 = none) */
     int      reloc_off;    /* offset of the `mov ax,@data` immediate  */
     int      code_start;   /* outlen when .code began (EXE layout)    */
@@ -98,6 +99,7 @@ int  asm_assemble_file(const char *path, int want_com, uint8_t **out, int *outle
 /* 1 if the last asm_assemble_file() source declared `.model`, i.e. it targets
  * an MZ EXE rather than a flat .COM image. */
 int  asm_last_was_exe(void);
+int  asm_last_is_boot(void);   /* source carried `#make_boot#` */
 
 /* Layout facts about the most recent assembly, for the MZ writer. */
 int  asm_last_stack_size(void);   /* bytes reserved by `.stack N`          */

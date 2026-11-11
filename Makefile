@@ -60,6 +60,12 @@ test: $(BIN) $(TBIN)
 	@echo "== INT 13h floppy services =="
 	@cd src && $(SKIPOK) "$(PYTHON)" check_int13.py
 	@echo
+	@echo "== runtime behaviour regressions =="
+	@cd src && $(SKIPOK) "$(PYTHON)" check_runtime.py
+	@echo
+	@echo "== every shipped example runs to completion =="
+	@cd src && $(SKIPOK) "$(PYTHON)" check_run.py
+	@echo
 	@echo "== INT 10h write-string services =="
 	@cd src && $(SKIPOK) "$(PYTHON)" check_int10.py
 	@echo

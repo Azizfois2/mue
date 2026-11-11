@@ -2757,3 +2757,69 @@ clamp fails `psp-child-top-of-memory` and `child-free-memory-all-levels`
 (0xEE). The chain check itself was wrong at first - it did `cmp ax,0` after the
 subtraction, which clears the borrow flag, so a wrapped sum looked fine; the
 negative test is what caught that.
+
+## 38. Why the shipped examples did not run, and what each cause was
+
+`src/check_run.py` assembles and executes all 85 shipped `.asm` files and
+started at 57/85. It is now 85/85. The eight causes, each confirmed against
+the original rather than guessed:
+
+**38.1 PUSHA/POPA (60h/61h) are skipped, not fatal.** The original's
+assembler accepts `pusha` and emits `60` (`0x4B18BB: mov ecx,0x60`), but its
+CPU core `FUN_004eff00` has no arm for it and falls into the shared funnel at
+`0x516E85`, which logs `unknown opcode skipped: <n> - not 8086 instruction -
+not supported yet.` (strings at `0x4467EC` / `0x446820`) and returns, so the
+byte is stepped over. Eleven shipped examples contain PUSHA/POPA and produce
+output. The clone therefore reports and skips 60h-6Fh (and ENTER/LEAVE)
+instead of halting with `-2`. This alone took 63 -> 76.
+
+**38.2 AAA/AAS/DAA/DAS (37h/3Fh/27h/2Fh) were missing entirely.** All four
+reached the unknown-opcode funnel. `examples/bcd_aaa.asm` states its own
+expected result ("ah = 1, al = 4 -> '14'"); with the four implemented the
+clone reports `DX=3134`. DAA/DAS recompute SF/ZF/PF from the adjusted AL,
+AAA/AAS clear the high nibble.
+
+**38.3 INT 21h AH=05h.** Original: `0x5E1E70`, which reports `virtual printer
+does not respond.` (`0x452204` at `0x5E1FEF`) and answers AL=0x90. The clone
+does the same and says so once per run (`PrinterDemo.asm`).
+
+**38.4 INT 19h stops the machine.** `0x525549`-`0x525581` writes `0xFFFF` to
+the register block's `+0x4C` word and to `ds:0x621218` - the halt marker - so
+a boot program that ends with `int 19h` (timer.asm) stops instead of running
+into the bytes that follow it.
+
+**38.5 The IVT is real.** emu8086 ships `INT_VECT` (1045 bytes, 261 vectors)
+and puts a stub block in `BIOS_ROM` at `F400:0100`. Every vector except 19h
+points at a three-instruction thunk `pushf / int NNh / iret`, spaced 16 bytes
+apart: INT 10h at `F400:0190`, INT 21h at `F400:0200`, INT 19h at
+`FFFF:0000`. That is why `examples/far_call.asm` can `call far es:[40h]`
+instead of using `int`. The clone now installs the same shape.
+
+**38.6 `call far [...]` was encoded as a near call.** Two separate bugs:
+`es:[bx]` was accepted by `eval_expr` as the number 0 (emitting `E8 0000`),
+and the `far ` distance keyword is part of the operand text so it blocked
+`parse_operand`. Ordering the memory form first, and stripping `far`, gives
+`26 FF 1F` for `call far es:[bx]` and `FF 1F` for `call far [bx]`.
+
+**38.7 `#make_boot#` marks a boot sector.** timer.asm, robot.asm and
+traffic_lights*.asm all carry it and `org 7c00h`. They were being loaded as
+.COMs at `0100`, so every absolute address in them was 0x7B00 too low. The
+clone now loads such a source at `0000:7C00` with all segment registers zero.
+
+**38.8 INT 15h AH=86h must actually wait.** timer.asm loops
+`int 15h / jc stop / jmp next_char`, so answering with CF set ends it after
+one character. The clone waits, clears CF/AH, caps the wait at one second and
+honours `MUE_NOSLEEP` (traffic_lights.asm asks for five seconds per step).
+
+A wrong turn worth recording: the first `timer.asm` run after 38.7 printed
+nothing, which looked like the video path. It was not - `set_video_mode` uses
+`call far [7C7E]`, so 38.6 was the actual cause, and fixing it turned the
+output into `abcdefghij...`. Two of the bugs presented as one symptom.
+
+`traffic_lights.asm` timing out at first was a measurement, not a bug: it
+delays five real seconds per step, so `check_run.py` runs with `MUE_NOSLEEP=1`
+while `check_runtime.py` checks the delay itself.
+
+Regression gate: `src/check_runtime.py` (12 checks), wired into `make test`
+alongside `check_run.py`. Negative controls: restoring any single one of
+38.1-38.8 turns its named check red.
