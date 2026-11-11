@@ -2529,3 +2529,38 @@ reports 0xF0, so the clamp did not become a blanket replacement.
 
 Verified to bite: restoring the plain `(uint16_t)(seg + 0x1000)` fails
 `psp-child-top-of-memory` with 0 while the grandchild check still passes.
+
+## 36. Scripted stdin: dos_feed_stdin (IMPLEMENTED)
+
+Stdin is one lazily refilled keyboard queue (sec. 33), and until now it always
+refilled from the host stream. `dos_feed_stdin(text)` was declared but only
+pushed the text into the 256-byte ring, so a script longer than the ring lost
+its tail and then silently fell through to the host; the `scripted` pointer it
+set was never read.
+
+It now *is* the stream: `kb_refill` takes bytes from the script and reports
+end-of-input when it runs out, and only falls back to the host when no script
+is set (`dos_feed_stdin(NULL)` returns to the host from wherever it stands).
+Feeding drops whatever was already typed, so a script always describes stdin
+from the start of the run. The text is not copied - it must outlive the run.
+
+A script is not a console, so `dos_stdin_console()` answers 0 while one is set:
+scripted input is read silently, exactly as a redirected file is (sec. 33).
+
+The tests reach it through `MUE_STDIN_TEXT`, following the `MUE_INT21_MEM_NOOP`
+precedent: `load_com` hands the variable's value to `dos_feed_stdin`. A check
+can then give a guest stdin without a pipe, and the host stream stays
+untouched.
+
+### Checks
+
+`stdin-script-reads-without-host` and `stdin-script-text`: the guest reads 4
+bytes with no host input at all and writes them out; it sees `abc`.
+
+`stdin-script-ends-at-script` and `stdin-script-beats-host-stream`: with the
+host offering `zzzz` and the script `ab`, the read returns 2 and the text is
+`ab` - the script wins and ends where it says it does.
+
+Verified to bite: making `kb_refill` read the host unconditionally (the old,
+effectively dead state) fails all four - the count is 0 with no host input and
+4 with `zzzz` on the host.

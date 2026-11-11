@@ -347,6 +347,30 @@ f2 db 's2.txt',0
 """
 
 # End of input is not an error: AX=0, CF clear.
+# Reads 4 bytes of stdin and writes whatever it got to sc.txt, so the
+# scripted-input checks can look at the text itself and at the count.
+T_STDIN_SCRIPT = PROLOG + """
+mov ah,3fh
+mov bx,0
+mov cx,4
+mov dx,200h
+int 21h
+mov si,ax
+mov ah,3ch
+mov cx,0
+lea dx,f1
+int 21h
+mov bx,ax
+mov ah,40h
+mov cx,si
+mov dx,200h
+int 21h
+mov ah,3eh
+int 21h
+ret
+f1 db 'sc.txt',0
+"""
+
 T_STDIN_EOF = PROLOG + """
 mov ah,3fh
 mov bx,0
@@ -1483,6 +1507,21 @@ def main():
         di = reg(out, "DI")
         check("stdin-eof-returns-zero", ax == 0, ax)
         check("stdin-eof-cf-clear", di is not None and not (di & 1), di)
+
+        # dos_feed_stdin: MUE_STDIN_TEXT scripts stdin from a string, with no
+        # host stream at all, and it wins over whatever the host offers.
+        rc, out = run(mue, T_STDIN_SCRIPT, d,
+                      env={"MUE_STDIN_TEXT": "abc"})
+        check("stdin-script-reads-without-host", reg(out, "SI") == 3,
+              reg(out, "SI"))
+        check("stdin-script-text", host("sc.txt") == b"abc", host("sc.txt"))
+
+        rc, out = run(mue, T_STDIN_SCRIPT, d, b"zzzz",
+                      env={"MUE_STDIN_TEXT": "ab"})
+        check("stdin-script-ends-at-script", reg(out, "SI") == 2,
+              reg(out, "SI"))
+        check("stdin-script-beats-host-stream", host("sc.txt") == b"ab",
+              host("sc.txt"))
 
         rc, out = run(mue, T_RENAME, d)
         bp = reg(out, "BP")

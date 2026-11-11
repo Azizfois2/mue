@@ -49,11 +49,16 @@ void dos_push_key(int ch)
     kb_tail = nt;
 }
 
+/* Point stdin at a literal string instead of the host stream, so a check can
+ * feed a guest exactly what it means to without plumbing a pipe.  The text is
+ * not copied, so it has to stay alive for the rest of the run; NULL goes back
+ * to the host stream.  Anything already typed is dropped, because a script
+ * describes stdin from the start of the run. */
 void dos_feed_stdin(const char *text)
 {
     scripted = text;
     scripted_pos = 0;
-    while (*text) { dos_push_key(*text); text++; }
+    kb_head = kb_tail = 0;
 }
 
 /* One byte from the host, so `mue prog.asm < input` works.
@@ -81,7 +86,11 @@ static int kb_refill(void)
 {
     int c;
     if (kb_head != kb_tail) return 1;
-    c = host_stdin_byte();
+    if (scripted) {
+        c = scripted[scripted_pos] ? (unsigned char)scripted[scripted_pos++] : -1;
+    } else {
+        c = host_stdin_byte();
+    }
     if (c < 0) return 0;
     dos_push_key(c);
     return kb_head != kb_tail;
@@ -93,6 +102,7 @@ static int kb_refill(void)
 static int dos_stdin_console(void)
 {
     static int on = -1;
+    if (scripted) return 0;                 /* a script is a file, not a console */
     if (on < 0) {
 #ifdef _WIN32
         on = _isatty(_fileno(stdin)) ? 1 : 0;

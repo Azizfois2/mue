@@ -44,6 +44,13 @@ static void load_com(const uint8_t *p, int n)
     cpu.ip     = 0x0100;
     cpu.phys   = seg_off_to_phys(cpu.sr[CS], cpu.ip);
     dos_boot_psp();                         /* its PSP at 0x0100:0 */
+    /* Test hook, like MUE_INT21_MEM_NOOP: MUE_STDIN_TEXT makes stdin that
+     * literal string instead of the host stream, so a check can drive a
+     * guest that reads stdin without plumbing a pipe. */
+    {
+        const char *e = getenv("MUE_STDIN_TEXT");
+        if (e) dos_feed_stdin(e);
+    }
 }
 
 int main(int argc, char **argv)
