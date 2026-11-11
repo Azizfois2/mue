@@ -132,6 +132,23 @@ CPU self-test (`test_cpu.exe`): ALL PASS (0 failures).
 
 `make examples`: all 85 programs in `C:\emu8086\Examples` assemble.
 
+### Where the clone is deliberately better
+
+Everywhere a comparison is possible - every example's output, every `.list`
+byte, every decoded interrupt function - `mue` matches emu8086 exactly. There
+is one place it knowingly does not, and only because emu8086 does nothing
+there:
+
+**`INT 21h` 48h/49h/4Ah (allocate/free/resize memory).** emu8086 dispatches
+these and returns **without touching a single register**, so a program cannot
+tell success from failure. `mue` implements a real memory arena instead. The
+original's silence is still available for comparison with
+`MUE_INT21_MEM_NOOP=1`.
+
+This is the intended behaviour - not an oversight, and not something to
+"fix" back. See `re/GAPS.md` section 4 for the full list of divergences and
+`re/FINDINGS.md` section 29 for the disassembly behind this one.
+
 ## Licence
 
 MIT — see `LICENSE`. You may use, modify and redistribute this code freely,

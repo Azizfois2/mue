@@ -2088,7 +2088,8 @@ did leave and the rmdir landed in the parent). Verified to bite: deleting the
 guest then rmdirs the wrong directory), and dropping the `dos_chdir()`
 failure from the guard fails `chdir-missing-dir-fails` with `AX=0`.
 
-## 29. INT 21h 36h, and 48h/49h/4Ah (IMPLEMENTED, with a divergence)
+## 29. INT 21h 36h, and 48h/49h/4Ah (IMPLEMENTED - deliberately better than
+##     the original, see "Why the clone does not copy the original here")
 
 ### 36h free disk space (CONFIRMED)
 
@@ -2239,13 +2240,31 @@ from a 4Bh parent - that is what `tsr-code-reaches-exec-caller` relies on (and
 that check therefore runs with `MUE_EXEC=1`; see FINDINGS 44). If
 the process status is ever wired to the guest's exit code, every suite's idea of
 "the run succeeded" changes with it.
+### Why the clone does not copy the original here (deliberate)
+
+emu8086's 48h/49h/4Ah touch no register at all, so a guest that calls 48h gets
+back whatever happened to be in AX, and cannot tell a success from a failure.
+That is not a design, it is an unimplemented service that still returns.
+
+Copying it would make the clone beat-for-beat identical on a code path that
+does nothing useful. Implementing it gives a guest a real arena, so the same
+program that silently misbehaves under emu8086 runs correctly under `mue`.
+**The clone implements it; that is the intended difference**, not an oversight
+and not something to "fix" later by making the handlers silent again.
+
+Everything that can be compared without this - every example's output, every
+`.list` byte, every decoded AH arm - is still required to match exactly. This
+is the one place where the answer is deliberately better rather than equal.
+
 ### The compatibility switch
 
-`MUE_INT21_MEM_NOOP=1` makes 48h/49h/4Ah do exactly what the original does:
-nothing visible. The handlers return before touching AX, BX or CF, so a guest
-that checks flags or expects a segment sees the same "no answer" emu8086 gives
-(29). Unset - the default - is the DOS-style arena from 29. Same convention as
-`MUE_FLOPPY`: read once via `getenv`, empty or `0` means off.
+`MUE_INT21_MEM_NOOP=1` restores emu8086's behaviour: 48h/49h/4Ah return
+without touching AX, BX or CF, so a guest that checks flags or expects a
+segment sees the same "no answer" the original gives (29). **Unset - the
+default - is the working DOS-style arena**, which is what this clone is
+supposed to do. Same convention as `MUE_FLOPPY`: read once via `getenv`,
+empty or `0` means off. The flag exists so the two models can both be tested,
+not because the silent one is more correct.
 
 ### Checks
 
@@ -3141,3 +3160,40 @@ finding that claimed it was unobservable. `MUE_EXEC` is now the one flag where
 
 Rule adopted: every env-gated arm must state, at the point of use, which side
 of the flag is the faithful one.
+
+## 46. Fix the bug, do not reproduce it: the 48h arena stays the default
+
+The previous open question was whether to make `MUE_INT21_MEM_NOOP` the default
+so 48h/49h/4Ah would be bug-compatible with emu8086's silent return. The
+answer is no. A fixed bug is better than a faithfully copied one.
+
+The reasoning, written down so it is not re-litigated:
+
+- emu8086 dispatches 48h/49h/4Ah and touches **no register** (FINDINGS 29).
+  A guest calling 48h gets back whatever was already in AX. This is not a
+  design decision, it is an unimplemented service that still returns.
+- Matching it buys nothing a program can use: the clone would be identical on
+  a path that produces no answer.
+- Implementing it means the same guest works under `mue` and silently
+  misbehaves under emu8086. That is strictly better and it is what a clone
+  should do with a hole in the original.
+
+**Where the line is.** Everything comparable must still match exactly - every
+example's output, every `.list` byte, every decoded AH arm. A behaviour may
+differ only where the original does nothing useful, and then it must be
+documented with the flag that restores the original. `MUE_INT21_MEM_NOOP=1`
+does that here.
+
+**Opposite polarity to 4Bh, on purpose.** 4Bh (FINDINGS 44) is off by default
+because the original *does* define behaviour there - it reports "not
+supported" - so being faithful means reproducing the refusal. 48h has no
+defined behaviour to reproduce, so being faithful there would only mean being
+useless. Same rule, two directions: match what the original defines, improve
+what it does not.
+
+**Verified, not assumed.** Default: three 48h calls return `0x2000`, `0x2100`,
+`0x2200` - distinct blocks exactly `BX` paragraphs apart. With the flag the
+same guest sees AX still holding `0x4800`, the untouched `AH` value. Both
+directions are now pinned by `mem-allocates-distinct-blocks`,
+`mem-noop-off-by-default` and `mem-noop-compat-flag`; forcing the allocator to
+return one fixed segment fails the first one.

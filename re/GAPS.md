@@ -169,6 +169,28 @@ Each should stay documented so nobody "fixes" it later:
 - **`INT 13h` uses `FLOPPY_<DL>` on the host filesystem**; the original holds
   an internal image. Behaviour matches for AH=00/02/03; error codes for
   absent images are DESIGN.
+- **`INT 21h` 48h/49h/4Ah implement a real memory arena.** The original
+  dispatches these and touches no register (FINDINGS 29), so a guest cannot
+  tell success from failure. Reproducing that would copy a broken service.
+  **The clone allocates properly and that is the intended behaviour** -
+  `MUE_INT21_MEM_NOOP=1` restores the original's silence for comparison.
+  Do not "fix" this back to bug-compatibility.
+- **`INT 21h` AH=4Bh EXEC really loads and runs a child.** The original has no
+  4Bh arm at all (FINDINGS 44) and answers "not supported". Here the clone is
+  the *less* faithful side, so this one is **off by default** (`MUE_EXEC=1`
+  enables it).
+
+Note the opposite polarities, which are deliberate: 48h/49h/4Ah are better by
+default because the original is simply unimplemented there; 4Bh is opt-in
+because the original's behaviour is defined (it reports), so matching it is
+what "faithful" means.
+
+### The rule
+
+Everywhere a comparison is possible - every example's output, every `.list`
+byte, every decoded AH arm - the clone must match exactly. A behaviour may
+differ only where the original does nothing useful, and then it must be listed
+here, with the flag that restores the original.
 
 ---
 

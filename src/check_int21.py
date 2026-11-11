@@ -1534,6 +1534,25 @@ pop di
 ret
 """
 
+# Three 48h allocations of 0x100 paragraphs must be three DIFFERENT blocks,
+# each exactly the size asked for.  Without this, the arena could regress to
+# returning one fixed segment and every other check would still pass.
+T_MEM_THRICE = PROLOG + """
+mov ah,48h
+mov bx,100h
+int 21h
+mov di,ax
+mov ah,48h
+mov bx,100h
+int 21h
+mov cx,ax
+mov ah,48h
+mov bx,100h
+int 21h
+mov si,ax
+ret
+"""
+
 # 36h: every drive reports the same fixed picture; DL > 26 is AX=0xFFFF.
 # The guest does the invalid drive first, so DX still holds the valid answer at
 # the end; CX is a sentinel 36h must not touch.
@@ -2245,6 +2264,17 @@ def main():
         check("mem-noop-off-by-default",
               reg(out, "AX") == 0x2000 and (reg(out, "DI") or 0) & 1 == 0,
               (reg(out, "AX"), reg(out, "DI")))
+
+        # The default arena must hand out distinct blocks the size asked for.
+        # 0x2000/0x2100/0x2200 is 0x100 paragraphs apart, i.e. exactly BX on
+        # each call.  The three results live in DI/CX/SI because the dump
+        # follows the guest's exit and AX is rewritten on the way out.
+        rc, out = run(mue, T_MEM_THRICE, d)
+        _di, _cx, _si = reg(out, "DI"), reg(out, "CX"), reg(out, "SI")
+        check("mem-allocates-distinct-blocks",
+              None not in (_di, _cx, _si) and
+              _cx - _di == 0x100 and _si - _cx == 0x100,
+              (_di, _cx, _si))
 
         # 36h free space: constants from the original's inline arm, and the
         # invalid drive answer.
