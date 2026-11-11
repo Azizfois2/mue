@@ -130,10 +130,32 @@ own mode table decides. Needs a run against the original to settle.
 
 All 22 AH values in emu8086's own
 `documentation/8086_bios_and_dos_interrupts.html` (0A 0B 0C 0E 19 25 2A 2C
-35 39 3A 3B 3C 3D 3E 3F 40 41 42 47 4C 56) are implemented. The clone has 61
-arms - more than the original's 47 - so several are supersets the original
-does not dispatch (`00 31 44 4B` and others). Those are harmless but are
-DESIGN, not CONFIRMED.
+35 39 3A 3B 3C 3D 3E 3F 40 41 42 47 4C 56) are implemented.
+
+**Verified by calling each one, not by reading the dispatch table.** A probe
+assembles a guest per AH, calls it with plausible arguments and asserts the
+output carries no "not supported" report. All 22 answer. The four that could
+have hidden a silent no-op behind an error return were then checked by their
+side effect rather than their return value:
+
+| AH | side effect checked |
+|---|---|
+| 39h mkdir | the directory really appears, then 3Ah removes it |
+| 3Ah rmdir | the directory really disappears |
+| 3Bh chdir | succeeds on a real directory (SI=0) |
+| 47h getcwd | the buffer receives the actual current directory |
+
+Two false alarms during the probe, both mine, both worth recording because
+they are easy to repeat: a function that leaves AH untouched on success
+(39h returns `AX=3900`) looks like an echoed failure if you read AX instead of
+CF, and 47h looks broken if you leave DX pointing at something other than the
+buffer.
+
+The clone has 61 arms - more than the original's 47 - so several are supersets
+the original does not dispatch (`00 31 44 4B` and others). Those are harmless
+but are DESIGN, not CONFIRMED. 31h and 4Bh are documented in sections 1 and 4;
+the 4Bh one is the only superset that is a *divergence* rather than an
+extension.
 
 ---
 

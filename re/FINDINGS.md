@@ -3197,3 +3197,32 @@ same guest sees AX still holding `0x4800`, the untouched `AH` value. Both
 directions are now pinned by `mem-allocates-distinct-blocks`,
 `mem-noop-off-by-default` and `mem-noop-compat-flag`; forcing the allocator to
 return one fixed segment fails the first one.
+
+## 47. GAPS.md sec.2 verified by calling, not by reading the dispatch table
+
+Section 2 claimed all 22 documented INT 21h functions are implemented. That
+claim had been checked against emu8086's documentation list and the clone's
+switch statement - i.e. against *two lists of names*, which is exactly the
+kind of self-referential validation that says nothing about behaviour.
+
+Re-verified by probe: a guest is assembled per AH, calls it, and the output is
+required to contain no "not supported" report. All 22 answer.
+
+The four where an arm could exist and still do nothing (39h, 3Ah, 3Bh, 47h)
+were then checked by **side effect**, not return value:
+
+- 39h mkdir: the directory really appears (`newdir` on disk), and 3Ah removes it.
+- 3Bh chdir: succeeds on a real directory and SI comes back 0.
+- 47h getcwd: the buffer receives the actual current working directory.
+
+**Both of my first readings were wrong, in the same direction.** I read
+`AX=3900` as a failure because AH looked like an echoed request code - but
+AH is simply undefined-on-success there and CF is what matters. And 47h
+appeared to write nothing until I noticed DX was still pointing at another
+string, so the buffer I printed was not the one I had passed. In both cases
+the clone was right and the test was wrong.
+
+That is the useful part: the two errors were not in the code, they were in
+how I looked at it. A check that asserts "no complaint was printed" catches a
+missing arm; it cannot catch an arm that runs and does nothing. Those need the
+side effect, so that is what the section now records.
