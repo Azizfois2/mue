@@ -2823,3 +2823,38 @@ while `check_runtime.py` checks the delay itself.
 Regression gate: `src/check_runtime.py` (12 checks), wired into `make test`
 alongside `check_run.py`. Negative controls: restoring any single one of
 38.1-38.8 turns its named check red.
+
+## 39. INT 10h cursor state is per page (IMPLEMENTED)
+
+The clone kept one global `cur_row`/`cur_col`, so touching a second page
+moved the first page's cursor. The original keeps one pair per page:
+
+- **AH=02** (`0x520A4D`) loads BH, DH and DL into the register block
+  (`+0xBD`, `+0xC1`, `+0xC0`) and hands them to `[esi+0x760]`.
+- **AH=03** (`0x520B27`) passes page BH `(+0xBD)` to `[esi+0x768]` for the
+  row, `[esi+0x764]` for the column, `[esi+0x784]` for CH and `[esi+0x788]`
+  for CL, storing them back into `+0xC1` DH, `+0xC0` DL, `+0xBF` CH and
+  `+0xBE` CL (`0x520BF2`, `0x520CA3`, `0x520D5C`, `0x520E06`).
+
+So BH is an argument to both calls, which is only meaningful if each page has
+its own cursor. The clone now holds `cur_row[8]`/`cur_col[8]`, a mode set
+clears all of them, and AH=05 selects which one AH=08/09/0A/0E/13h read and
+advance.
+
+**AH=01 is no longer a no-op.** It stores CX and AH=03 returns the same value;
+the clone previously answered a hard-coded `0607`. Because the shape goes
+through two separate sinks (CH by `+0x788`, CL by `+0x784`), the stored value
+is one 16-bit word and a mode set restores the 0607 default.
+
+**A wrong test, caught by its own negative control.** The first regression
+only read page 0 after setting page 1 - and page 0 is exactly what a
+BH-ignoring bug still returns, so the check passed against a deliberately
+broken build. Reading *page 1* after setting it (`0x101, 0x101, 0x101` instead
+of `0x101, 0xB0B, 0x101`) is what makes it fail. Two iterations were needed
+before the control actually bit; a green check that cannot go red is not a
+check. This is the same class of mistake as the INT 13h regression that used
+to compare two all-zero buffers (sec. 5.6).
+
+Also switched the AH=0C/0D pixel page read from the numeric `cpu.r[3]` to
+`cpu.r[BX]`; `3` is BX in this enum, which is why it happened to work, but the
+numeric form is what silently aliased DH to BX in the INT 13h bug.

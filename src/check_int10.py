@@ -245,6 +245,54 @@ def main():
     check("unsupported-ah-reports",
           "INT 10h, AH=99h - not supported yet." in out, repr(out[-200:]))
 
+    # 10. Every page keeps its own cursor.  CONFIRMED from the original:
+    #     AH=02 (0x520A4D) hands BH, DL and DH to [obj+0x760] and AH=03
+    #     (0x520B27) asks [obj+0x768]/0x764 for page BH.  A single shared
+    #     cursor made page 0 read back page 1's position.
+    rc, out = run(mue, PROLOG +
+                  "mov ah,2\nmov bh,0\nmov dx,0101h\nint 10h\n"
+                  "mov ah,2\nmov bh,1\nmov dx,0A0Ah\nint 10h\n"
+                  "mov ah,3\nmov bh,0\nint 10h\n"
+                  "mov si,dx\n"        # page 0 must still be 0101
+                  "mov ah,2\nmov bh,1\nmov dx,0B0Bh\nint 10h\n"
+                  "mov ah,3\nmov bh,1\nint 10h\n"
+                  "mov di,dx\n"        # page 1 reads back its own 0B0B
+                  "mov ah,3\nmov bh,0\nint 10h\n"
+                  "mov bp,dx\n"        # and page 0 is still 0101
+                  "ret\n")
+    si = reg(out, "SI")
+    di = reg(out, "DI")
+    bp = reg(out, "BP")
+    check("cursor-is-per-page",
+          si == 0x0101 and di == 0x0B0B and bp == 0x0101,
+          (hex(si) if si is not None else None,
+           hex(di) if di is not None else None,
+           hex(bp) if bp is not None else None))
+
+    # 11. AH=01 stores the cursor shape and AH=03 returns the same value in
+    #     CX: [obj+0x788] keeps CH (0x520DBC) and [obj+0x784] keeps CL
+    #     (0x520D0C).  The clone used to invent a fixed 0607.
+    rc, out = run(mue, PROLOG +
+                  "mov ah,1\nmov cx,0E0Fh\nint 10h\n"
+                  "mov ah,3\nmov bh,0\nint 10h\n"
+                  "ret\n")
+    cx = reg(out, "CX")
+    check("cursor-shape-round-trips", cx == 0x0E0F,
+          hex(cx) if cx is not None else None)
+
+    # 12. AH=05 selects the page that AH=09/0A/0E draw into, so a character
+    #     written to page 1 must not appear in page 0's cell buffer.
+    rc, out = run(mue, PROLOG +
+                  "mov ah,5\nmov al,1\nint 10h\n"
+                  "mov ah,0eh\nmov al,'X'\nint 10h\n"
+                  "mov ah,5\nmov al,0\nint 10h\n"
+                  "mov ah,8\nint 10h\n"
+                  "mov bx,ax\n"
+                  "ret\n")
+    bx = reg(out, "BX")
+    check("select-page-routes-writes", bx == 0x0720,
+          hex(bx) if bx is not None else None)
+
     print("INT10 %s (%d fail)" % ("PASS" if not fails else "FAIL", len(fails)))
     return 1 if fails else 0
 

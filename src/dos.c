@@ -1624,7 +1624,17 @@ static void int21(void)
 #define VIDEO_ROWS 25
 #define VIDEO_PAGES 8                  /* mode 3 reserves 8 text pages */
 #define VIDEO_PAGE_BYTES 4096          /* B800:0000 + page*4096 */
-static int cur_row, cur_col, cur_page;
+/* CONFIRMED from the original: INT 10h AH=02 (0x520A4D) hands BH, DL and DH
+ * to [obj+0x760] and AH=03 (0x520B27) asks [obj+0x768]/0x764/0x784/0x788 for
+ * page BH's row, column and cursor shape.  BH is an argument, so every page
+ * keeps its own cursor - one shared pair loses page 0's position as soon as
+ * page 1 is touched. */
+static int cur_row[VIDEO_PAGES], cur_col[VIDEO_PAGES], cur_page;
+/* AH=01 stores the cursor shape and AH=03 must hand the same value back in
+ * CX: [obj+0x788] keeps CH (0x520DBC) and [obj+0x784] keeps CL (0x520D0C).
+ * The real BIOS default is 0607, and mode 3 sets that, so the clone starts
+ * there instead of reporting a fixed 0607 forever. */
+static uint16_t cursor_shape = 0x0607;
 static int gfx_mode;                   /* 0 = text, 1 = CGA 320x200x4 */
 
 /* CGA order: even byte = character, odd byte = attribute.  One array per
@@ -1713,10 +1723,11 @@ static void video_putc(int c)
 /* Move the modelled cursor n columns, wrapping at the mode-3 width. */
 static void cursor_advance_cols(int n)
 {
-    cur_col += n;
-    while (cur_col >= VIDEO_COLS) {
-        cur_col -= VIDEO_COLS;
-        cur_row  = (cur_row + 1) % VIDEO_ROWS;
+    int p = cur_page;
+    cur_col[p] += n;
+    while (cur_col[p] >= VIDEO_COLS) {
+        cur_col[p] -= VIDEO_COLS;
+        cur_row[p]  = (cur_row[p] + 1) % VIDEO_ROWS;
     }
 }
 
@@ -1796,18 +1807,35 @@ static void int10(void)
         case 0x06: case 0x13: gfx_mode = 2; break;   /* one byte a pixel */
         default:              gfx_mode = 0; break;   /* text */
         }
+        /* A mode set clears every page's cursor, as the BIOS does. */
+        {
+            int i;
+            for (i = 0; i < VIDEO_PAGES; i++) cur_row[i] = cur_col[i] = 0;
+        }
+        cursor_shape = 0x0607;
         cur_page = 0;
-        cur_row = cur_col = 0;
         break;
     case 0x01:                                  /* set cursor shape */
+        /* CONFIRMED: the shape reaches [obj+0x788] (CH) and [obj+0x784]
+         * (CL) and AH=03 hands it back in CX (0x520D0C/0x520DBC).  The clone
+         * has no blinking cursor to draw, but it must not invent 0607. */
+        cursor_shape = cpu.r[CX];
         break;
     case 0x02:                                  /* set cursor position */
-        cur_row = (cpu.r[DX] >> 8) & 0xFF;
-        cur_col = cpu.r[DX] & 0xFF;
+        {
+            int p = (cpu.r[BX] >> 8) & 0xFF;    /* BH = page */
+            if (p >= VIDEO_PAGES) p = 0;
+            cur_row[p] = (cpu.r[DX] >> 8) & 0xFF;
+            cur_col[p] = cpu.r[DX] & 0xFF;
+        }
         break;
     case 0x03:                                  /* read cursor position */
-        cpu.r[CX] = 0x0607;
-        cpu.r[DX] = (uint16_t)((cur_row << 8) | cur_col);
+        {
+            int p = (cpu.r[BX] >> 8) & 0xFF;    /* BH = page */
+            if (p >= VIDEO_PAGES) p = 0;
+            cpu.r[CX] = cursor_shape;
+            cpu.r[DX] = (uint16_t)((cur_row[p] << 8) | cur_col[p]);
+        }
         break;
     case 0x06: case 0x07:                       /* scroll up / down */
         {
@@ -1824,7 +1852,7 @@ static void int10(void)
         break;
     case 0x08:                                  /* read char/attr at cursor */
         {
-            unsigned char *cell = vram_cell(cur_row, cur_col);
+            unsigned char *cell = vram_cell(cur_row[cur_page], cur_col[cur_page]);
             cpu.r[AX] = (uint16_t)((cell[1] << 8) | cell[0]);
         }
         break;
@@ -1837,8 +1865,8 @@ static void int10(void)
 
             /* In text mode AH=0A writes the character only: the cell keeps
              * the attribute it already had, and BL is ignored. */
-            for (i = 0; i < n && cur_col + i < VIDEO_COLS; i++) {
-                unsigned char *cell = vram_cell(cur_row, cur_col + i);
+            for (i = 0; i < n && cur_col[cur_page] + i < VIDEO_COLS; i++) {
+                unsigned char *cell = vram_cell(cur_row[cur_page], cur_col[cur_page] + i);
                 cell[0] = (unsigned char)ch;
                 if (ah == 0x09) cell[1] = (unsigned char)attr;
                 video_putc(ch);
@@ -1849,23 +1877,24 @@ static void int10(void)
         {
             int c = cpu.r[AX] & 0xFF;
             if (c >= 0x20) {                    /* teletype draws, attr 0x07 */
-                unsigned char *cell = vram_cell(cur_row, cur_col);
+                unsigned char *cell = vram_cell(cur_row[cur_page], cur_col[cur_page]);
                 cell[0] = (unsigned char)c;
                 cell[1] = 0x07;
             }
             video_putc(c);
             /* Teletype moves the cursor: CR to column 0, LF down a row, BS
              * back one column, anything else one column forward. */
-            if (c == 0x0D)                        cur_col = 0;
-            else if (c == 0x0A)                   cur_row = (cur_row + 1) % VIDEO_ROWS;
-            else if (c == 0x08) { if (cur_col > 0) cur_col--; }
+            if (c == 0x0D)                        cur_col[cur_page] = 0;
+            else if (c == 0x0A)                   cur_row[cur_page] = (cur_row[cur_page] + 1) % VIDEO_ROWS;
+            else if (c == 0x08) { if (cur_col[cur_page] > 0) cur_col[cur_page]--; }
             else                                  cursor_advance_cols(1);
         }
         break;
     case 0x0C: case 0x0D:                       /* write / read pixel */
         {
             int color = cpu.r[AX] & 0xFF;
-            int page  = (cpu.r[3] >> 8) & 0xFF;   /* BH */
+            int page  = (cpu.r[BX] >> 8) & 0xFF;   /* BH, named so it cannot
+                                                    * alias another register */
             int y     = cpu.r[CX];                /* row */
             int x     = cpu.r[DX];                /* column */
             if (cga_pixel(page, x, y, ah == 0x0C ? color : -1) < 0)
@@ -1904,8 +1933,8 @@ static void int10(void)
             }
 
             /* DX is the starting position, as on the real BIOS. */
-            cur_row = (cpu.r[DX] >> 8) & 0xFF;
-            cur_col = cpu.r[DX] & 0xFF;
+            cur_row[cur_page] = (cpu.r[DX] >> 8) & 0xFF;
+            cur_col[cur_page] = cpu.r[DX] & 0xFF;
             for (i = 0; i < cells; i++) {
                 int attr = 0x07;
                 unsigned char *cell;
@@ -1913,7 +1942,7 @@ static void int10(void)
                 /* With bit1 set every second byte is an attribute: consume it
                  * and give it to the cell instead of printing it. */
                 if (pairs) attr = peek8(p++);
-                cell = vram_cell(cur_row, cur_col + written);
+                cell = vram_cell(cur_row[cur_page], cur_col[cur_page] + written);
                 cell[0] = (unsigned char)ch;
                 cell[1] = (unsigned char)attr;
                 video_putc(ch);
