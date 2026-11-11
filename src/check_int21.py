@@ -1001,6 +1001,7 @@ mov ah,4ch
 int 21h
 """
 
+# Runs `top.com` as a child, for the MZ maxalloc check below.
 T_EXEC_TOP = PROLOG + """
 mov ax,4b00h
 lea dx,cname
@@ -1035,6 +1036,34 @@ dd 0
 cname db 'top.com',0
 """
 
+# A module that reports its own child PSP:0x02 through the exit code, so a
+# header's maxalloc can be read back: top = 0xF000 + 0x10 + maxalloc.
+MAXA_ASM = """
+mov bx,0
+mov ax,[bx+2]
+mov al,ah
+mov ah,4ch
+int 21h
+"""
+
+# Runs `maxa.exe`, an MZ image whose header caps maxalloc at 0x110 paragraphs:
+# the block ends early, so the child sees 0xF120 rather than the whole window.
+T_EXEC_MAXA = PROLOG + """
+mov ax,4b00h
+lea dx,cname
+mov bx,offset pblk
+push ds
+pop es
+int 21h
+mov bp,ax
+ret
+pblk dw 0
+dd 0
+dd 0
+dd 0
+cname db 'maxa.exe',0
+"""
+
 T_EXEC_TOP_MID = PROLOG + """
 mov ax,4b00h
 lea dx,cname
@@ -1049,6 +1078,69 @@ dd 0
 dd 0
 dd 0
 cname db 'mid.com',0
+"""
+
+# The boot program's own PSP:0x02, and the free-memory sum a program makes
+# from it (top - PSP).
+T_BOOT_TOP = PROLOG + """
+mov bx,0
+mov ax,[bx+2]
+mov bp,ax
+mov dx,ds
+sub ax,dx
+mov si,ax
+ret
+"""
+
+# Execs itself until the window limit refuses the exec, so every window level
+# runs the same test: its own (PSP:0x02 - PSP) must be positive.  Each level
+# returns the number of levels it saw, or 0xEE if its sum was zero or wrapped.
+CHAIN_ASM = PROLOG + """
+mov bx,0
+mov ax,[bx+2]
+mov dx,ds
+sub ax,dx
+jbe bad
+mov ax,4b00h
+lea dx,nm
+mov bx,offset pblk
+push ds
+pop es
+int 21h
+jnc again
+mov al,1
+jmp out2
+again:
+cmp al,0EEh
+je out2
+inc al
+out2:
+mov ah,4ch
+int 21h
+bad:
+mov ax,4cEEh
+int 21h
+pblk dw 0
+dd 0
+dd 0
+dd 0
+nm db 'chain.com',0
+"""
+
+T_CHAIN = PROLOG + """
+mov ax,4b00h
+lea dx,nm
+mov bx,offset pblk
+push ds
+pop es
+int 21h
+mov bp,ax
+ret
+pblk dw 0
+dd 0
+dd 0
+dd 0
+nm db 'chain.com',0
 """
 
 T_EXEC_PARENT_NEST = PROLOG + """
@@ -1206,28 +1298,31 @@ int 21h
 """
 
 
-def mz_image(module, minalloc=0, ss=3, sp=0x0127, cs=1, ip=0):
-    """Wrap a load module in an MZ header with one relocation entry.
+def mz_image(module, minalloc=0, ss=3, sp=0x0127, cs=1, ip=0, maxalloc=0xFFFF,
+             reloc=True):
+    """Wrap a load module in an MZ header.
 
-    The entry is (segment cs, offset 1): the immediate of `mov ax,0`, which
-    must come back as the load segment after loading.
+    By default there is one relocation entry, (segment cs, offset 1): the
+    immediate of `mov ax,0`, which must come back as the load segment after
+    loading.  reloc=False is for modules that have no such word.
     """
     hdr = bytearray(0x200)
     total = 0x200 + len(module)          # the header is part of the file size
     hdr[0:2] = b"MZ"
     hdr[2:4] = (total % 512).to_bytes(2, "little")        # bytes last page
     hdr[4:6] = ((total + 511) // 512).to_bytes(2, "little")  # page count
-    hdr[6:8] = (1).to_bytes(2, "little")                 # one relocation
+    hdr[6:8] = (1 if reloc else 0).to_bytes(2, "little")  # relocation count
     hdr[8:10] = (0x20).to_bytes(2, "little")             # header paragraphs
     hdr[0x0A:0x0C] = minalloc.to_bytes(2, "little")
-    hdr[0x0C:0x0E] = (0xFFFF).to_bytes(2, "little")
+    hdr[0x0C:0x0E] = maxalloc.to_bytes(2, "little")
     hdr[0x0E:0x10] = ss.to_bytes(2, "little")
     hdr[0x10:0x12] = sp.to_bytes(2, "little")
     hdr[0x14:0x16] = ip.to_bytes(2, "little")
     hdr[0x16:0x18] = cs.to_bytes(2, "little")
     hdr[0x18:0x1A] = (0x1E).to_bytes(2, "little")        # relocation table
-    hdr[0x1E:0x20] = (1).to_bytes(2, "little")           # ... offset
-    hdr[0x20:0x22] = cs.to_bytes(2, "little")            # ... segment
+    if reloc:
+        hdr[0x1E:0x20] = (1).to_bytes(2, "little")       # ... offset
+        hdr[0x20:0x22] = cs.to_bytes(2, "little")        # ... segment
     return bytes(hdr) + module
 
 
@@ -1822,7 +1917,8 @@ def main():
 
         for nm, src in (("cpsp", CPSP_ASM), ("pchild", CPSP_PARENT_ASM),
                         ("c1p", C1P_ASM), ("opener", OPENER_ASM),
-                        ("top", TOP_ASM), ("mid", MID_ASM)):
+                        ("top", TOP_ASM), ("mid", MID_ASM),
+                        ("chain", CHAIN_ASM)):
             with open(os.path.join(d, nm + ".asm"), "w") as f:
                 f.write(src)
             subprocess.run([mue, "-a", nm + ".asm", nm + ".com"], cwd=d,
@@ -1852,6 +1948,19 @@ def main():
         rc, out = run(mue, T_EXEC_TOP_MID, d)
         check("psp-grandchild-top-of-memory",
               (reg(out, "BP") or 0) & 0xFF == 0xF0, reg(out, "BP"))
+
+        # The boot program has a PSP too, and its block ends at the top of
+        # conventional memory (0xA000 paragraphs), not at zero.
+        rc, out = run(mue, T_BOOT_TOP, d)
+        check("boot-psp-top-of-memory", reg(out, "BP") == 0xA000, reg(out, "BP"))
+        check("boot-free-memory-positive", reg(out, "SI") == 0x9F00,
+              reg(out, "SI"))
+
+        # Every window level: (PSP:0x02 - PSP) must stay positive, so the
+        # six levels of the chain all report in.
+        rc, out = run(mue, T_CHAIN, d)
+        check("child-free-memory-all-levels", reg(out, "BP") == 6,
+              reg(out, "BP"))
 
         # A child's unclosed handles die with it; the parent's slot 1 is free
         # again, so the next open gets handle 6 and not 7.
@@ -1899,6 +2008,15 @@ def main():
             f.write(mz_image(module))
         with open(os.path.join(d, "big.exe"), "wb") as f:
             f.write(mz_image(module, minalloc=0x1000))
+        # maxalloc caps the block: 0x110 paragraphs past the load segment, so
+        # the child's top of memory is 0xF120 instead of the whole window.
+        with open(os.path.join(d, "maxa.asm"), "w") as f:
+            f.write(MAXA_ASM)
+        subprocess.run([mue, "-a", "maxa.asm", "maxa.bin"], cwd=d,
+                       capture_output=True, timeout=60)
+        maxa = open(os.path.join(d, "maxa.bin"), "rb").read()
+        with open(os.path.join(d, "maxa.exe"), "wb") as f:
+            f.write(mz_image(maxa, maxalloc=0x110, cs=0, reloc=False))
 
         rc, out = run(mue, T_EXEC_MZ, d)
         check("exec-mz-loads",
@@ -1931,6 +2049,9 @@ def main():
               nrel == 1 and raw[at - 1] == 0xB8 and
               int.from_bytes(raw[at:at + 2], "little") == 0,
               (nrel, roff, rseg, raw[at - 1:at + 2]))
+
+        rc, out = run(mue, T_EXEC_MAXA, d)
+        check("exec-mz-maxalloc", (reg(out, "BP") or 0) == 0xF1, reg(out, "BP"))
 
         rc, out = run(mue, T_EXEC_MZ_MODEL, d)
         check("exec-mz-model-child", "MZDATA" in guest_text(out),

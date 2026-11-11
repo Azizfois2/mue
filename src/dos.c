@@ -554,8 +554,15 @@ static void dos_jft_fill(uint16_t psp)
  * its parent segment points at itself.  main.c calls this once per load. */
 void dos_boot_psp(void)
 {
+    uint32_t base = (uint32_t)DOS_BOOT_PSP << 4;
+
     dos_psp = DOS_BOOT_PSP;
-    poke16(((uint32_t)DOS_BOOT_PSP << 4) + 0x16, DOS_BOOT_PSP);
+    poke16(base + 0x16, DOS_BOOT_PSP);
+    /* PSP:0x02 is the first paragraph past the program's block, and a guest
+     * sizes its heap with (top - PSP).  The boot program's block runs to the
+     * end of the 48h arena - 0xA000 paragraphs, the classic top of
+     * conventional memory - and child windows start above that (sec. 40). */
+    poke16(base + 2, DOS_HEAP_END);
     dos_jft_fill(DOS_BOOT_PSP);
 }
 
@@ -853,6 +860,7 @@ static void int21(void)
         uint16_t saved_psp = dos_psp;
         FILE *saved_files[DOS_FILES];
         uint32_t base, img_base, pb, cmd_phys, env_phys, env_len, j;
+        uint32_t top_paras = 0;                 /* PSP:0x02, once seg is known */
 
         memcpy(saved_files, dos_files, sizeof saved_files);
 
@@ -905,6 +913,7 @@ static void int21(void)
         base = (uint32_t)seg << 4;
         load_seg = overlay ? seg : (uint16_t)(seg + 0x10);
         img_base = overlay ? base : base + 0x100;   /* MZ module or .COM text */
+        top_paras = (uint32_t)seg + 0x1000;         /* the whole window */
         if (!overlay) memset(MEM + base, 0, 0x10000);
 
         if (!is_mz) {
@@ -924,6 +933,7 @@ static void int21(void)
             unsigned cblp = dos_img16(img + 0x02), cp = dos_img16(img + 0x04);
             unsigned nrel = dos_img16(img + 0x06), hpar = dos_img16(img + 0x08);
             unsigned mina = dos_img16(img + 0x0A);
+            unsigned maxa = dos_img16(img + 0x0C);
             unsigned rel  = dos_img16(img + 0x18);
             long hdr = (long)hpar * 16;
             long total, isize;
@@ -945,6 +955,19 @@ static void int21(void)
                 free(img);
                 dos_file_error(8);              /* insufficient memory */
                 break;
+            }
+            /* DOS gives the image plus minalloc, then grows the block toward
+             * maxalloc as far as memory allows.  That block end is what
+             * PSP:0x02 reports, and it is how a program learns its heap size,
+             * so a header that caps maxalloc must shrink it.  The window is
+             * the ceiling, and 0xFFFF means "as much as there is". */
+            if (!overlay && maxa != 0xFFFF) {
+                uint32_t need = (uint32_t)isize + (uint32_t)mina * 16;
+                uint32_t want = (uint32_t)maxa * 16;
+
+                if (want < need) want = need;
+                if (want > 0x10000 - 0x100) want = 0x10000 - 0x100;
+                top_paras = (uint32_t)seg + 0x10 + (want + 15) / 16;
             }
             memcpy(MEM + img_base, img + hdr, (size_t)isize);
             for (i = 0; i < (int)nrel; i++) {
@@ -1000,7 +1023,7 @@ static void int21(void)
              * fit in a word: report the last paragraph instead of wrapping to
              * 0x0000, so a child computing its free memory (top - PSP) still
              * gets a positive, under-estimated answer (FINDINGS 35). */
-            uint32_t top = (uint32_t)seg + 0x1000;
+            uint32_t top = top_paras;
 
             poke16(base + 2, (uint16_t)(top > 0xFFFF ? 0xFFFF : top));
         }

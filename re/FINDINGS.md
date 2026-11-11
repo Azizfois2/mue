@@ -2704,3 +2704,46 @@ pushes nothing. Building the far call with `push cs` / `push offset back` /
 `retf` therefore jumped to 0:0. 0x9A is the 8086 way. Not fixed here: the
 assembler should reject `push imm` (or the core should not treat 0x68 as a
 no-op) rather than emit a silent hole.
+
+## 40. The boot PSP's top of memory, and maxalloc for children (IMPLEMENTED)
+
+Two gaps left by sec. 35, which clamped a *child's* top of memory but not the
+boot program's:
+
+- `dos_boot_psp` set PSP:0x16 and the job file table but never PSP:0x02, so
+  `mue prog.asm` ran with a top of 0 and any program sizing itself with
+  `top - PSP` computed a wrapped negative number. It now reports 0xA000: the
+  boot program's block runs to the end of the 48h arena, which is what a real
+  640K DOS reports, and the child windows sit above it.
+- A child's top was always the whole 64K window. The header's maxalloc is how a
+  program caps its own heap, and it is what PSP:0x02 is for, so 4Bh now sizes
+  the block the DOS way: image + minalloc is required (error 8 if the window
+  cannot hold it), then the block grows toward maxalloc and stops there, and
+  PSP:0x02 reports the paragraph after it. 0xFFFF - what emu8086's writer emits
+  - still means the whole window, so existing children see exactly what they
+  saw before. The clone cannot hand the unused tail back to anything (its arena
+  is a separate region), so the cap is the program's own view of its memory.
+
+### Checks
+
+`boot-psp-top-of-memory` (the boot program reads its PSP:0x02 and exits with
+it in BP: 0xA000) and `boot-free-memory-positive` (top - PSP = 0x9F00, so a
+guest's heap arithmetic is positive).
+
+`exec-mz-maxalloc`: a module that reports its own child PSP:0x02 through its
+exit code is wrapped with maxalloc = 0x110 paragraphs, so the child sees
+0xF120 in the 0xF000 window - 0xF1 rather than the 0xFF the whole window
+gives.
+
+`child-free-memory-all-levels`: one program execs itself until the window limit
+refuses, and every level computes `PSP:0x02 - PSP` and fails the chain with
+0xEE if it is zero or wrapped. It runs in all six windows (0xF000 down to
+0xA000) and the outermost run sees 6.
+
+Verified to bite: dropping the boot PSP:0x02 write fails
+`boot-psp-top-of-memory` (0) and `boot-free-memory-positive` (0xFF00);
+ignoring maxalloc fails `exec-mz-maxalloc` with 0xFF; removing the sec. 35
+clamp fails `psp-child-top-of-memory` and `child-free-memory-all-levels`
+(0xEE). The chain check itself was wrong at first - it did `cmp ax,0` after the
+subtraction, which clears the borrow flag, so a wrapped sum looked fine; the
+negative test is what caught that.
