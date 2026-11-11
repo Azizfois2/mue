@@ -572,6 +572,80 @@ ret
 # 4Bh: a missing program, an overlay request (AL=1, refused), then a real
 # child that exits with 5 and prints before the parent does.  BL collects a
 # bit for every answer that came back wrong.
+# 4Bh AL=1: an overlay, loaded where the parameter block says (+0x10) and
+# not run.  The guest prints 'L' when the call returns, far-calls the overlay
+# at 8001h:0000 (header CS 1, since .code starts at 0x10), then 'P'.  0x9A is
+# the 8086 far call; a `push imm16` + retf would need 0x68, which is 80186.
+OVL_ASM = """
+.model small
+.data
+msg db 'O$'
+.code
+mov ax,@data
+mov ds,ax
+mov ah,9
+mov dx,offset msg
+int 21h
+retf
+end
+"""
+
+T_OVERLAY = PROLOG + """
+mov ax,4b01h
+lea dx,oname
+mov bx,offset pblk
+push ds
+pop es
+int 21h
+jnc ovok
+mov bp,ax
+or bp,0100h
+jmp ov2
+ovok:
+mov bp,0
+ov2:
+mov ah,2
+mov dl,'L'
+int 21h
+push ds
+call 8001h:0
+pop ds
+mov ah,2
+mov dl,'P'
+int 21h
+ret
+pblk dw 0
+dd 0
+dd 0
+dd 0
+dw 0
+dw 8000h
+oname db 'ovl.exe',0
+"""
+
+# AL=1 with no load address in the block: the clone refuses it rather than
+# guessing where to put the image.
+T_OVERLAY_NOADDR = PROLOG + """
+mov ax,4b01h
+lea dx,oname
+mov bx,offset pblk
+push ds
+pop es
+int 21h
+mov bp,ax
+jnc on1
+or bp,0100h
+on1:
+ret
+pblk dw 0
+dd 0
+dd 0
+dd 0
+dw 0
+dw 0
+oname db 'ovl.exe',0
+"""
+
 T_EXEC = PROLOG + """
 mov bx,0
 mov ah,4bh
@@ -588,7 +662,7 @@ mov al,1
 lea dx,cname
 int 21h
 jnc e2
-cmp ax,1
+cmp ax,9
 je e2
 or bl,2
 e2:
@@ -1861,6 +1935,23 @@ def main():
         rc, out = run(mue, T_EXEC_MZ_MODEL, d)
         check("exec-mz-model-child", "MZDATA" in guest_text(out),
               repr(guest_text(out)[:40]))
+
+        # 4Bh AL=1: an overlay lands where the block asks and is not run; the
+        # caller enters it itself, and its @data relocation resolves to the
+        # load segment (else it would print from segment 0).
+        with open(os.path.join(d, "ovl.asm"), "w") as f:
+            f.write(OVL_ASM)
+        subprocess.run([mue, "-a", "ovl.asm", "ovl.exe"], cwd=d,
+                       capture_output=True, timeout=60)
+        rc, out = run(mue, T_OVERLAY, d)
+        txt = guest_text(out).replace("\r", "").strip()
+        check("exec-overlay-loads", reg(out, "BP") == 0, reg(out, "BP"))
+        check("exec-overlay-does-not-run", txt.startswith("LO"), repr(txt[:20]))
+        check("exec-overlay-runs-where-asked", txt == "LOP", repr(txt[:20]))
+
+        rc, out = run(mue, T_OVERLAY_NOADDR, d)
+        check("exec-overlay-needs-address",
+              (reg(out, "BP") or 0) == 0x109, reg(out, "BP"))
 
         # A child that leaves through 31h: its AL must reach the 4Bh caller.
         with open(os.path.join(d, "tsr.asm"), "w") as f:

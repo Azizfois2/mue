@@ -847,21 +847,24 @@ static void int21(void)
         uint32_t saved_dta = dta;
         int saved_dta_valid = dta_valid, saved_depth = dos_exec_depth;
         int child_exit, cmd_len, i, fi, is_mz = 0;
+        int overlay = ((cpu.r[0] & 0xFF) == 1);
         uint16_t seg, load_seg, env_seg = 0;
         uint16_t e_ip = 0x100, e_cs = 0, e_ss = 0, e_sp = 0xFFFE;
         uint16_t saved_psp = dos_psp;
         FILE *saved_files[DOS_FILES];
-        uint32_t base, pb, cmd_phys, env_phys, env_len, j;
+        uint32_t base, img_base, pb, cmd_phys, env_phys, env_len, j;
 
         memcpy(saved_files, dos_files, sizeof saved_files);
 
         /* Original: no 4Bh arm either (see 30), so it reports "not supported"
          * and returns.  A child process is a divergence, implemented the DOS
          * way for the one form that can work here: AL=0, load and execute a
-         * .COM or MZ image with a parameter block (ES:BX).  AL=1/3 (overlay)
-         * are refused; MZ support is in 34. */
-        if ((cpu.r[0] & 0xFF) != 0) { dos_file_error(1); break; }
-        if (dos_exec_depth >= DOS_CHILD_LEVELS) { dos_file_error(8); break; }
+         * .COM or MZ image with a parameter block (ES:BX); MZ support is in
+         * 34.  AL=1 loads an overlay into the caller's own memory without a
+         * process (39).  AL=3 is the same load without an environment or
+         * command line, and is still refused with error 1. */
+        if ((cpu.r[0] & 0xFF) != 0 && !overlay) { dos_file_error(1); break; }
+        if (!overlay && dos_exec_depth >= DOS_CHILD_LEVELS) { dos_file_error(8); break; }
         if (dos_guest_name(name, sizeof name) != 0) { dos_file_error(3); break; }
         dos_seed();
         if (dos_apply_path(dos_drive, name, want, sizeof want) != 0) {
@@ -881,16 +884,36 @@ static void int21(void)
         }
         fclose(f);
         is_mz = (n >= 2 && img[0] == 'M' && img[1] == 'Z');
-        if (!is_mz && n > 0xFF00) n = 0xFF00;
+        pb = seg_off_to_phys(cpu.sr[ES], cpu.r[3]);
 
-        seg = dos_child_seg();
-        load_seg = (uint16_t)(seg + 0x10);      /* the module starts one
-                                                 * paragraph after the PSP */
+        if (overlay) {
+            /* An overlay has no process and no PSP: the caller names where the
+             * image goes in the parameter block, as a far pointer at +0x0E
+             * whose segment is the load address (DOS wants the offset part
+             * zero).  It also enters the overlay itself, so nothing here
+             * touches the registers beyond CF. */
+            seg = peek16(pb + 0x10);
+            if (seg < 0x40) {                   /* 0 = no address given */
+                free(img);
+                dos_file_error(9);              /* invalid block address */
+                break;
+            }
+        } else {
+            if (!is_mz && n > 0xFF00) n = 0xFF00;
+            seg = dos_child_seg();
+        }
         base = (uint32_t)seg << 4;
-        memset(MEM + base, 0, 0x10000);
+        load_seg = overlay ? seg : (uint16_t)(seg + 0x10);
+        img_base = overlay ? base : base + 0x100;   /* MZ module or .COM text */
+        if (!overlay) memset(MEM + base, 0, 0x10000);
 
         if (!is_mz) {
-            memcpy(MEM + base + 0x100, img, (size_t)n);
+            if (img_base + (uint32_t)n > 0x100000) {
+                free(img);
+                dos_file_error(8);
+                break;
+            }
+            memcpy(MEM + img_base, img, (size_t)n);
         } else {
             /* MZ (EXE): the header says how long the module is, where the
              * relocation table is, and what CS:IP / SS:SP start as.  Every
@@ -914,12 +937,16 @@ static void int21(void)
                 dos_file_error(11);             /* invalid EXE format */
                 break;
             }
-            if (isize + (long)mina * 16 > 0x10000 - 0x100) {
+            /* A child gets a 64K window and has to fit its minalloc beside the
+             * image; an overlay goes wherever the caller asked and allocates
+             * nothing, so only the top of memory matters. */
+            if (overlay ? (img_base + (uint32_t)isize > 0x100000)
+                        : (isize + (long)mina * 16 > 0x10000 - 0x100)) {
                 free(img);
                 dos_file_error(8);              /* insufficient memory */
                 break;
             }
-            memcpy(MEM + base + 0x100, img + hdr, (size_t)isize);
+            memcpy(MEM + img_base, img + hdr, (size_t)isize);
             for (i = 0; i < (int)nrel; i++) {
                 unsigned off = dos_img16(img + rel + 4 * i);
                 unsigned sgm = dos_img16(img + rel + 4 * i + 2);
@@ -930,7 +957,7 @@ static void int21(void)
                     dos_file_error(11);
                     break;
                 }
-                at = base + 0x100 + ((uint32_t)sgm << 4) + off;
+                at = img_base + ((uint32_t)sgm << 4) + off;
                 poke16(at, (uint16_t)(peek16(at) + load_seg));
             }
             if (i < (int)nrel) break;           /* bad relocation, no cleanup */
@@ -941,11 +968,17 @@ static void int21(void)
         }
         free(img);
 
+        if (overlay) {
+            /* Loaded, not run: DOS hands no entry point back, because the
+             * caller chose the address and knows the image's header. */
+            cpu.flags &= ~F_CF;
+            break;
+        }
+
         /* ---- minimal PSP, from the caller's parameter block ------------
          * ES:BX points at the DOS 3.x block: +0 environment segment, then a
          * far pointer to the counted command line, then two FCB pointers we
          * leave as the zeroed block already has them. */
-        pb = seg_off_to_phys(cpu.sr[ES], cpu.r[3]);
         cmd_phys = seg_off_to_phys(peek16(pb + 4), peek16(pb + 2));
         env_phys = seg_off_to_phys(peek16(pb), 0);
 

@@ -2654,3 +2654,53 @@ Not fixed here, and older than this work: a source with neither `org` nor
 `.model` assembles with its labels based at 0 while `mue` loads it at 0x100, so
 data references miss. Every check and example carries `org 100h`, so it has not
 surfaced.
+
+## 39. 4Bh AL=1: overlays (IMPLEMENTED, divergent)
+
+AL=1 used to be refused with error 1 along with the other non-zero forms. It is
+the overlay form: the file is loaded into the caller's own memory and *not*
+run, so it needs no PSP, no environment, no window of its own and no exit code
+(sec. 30, 34 cover the child path). AL=0 is unchanged; AL=3 - the same load
+without the environment and command line - is still error 1.
+
+Where the image goes comes from the parameter block: a far pointer at +0x0E
+whose segment (+0x10) is the load address, which is what DOS 4.0+ reads there.
+The clone requires it: a segment below 0x40 (including the zero a caller that
+never set the field passes) is error 9, invalid block address. DOS would fall
+back to the top of the caller's memory block, but nothing in this clone tracks
+the caller's block size, so guessing is worse than saying no. The offset part
+of the pointer is ignored, as DOS requires it to be zero.
+
+The load itself is the child's code path with two values changed: `load_seg` is
+the requested segment (not PSP + 0x10) and the image goes at `seg:0`. An MZ
+overlay therefore has its relocations applied against `seg`, so `mov ax,@data`
+resolves inside the overlay, and a .COM overlay is copied flat. The memory is
+not cleared first - the caller owns it - and minalloc is ignored because
+nothing is allocated; only the top of memory bounds the copy (error 8).
+
+On return only CF changes (clear on success): DOS returns no entry point,
+because the caller picked the address and already knows the image's header.
+Registers, PSP, file table and exit state are untouched.
+
+### Checks
+
+`exec-overlay-loads` (CF clear, AX untouched - the guest turns that into BP=0),
+`exec-overlay-does-not-run` (the parent prints `L` after the call and `O` only
+when it far-calls the overlay, so the order is `LO`), and
+`exec-overlay-runs-where-asked` (the whole output is `LOP`: the image is at
+8000h, its `mov ax,@data` was relocated to it, and `retf` gets back to the
+caller). `exec-overlay-needs-address` covers the missing address (AX=9, CF
+set). The far call is `call 8001h:0` - header CS 1 because `.code` starts at
+0x10 - so the check also pins 0x9A in the CPU.
+
+Verified to bite: removing the early return (so AL=1 falls into the child path)
+and skipping the relocations for overlays each fail
+`exec-overlay-does-not-run`/`exec-overlay-runs-where-asked`; without the
+relocation the overlay reads its data from segment 0 and prints zeros.
+
+One trap, unrelated but found here: `push imm16` assembles to 0x68, which is an
+80186 opcode - the 8086 core does not decode it, so `push 1234h` silently
+pushes nothing. Building the far call with `push cs` / `push offset back` /
+`retf` therefore jumped to 0:0. 0x9A is the 8086 way. Not fixed here: the
+assembler should reject `push imm` (or the core should not treat 0x68 as a
+no-op) rather than emit a silent hole.
