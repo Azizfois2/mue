@@ -2905,3 +2905,43 @@ updated to `0x284B`: they were pinning the bug, not the contract.
 
 Gate: `src/check_int16.py` (13 checks, wired into `make test`). Negative
 control - forcing `AH = 0` again turns 11 of them red.
+
+## 41. INT 21h AH=2Ah/2Ch read the host clock (IMPLEMENTED)
+
+The clone answered a frozen `2024-01-01 12:00:00`. Both arms in the original
+read the host clock, so a guest that timestamps anything was getting a
+constant.
+
+**AH=2Ah** (`0x52793A`): calls `0x40140C` (VB `Now`), `0x401098` (DateValue)
+and `0x4012DC` (year) into `[ebp-0x34]`, then `0x401050` for month and day.
+The five stores are `+0xBE` CH year-hi, `+0xBF` CL year-lo, `+0xC1` DH month,
+`+0xC0` DL day, `+0xBA` AL day-of-week, at `0x527A36`, `0x527AFB`, `0x527B65`,
+`0x527BBC`, `0x527C3E`.
+
+**AH=2Ch** (`0x527C69`): the same `0x40140C` clock through `0x4013EC` and
+`0x401414`, storing `+0xBF` CL minute (`0x527CB8`), `+0xBE` CH hour
+(`0x527D0F`), `+0xC1` DH second (`0x527D66`), `+0xC0` DL hundredths
+(`0x527DA7`) and `+0xBA` AL = 0 (`0x527E15`).
+
+Both match the shipped documentation exactly - `"CX = year (1980-2099). DH =
+month. DL = day. AL = day of week (00h=Sunday)"` and `"CH = hour. CL =
+minute. DH = second. DL = 1/100 seconds"` - so the field order needed no
+guessing, only the source.
+
+**Implementation.** `localtime()` for the date; on Windows `GetLocalTime()`
+also supplies the hundredths that `localtime()` cannot. Any guest year outside
+1980-2099 is left alone rather than clamped, since the original does not clamp
+either.
+
+**A naming trap fixed while here.** The helper that writes AL was called
+`setAThi` - it never touches AH. It is now `setAL`, with `setAThi` kept as an
+alias so the 20-odd existing call sites did not all have to change in the same
+commit. A function named "set AH high" that writes AL is the same class of
+hazard as the numeric `cpu.r[3]` that meant BX (sec. 5.6).
+
+**The regression deliberately avoids literal dates.** `check_int21time.py`
+compares the returned date and time against the host clock with a tolerance
+(5 minutes for time, one day for date, to survive a run across midnight). A
+test that pinned `2026-11-11` would pass today and rot tomorrow. Negative
+control: restoring the frozen constants fails `date-tracks-host-clock`,
+`date-day-of-week-matches` and `time-tracks-host-clock`.

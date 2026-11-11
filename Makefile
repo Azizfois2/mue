@@ -72,6 +72,9 @@ test: $(BIN) $(TBIN)
 	@echo "== INT 16h keyboard buffer and scan codes =="
 	@cd src && $(SKIPOK) "$(PYTHON)" check_int16.py
 	@echo
+	@echo "== INT 21h date and time follow the host clock =="
+	@cd src && $(SKIPOK) "$(PYTHON)" check_int21time.py
+	@echo
 	@echo "== INT 21h file services =="
 	@cd src && $(SKIPOK) "$(PYTHON)" check_int21.py
 	@echo

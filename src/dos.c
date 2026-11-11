@@ -250,7 +250,10 @@ static void setAX(int v) { cpu.r[0] = (uint16_t)v; }
 /* Declared here because INT 21h's own fail arm needs it long before the
  * definition further down next to the video and floppy services. */
 static void unsupported_ah(const char *service, int ah);
-static void setAThi(int v) { cpu.r[0] = (uint16_t)((cpu.r[0] & 0xFF00) | (v & 0xFF)); }
+/* Writes AL.  The name is historical - it does NOT touch AH, which is why
+ * every AL-returning service calls it. */
+static void setAL(int v) { cpu.r[0] = (uint16_t)((cpu.r[0] & 0xFF00) | (v & 0xFF)); }
+#define setAThi setAL
 
 #define DOS_DRIVES 27
 
@@ -1318,15 +1321,48 @@ static void int21(void)
         }
         break;
 
-    case 0x2A:                                  /* get date */
-        cpu.r[1] = 2024;
-        cpu.r[2] = 0x0101;
-        setAThi(1);
+    case 0x2A:                              /* get system date */
+        /* CONFIRMED (0x52793A): the arm calls 0x40140C (VB Now), 0x401098
+         * (DateValue) and 0x4012DC (year), then 0x401050 for month/day, and
+         * stores five fields: CH year-hi (+0xBE), CL year-lo (+0xBF),
+         * DH month (+0xC1), DL day (+0xC0), AL day-of-week (+0xBA) - exactly
+         * the documented "CX = year, DH = month, DL = day, AL = day of week".
+         * The clone used to return a frozen 2024-01-01. */
+        {
+            time_t now = time(NULL);
+            const struct tm *lt = localtime(&now);
+            int year = lt ? lt->tm_year + 1900 : 1980;
+            int mon  = lt ? lt->tm_mon + 1 : 1;
+            int day  = lt ? lt->tm_mday : 1;
+            int dow  = lt ? lt->tm_wday : 0;      /* 0 = Sunday */
+            cpu.r[CX] = (uint16_t)year;
+            cpu.r[DX] = (uint16_t)((mon << 8) | day);
+            setAL((uint8_t)dow);
+        }
         break;
 
-    case 0x2C:                                  /* get time */
-        cpu.r[1] = 0x1200;
-        cpu.r[2] = 0x0000;
+    case 0x2C:                              /* get system time */
+        /* CONFIRMED (0x527C69): same host clock, storing CH hour (+0xBE),
+         * CL minute (+0xBF), DH second (+0xC1), DL hundredths (+0xC0), and
+         * AL = 0 (+0xBA) - the documented "CH hour, CL minute, DH second,
+         * DL 1/100 seconds". */
+        {
+            time_t now = time(NULL);
+            const struct tm *lt = localtime(&now);
+            int hour = lt ? lt->tm_hour : 0;
+            int min  = lt ? lt->tm_min : 0;
+            int sec  = lt ? lt->tm_sec : 0;
+            int hundredths = 0;
+#ifdef _WIN32
+            {   SYSTEMTIME st;
+                GetLocalTime(&st);
+                hour = st.wHour; min = st.wMinute; sec = st.wSecond;
+                hundredths = st.wMilliseconds / 10; }
+#endif
+            cpu.r[CX] = (uint16_t)((hour << 8) | min);
+            cpu.r[DX] = (uint16_t)((sec << 8) | hundredths);
+            setAL(0);
+        }
         break;
 
     case 0x2F:                                  /* get DTA */
