@@ -74,10 +74,17 @@ It performs three independent checks, in order:
 3. **Byte round-trip** (`src/check_roundtrip.py`) — reassemble emu8086's own
    shipped sources and require the output to be byte-identical to the binaries
    emu8086 itself produced, MZ EXE header included.
+4. **Runtime regressions** (`src/check_runtime.py`) — the behaviours the
+   examples depend on: PUSHA/POPA stepped over, AAA/AAS/DAA/DAS adjusting BCD,
+   INT 21h AH=05h refusing, INT 19h halting, the IVT answering a
+   `call far es:[40h]`, and an unimplemented INT 21h function reporting.
+5. **Every shipped example runs** (`src/check_run.py`) — all 85 `.asm` files
+   are assembled and executed with no diagnostic and a zero exit, which is
+   what "the clone can run emu8086's own programs" actually means.
 
-Checks 2 and 3 read fixtures from `C:\emu8086`, so they need emu8086 installed;
-`make` alone never touches it. Where those fixtures are missing the two checks
-print `SKIP` and exit 77, which `make test` treats as skipped rather than
+Checks 2, 3 and 5 read fixtures from `C:\emu8086`, so they need emu8086
+installed; `make` alone never touches it. Where those fixtures are missing the
+checks print `SKIP` and exit 77, which `make test` treats as skipped rather than
 passed -- so a machine without emu8086 gets a green run that never silently
 claims to have verified byte compatibility.
 
