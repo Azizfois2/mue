@@ -13,4 +13,6 @@ void dos_push_key(int ch);
 void dos_boot_psp(void);        /* PSP:0x16 and the job file table of the
                                  * program main.c just loaded */
 void dos_feed_stdin(const char *text);
+int  dos_redirect_stdout(const char *path);   /* handle 1 to a file, `> file` */
+void dos_stdout_close(void);    /* flush and close it (atexit) */
 #endif

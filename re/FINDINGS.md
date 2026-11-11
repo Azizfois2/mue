@@ -2564,3 +2564,37 @@ host offering `zzzz` and the script `ab`, the read returns 2 and the text is
 Verified to bite: making `kb_refill` read the host unconditionally (the old,
 effectively dead state) fails all four - the count is 0 with no host input and
 4 with `zzzz` on the host.
+
+## 37. Standard output redirected to a file, and inherited by a child (IMPLEMENTED)
+
+There was no `>`: handle 1 and 2 were hardwired to the screen buffer, so a
+guest's only way to keep its output was to open its own file. Writing to handle
+1, `int 21h` 02h and 09h now share one sink (`stdout_byte`), which is the
+screen until something redirects it. `dos_redirect_stdout(path)` opens the file
+the way `>` does (truncated) and installs it; `MUE_STDOUT_FILE` reaches that
+from `load_com`, beside the `MUE_STDIN_TEXT` hook (sec. 36).
+
+The sink is one global, and nothing in 4Bh touches it, so an exec'd child
+writes into the same file, in order with its parent - that is what inheriting a
+redirection means. Handle 2 stays on the screen, and so do the console-only
+paths: INT 10h, 06h, and the keyboard echo of 01h/0Ah. A byte written to the
+file is not line-ending-translated, unlike the screen buffer's LF -> CRLF.
+
+Two things follow from routing 02h/09h through the sink: redirected output no
+longer appears on the screen at all, and `mue`'s own register dump still goes
+to the host's stdout, because that is the harness, not the guest.
+
+### Checks
+
+`stdout-redirect-file` (a guest prints `A` with 09h, `B` with 40h on handle 1
+and `C` with 02h; the file holds `ABC`) and `stdout-redirect-off-screen`
+(nothing of it is on the console).
+
+`exec-child-inherits-stdout` (parent writes `1`, execs a child that writes `2`
+with 09h and `3` with 40h, then writes `4`; the file holds `1234` in that
+order) and `exec-child-stdout-off-screen`.
+
+Verified to bite: giving the child a NULL sink for the duration of the exec
+fails both exec checks - the file holds `14` and the child's `23` appears on
+the screen; routing only handle 1 and leaving 09h/02h on the console fails
+`stdout-redirect-file` with `B` and `stdout-redirect-off-screen` with `AC`.

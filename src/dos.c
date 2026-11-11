@@ -139,6 +139,48 @@ void dos_putc(int ch)
 
 void dos_puts(const char *s) { while (*s) dos_putc((unsigned char)*s++); }
 
+/* ---- standard output -------------------------------------------------- */
+/* `> file` replaces DOS's standard output: handle 1 and the functions that
+ * write to it (02h, 09h) no longer reach the screen.  The sink is global, so a
+ * child started by 4Bh writes to the same file; that is what inheriting a
+ * redirection means (FINDINGS 37).  Console-only output (INT 10h, 06h,
+ * keyboard echo) still goes to the screen through dos_putc. */
+static FILE *dos_out_file;
+
+void dos_stdout_close(void);            /* also the atexit() hook */
+
+static void stdout_byte(int ch)
+{
+    if (dos_out_file) {
+        fputc(ch, dos_out_file);           /* atexit() closes and flushes */
+    } else {
+        dos_putc(ch);
+    }
+}
+
+int dos_redirect_stdout(const char *path)
+{
+    static int hooked;
+    FILE *f = fopen(path, "wb");
+
+    if (!f) return -1;
+    if (dos_out_file) fclose(dos_out_file);
+    dos_out_file = f;
+    if (!hooked) {
+        hooked = 1;
+        atexit(dos_stdout_close);
+    }
+    return 0;
+}
+
+void dos_stdout_close(void)
+{
+    if (dos_out_file) {
+        fclose(dos_out_file);
+        dos_out_file = NULL;
+    }
+}
+
 void dos_flush(FILE *f)
 {
     if (outlen) { fwrite(outbuf, 1, (size_t)outlen, f); outlen = 0; }
@@ -376,7 +418,7 @@ static void print_dollar_string(void)
     uint32_t p = seg_off_to_phys(cpu.sr[DS], cpu.r[2]);
     int guard = 0;
     while (peek8(p) != '$' && guard++ < 65535) {
-        dos_putc(peek8(p));
+        stdout_byte(peek8(p));
         p++;
     }
 }
@@ -699,8 +741,8 @@ static void int21(void)
         break; }
 
     case 0x02:                                  /* display output */
-        if ((cpu.r[2] & 0xFF) == 9) dos_putc('\t');
-        else dos_putc(cpu.r[2] & 0xFF);
+        if ((cpu.r[2] & 0xFF) == 9) stdout_byte('\t');
+        else stdout_byte(cpu.r[2] & 0xFF);
         break;
 
     case 0x06: {                                /* direct console I/O */
@@ -1250,9 +1292,17 @@ static void int21(void)
         p = seg_off_to_phys(cpu.sr[DS], cpu.r[DX]);
         n = cpu.r[CX];
         if (p + n > (uint32_t)0x100000) { dos_file_error(5); break; }
-        if (h == 1 || h == 2) {                 /* stdout / stderr */
+        if (h == 1) {                           /* stdout: maybe redirected */
+            for (k = 0; k < n; k++) stdout_byte(peek8(p + k));
+            if (dos_out_file) fflush(dos_out_file);
+            else dos_flush(stdout);
+            cpu.flags &= ~F_CF;
+            setAX((int)n);
+            break;
+        }
+        if (h == 2) {                           /* stderr */
             for (k = 0; k < n; k++) dos_putc(peek8(p + k));
-            dos_flush(h == 1 ? stdout : stderr);
+            dos_flush(stderr);
             cpu.flags &= ~F_CF;
             setAX((int)n);
             break;

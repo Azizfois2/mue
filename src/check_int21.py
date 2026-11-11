@@ -371,6 +371,69 @@ ret
 f1 db 'sc.txt',0
 """
 
+# Standard output redirected to a file: 09h, 40h on handle 1 and 02h all go
+# there, and none of it reaches the screen.
+T_STDOUT_REDIR = PROLOG + """
+mov ah,9
+lea dx,m1
+int 21h
+mov ah,40h
+mov bx,1
+mov cx,1
+mov dx,offset m2
+int 21h
+mov ah,2
+mov dl,'C'
+int 21h
+ret
+m1 db 'A$'
+m2 db 'B'
+"""
+
+# A child started by 4Bh writes into the same file the parent redirected to.
+SO_ASM = PROLOG + """
+mov ah,9
+lea dx,m1
+int 21h
+mov ah,40h
+mov bx,1
+mov cx,1
+mov dx,offset m2
+int 21h
+mov ah,4ch
+mov al,0
+int 21h
+m1 db '2$'
+m2 db '3'
+"""
+
+T_EXEC_STDOUT = PROLOG + """
+mov ah,40h
+mov bx,1
+mov cx,1
+mov dx,offset p1
+int 21h
+mov ax,4b00h
+lea dx,cname
+mov bx,offset pblk
+push ds
+pop es
+int 21h
+mov ah,40h
+mov bx,1
+mov cx,1
+mov dx,offset p4
+int 21h
+ret
+pblk dw 0
+dd 0
+dd 0
+dd 0
+cname db 'so.com',0
+p1 db '1'
+p4 db '4'
+"""
+
 T_STDIN_EOF = PROLOG + """
 mov ah,3fh
 mov bx,0
@@ -1522,6 +1585,27 @@ def main():
               reg(out, "SI"))
         check("stdin-script-beats-host-stream", host("sc.txt") == b"ab",
               host("sc.txt"))
+
+        # Standard output redirected to a file: 09h, 02h and 40h on handle 1
+        # all land there, and an exec'd child writes to the same file.
+        with open(os.path.join(d, "so.asm"), "w") as f:
+            f.write(SO_ASM)
+        subprocess.run([mue, "-a", "so.asm", "so.com"], cwd=d,
+                       capture_output=True, timeout=60)
+
+        rc, out = run(mue, T_STDOUT_REDIR, d,
+                      env={"MUE_STDOUT_FILE": "redir.txt"})
+        check("stdout-redirect-file", host("redir.txt") == b"ABC",
+              host("redir.txt"))
+        check("stdout-redirect-off-screen", guest_text(out).strip() == "",
+              repr(guest_text(out)[:40]))
+
+        rc, out = run(mue, T_EXEC_STDOUT, d,
+                      env={"MUE_STDOUT_FILE": "redir2.txt"})
+        check("exec-child-inherits-stdout", host("redir2.txt") == b"1234",
+              host("redir2.txt"))
+        check("exec-child-stdout-off-screen", guest_text(out).strip() == "",
+              repr(guest_text(out)[:40]))
 
         rc, out = run(mue, T_RENAME, d)
         bp = reg(out, "BP")

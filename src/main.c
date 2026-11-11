@@ -49,7 +49,9 @@ static void load_com(const uint8_t *p, int n)
      * guest that reads stdin without plumbing a pipe. */
     {
         const char *e = getenv("MUE_STDIN_TEXT");
+        const char *o = getenv("MUE_STDOUT_FILE");
         if (e) dos_feed_stdin(e);
+        if (o) dos_redirect_stdout(o);
     }
 }
 
