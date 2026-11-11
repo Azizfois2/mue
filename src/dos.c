@@ -261,6 +261,12 @@ static void setAL(int v) { cpu.r[0] = (uint16_t)((cpu.r[0] & 0xFF00) | (v & 0xFF
  * read by 19h; C: is what emu8086 starts on. */
 static int dos_drive = 2;
 
+/* Write-verify flag.  The original keeps exactly one byte at ds:0x621CD0:
+ * FUN_005e0860 stores AL into it (INT 21h AH=2Eh) and FUN_005e0870 loads it
+ * back into AL (INT 21h AH=54h).  emu8086 never consults it when writing, so
+ * neither does the clone - the point is that the round trip works. */
+static unsigned char dos_verify_flag = 0;
+
 /* Each drive remembers its own current directory, as DOS does, as a path
  * relative to the drive root ("" = root).  The host cwd is the live directory
  * of dos_drive, so switching drives (0Eh) re-enters that drive's directory. */
@@ -527,6 +533,9 @@ static void read_buffered(uint16_t buf_off)
 #define DOS_FIRST_HANDLE  5
 static FILE *dos_files[DOS_FILES];
 static int   dos_fmode[DOS_FILES];       /* 0 read-only, 1 write-only, 2 both */
+/* Host path of each open handle.  57h (get/set file date) needs a name to
+ * stat, and DOS hands it only a handle, so it has to be remembered at open. */
+static char  dos_fname[DOS_FILES][260];
 
 static void dos_file_error(int code)
 {
@@ -1406,6 +1415,7 @@ static void int21(void)
         if (!f) { dos_file_error(5); break; }
         dos_files[i] = f;
         dos_fmode[i] = 2;
+        snprintf(dos_fname[i], sizeof dos_fname[i], "%s", name);
         dos_jft_set(dos_psp, DOS_FIRST_HANDLE + i, (uint8_t)i);
         cpu.flags &= ~F_CF;
         setAX(DOS_FIRST_HANDLE + i);
@@ -1424,6 +1434,7 @@ static void int21(void)
         if (!f) { dos_file_error(2); break; }
         dos_files[i] = f;
         dos_fmode[i] = mode;
+        snprintf(dos_fname[i], sizeof dos_fname[i], "%s", name);
         dos_jft_set(dos_psp, DOS_FIRST_HANDLE + i, (uint8_t)i);
         cpu.flags &= ~F_CF;
         setAX(DOS_FIRST_HANDLE + i);
@@ -1436,6 +1447,7 @@ static void int21(void)
         if (!f) { dos_file_error(6); break; }
         fclose(f);
         dos_files[i] = NULL;
+        dos_fname[i][0] = 0;
         dos_jft_set(dos_psp, cpu.r[BX], 0xFF);  /* free again in this PSP */
         cpu.flags &= ~F_CF;
         break; }
@@ -1693,6 +1705,126 @@ static void int21(void)
         cpu.flags &= ~F_CF;
         setAX(0);
         break; }
+
+    case 0x2E:                                  /* set verify flag (AL) */
+        /* CONFIRMED: arm at 0x527DB9 -> FUN_005e0860, whose whole body is
+         * `mov cl,[eax]; mov ds:0x621CD0,cl`.  One byte, nothing else. */
+        dos_verify_flag = (unsigned char)(cpu.r[AX] & 0xFF);
+        cpu.flags &= ~F_CF;
+        break;
+
+    case 0x54:                                  /* get verify flag */
+        /* CONFIRMED: arm at 0x529E15 -> FUN_005e0870, `mov al,ds:0x621CD0`,
+         * stored back through +0xBA. */
+        cpu.flags &= ~F_CF;
+        setAL(dos_verify_flag);
+        break;
+
+    case 0x17: {                                /* rename DS:DX -> ES:DI */
+        /* CONFIRMED arm at 0x5277C0 (calls FUN_005e33f0/FUN_005dc390, then
+         * AL -> +0xBA).  The clone had no rename at all. */
+        char old[128], newn[128];
+        uint16_t saved_ds = cpu.sr[DS];
+        uint16_t saved_dx = cpu.r[DX];
+
+        if (dos_guest_name(old, sizeof old) != 0) { dos_file_error(3); break; }
+        /* ES:DI names the new path, but dos_guest_name reads DS:DX, so point
+         * DS at ES *and* DX at DI before calling it a second time. */
+        cpu.sr[DS] = cpu.sr[ES];
+        cpu.r[DX] = cpu.r[DI];
+        if (dos_guest_name(newn, sizeof newn) != 0) {
+            cpu.sr[DS] = saved_ds;
+            cpu.r[DX] = saved_dx;
+            dos_file_error(3);
+            break;
+        }
+        cpu.sr[DS] = saved_ds;
+        cpu.r[DX] = saved_dx;
+        if (rename(old, newn) != 0) { dos_file_error(3); break; }
+        cpu.flags &= ~F_CF;
+        setAX(0);
+        break; }
+
+    case 0x57: {                                /* get/set file date+time */
+        /* CONFIRMED arm at 0x52A182 -> FUN_005e2e50 (821 bytes), which walks
+         * the handle table at ds:0x6214D0 and touches a host timestamp.
+         * AL=00 get, AL=01 set.  CX = time, DX = date.
+         *   time: bits 15-11 hour, 10-5 min, 4-0 sec/2
+         *   date: bits 15-9 year-1980, 8-5 month, 4-0 day */
+        FILE *f = dos_slot_file(cpu.r[BX], NULL);
+        int sub = cpu.r[AX] & 0xFF;
+
+        if (!f) { dos_file_error(6); break; }
+        if (sub == 0x00) {                      /* get */
+            struct _stat st;
+            int i = cpu.r[BX] - DOS_FIRST_HANDLE;
+
+            if (i < 0 || i >= DOS_FILES || !dos_fname[i][0] ||
+                _stat(dos_fname[i], &st) != 0) { dos_file_error(6); break; }
+            {
+                const struct tm *tm = localtime(&st.st_mtime);
+                int tt = 0, dd = 0;
+                if (tm) {
+                    tt = ((tm->tm_hour & 0x1F) << 11) |
+                         ((tm->tm_min & 0x3F) << 5) |
+                         ((tm->tm_sec / 2) & 0x1F);
+                    dd = (((tm->tm_year + 1900 - 1980) & 0x7F) << 9) |
+                         (((tm->tm_mon + 1) & 0x0F) << 5) |
+                         (tm->tm_mday & 0x1F);
+                }
+                cpu.r[CX] = (uint16_t)tt;
+                cpu.r[DX] = (uint16_t)dd;
+            }
+            cpu.flags &= ~F_CF;
+            setAX(0);
+            break;
+        }
+        if (sub == 0x01) {                      /* set */
+            /* The clone does not apply a settable stamp to the host file,
+             * so it must not pretend: SET succeeds silently (DOS programs
+             * expect CF=0) but a following GET returns the real mtime. */
+            cpu.flags &= ~F_CF;
+            setAX(0);
+            break;
+        }
+        dos_file_error(1);                      /* bad subfunction */
+        break; }
+
+    case 0x0C:                                  /* clear buffer, invoke AL */
+    case 0x0D:                                  /* flush, invoke AL */
+        /* CONFIRMED arms at 0x5275BC / 0x52775B.  DOS's "flush then call
+         * AH=AL" idiom.  The clone honours the flush half. */
+        {
+            int i;
+            for (i = 0; i < DOS_FILES; i++)
+                if (dos_files[i]) fflush(dos_files[i]);
+            cpu.flags &= ~F_CF;
+        }
+        break;
+
+    case 0x23:                                  /* get break flag */
+        /* CONFIRMED arm at 0x52A1AD, a single word store into [eax+0x7C0].
+         * DOS reports 0 = break checking off. */
+        setAL(0);
+        break;
+
+    case 0x33:                                  /* get/set Ctrl-Break */
+        /* CONFIRMED arm at 0x52A21E (word at [edx+0xB4C], calls 0x60A910).
+         * AL=00 read -> DL, AL=01 write from DL.  Distinct from INT 33h,
+         * which is the mouse. */
+        {
+            static unsigned char ctrl_break = 0;
+            if ((cpu.r[AX] & 0xFF) == 0x00) {
+                cpu.r[DX] = (uint16_t)((cpu.r[DX] & 0xFF00) | ctrl_break);
+            } else if ((cpu.r[AX] & 0xFF) == 0x01) {
+                ctrl_break = (unsigned char)(cpu.r[DX] & 0xFF);
+            } else {
+                setAL(0xFF);
+                break;
+            }
+            setAL(0);
+        }
+        break;
 
     default:
         /* Original: an AH with no arm falls through the whole compare chain
@@ -1990,8 +2122,18 @@ static void int10(void)
                                                     * alias another register */
             int y     = cpu.r[CX];                /* row */
             int x     = cpu.r[DX];                /* column */
-            if (cga_pixel(page, x, y, ah == 0x0C ? color : -1) < 0)
-                unsupported_ah("INT 10h", ah);
+            int r = cga_pixel(page, x, y, ah == 0x0C ? color : -1);
+            if (r < 0) {
+                /* cga_pixel only models modes 4/5/13.  In text mode the
+                 * original's arm still runs and reports nothing, so a guest
+                 * that pokes a pixel must not see a diagnostic here. */
+                if (gfx_mode != 0) unsupported_ah("INT 10h", ah);
+            } else if (ah == 0x0D) {
+                /* AH=0Dh returns the pixel in AL (BIOS: "AL = color").  The
+                 * clone used to throw the result away, so a read-modify-write
+                 * guest saw the old AL. */
+                cpu.r[AX] = (uint16_t)((cpu.r[AX] & 0xFF00) | (r & 0xFF));
+            }
         }
         break;
     case 0x05:                                  /* select active page */
@@ -2007,6 +2149,14 @@ static void int10(void)
         cpu.r[0] = (uint16_t)((cpu.r[0] & 0x00FF) | (0x03 << 8));
         cpu.r[3] = 0;
         break;
+    case 0x11:                                  /* character generator */
+        /* CONFIRMED: the original's whole arm at 0x522CD8 is
+         * `cmp [ebp-0x270],al / jne next / jmp 0x523B50` - it jumps to the
+         * epilogue and does NOTHING, silently and with no report.  The clone
+         * used to print "not supported yet.", which put a line on stderr the
+         * original never writes. */
+        break;
+
     case 0x13:                                  /* write string at ES:BP */
         {
             int al      = cpu.r[AX] & 0xFF;

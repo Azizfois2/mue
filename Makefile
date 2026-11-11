@@ -75,6 +75,9 @@ test: $(BIN) $(TBIN)
 	@echo "== INT 21h date and time follow the host clock =="
 	@cd src && $(SKIPOK) "$(PYTHON)" check_int21time.py
 	@echo
+	@echo "== INT 21h/INT 10h gap regressions (re/GAPS.md) =="
+	@cd src && $(SKIPOK) "$(PYTHON)" check_gaps.py
+	@echo
 	@echo "== INT 21h file services =="
 	@cd src && $(SKIPOK) "$(PYTHON)" check_int21.py
 	@echo

@@ -1,6 +1,7 @@
 # Gap list: mue vs. emu8086
 
-Status of every surface I have compared, as of commit `b0935ae`.
+Status of every surface I have compared, as of commit after the
+"fix all gaps" pass. **Section 1 is now entirely closed** - see sec. 1.0.
 
 **How this list was produced.** Not from memory or from a wish-list. The
 authoritative list of what the original *dispatches* comes from the
@@ -28,6 +29,25 @@ arm.
 ---
 
 ## 1. Real gaps, ordered by risk
+
+### 1.0 All six closed
+
+Every item in this section is now implemented and covered by
+`src/check_gaps.py` (22 checks, wired into `make test`). Negative control:
+reverting the 2Eh/54h arms makes `verify-flag-no-report` fail.
+
+| gap | what was done |
+|---|---|
+| INT 21h AH=2Eh/54h verify flag | one byte, `dos_verify_flag`, round-trips |
+| INT 21h AH=17h rename | real `rename()`; needed `DX`->`DI` too, not just `DS`->`ES` |
+| INT 21h AH=57h file date | added `dos_fname[]` to remember each handle's host path, then `_stat` + DOS packed CX/DX |
+| INT 21h AH=0Ch/0Dh | flushes every open write handle |
+| INT 21h AH=23h/33h | break flag constant 0; Ctrl-Break get/set round-trips |
+| INT 10h AH=11h | silent no-op, matching the original's jump-to-epilogue |
+| INT 10h AH=0Ch/0Dh text mode | no diagnostic outside graphics modes |
+
+The items below are kept in their original form as the record of what the
+gap *was*.
 
 ### 1.1 INT 21h AH=57h - get/set file date and time  `0x52A182`
 

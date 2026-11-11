@@ -2945,3 +2945,45 @@ compares the returned date and time against the host clock with a tolerance
 test that pinned `2026-11-11` would pass today and rot tomorrow. Negative
 control: restoring the frozen constants fails `date-tracks-host-clock`,
 `date-day-of-week-matches` and `time-tracks-host-clock`.
+
+## 42. Closing the GAPS.md list, and one bug the tests caught IN the new code
+
+All six gaps from `re/GAPS.md` sec. 1 are implemented. Two of them were not
+the shape the list assumed.
+
+**INT 21h AH=17h rename: swapping DS was not enough.** `dos_guest_name()`
+reads **DS:DX**, so to parse the ES:DI source string the arm has to redirect
+both halves - `cpu.sr[DS] = cpu.sr[ES]` *and* `cpu.r[DX] = cpu.r[DI]`. The
+first version swapped only DS, so it read the *new* name twice and reported
+"file not found" (AX=3) on a rename that should have worked. A rename test
+that only asserted CF would have passed this bug; the one that also asserts
+the file actually moved is what caught it.
+
+**INT 21h AH=57h needed state that did not exist.** DOS identifies the file
+by handle, but the clone kept only `FILE *` per slot - no path - so there was
+nothing to `_stat`. Fixed by adding `char dos_fname[DOS_FILES][260]`,
+populated at 3Ch/3Dh and cleared at 3Eh. Without this the arm cannot be
+written at all; worth recording because it looks like a one-liner and is not.
+
+**INT 10h AH=0Dh was discarding the pixel.** Not in the original gap list -
+found while testing the mode gate. The arm called `cga_pixel()` and threw the
+return value away, so "read pixel" left AL at whatever the guest had put
+there. BIOS says AL = colour. Now `AX` low byte is set from the read.
+
+**INT 21h AH=0Ch/0Dh** implement the flush half only. The "then invoke AH=AL"
+half is not done: emu8086's arms (`0x5275BC`/`0x52775B`) reach
+`FUN_005dc310` and a `WORD PTR [edx+0x7B0]`, which was not decoded. No
+shipped example uses these, so the difference is latent - recorded here so
+it is not mistaken for complete.
+
+**A test-harness bug worth its own line.** `check_gaps.py` first failed
+rename with AX=3 while the same guest worked by hand. Cause: the snippet had
+no `org 100h`, so it assembled as an **EXE**, whose DS at load is not
+`CS-0x10` the way the hand test's `.COM` was - the `offset o` operands then
+pointed into the wrong segment. `check_run.py` and the other checks always
+used `org 100h`; this one did not. It is a reminder that "works by hand"
+and "works in the harness" differ in exactly the assembly prologue.
+
+Gate after the pass: CPU ALL PASS, `.list` 46/46, roundtrip 44/44, RUN 85/85,
+EXAMPLES 85/85, and every `check_*.py` green including the new
+`check_gaps.py` (22 checks).
