@@ -69,6 +69,9 @@ test: $(BIN) $(TBIN)
 	@echo "== INT 10h write-string services =="
 	@cd src && $(SKIPOK) "$(PYTHON)" check_int10.py
 	@echo
+	@echo "== INT 16h keyboard buffer and scan codes =="
+	@cd src && $(SKIPOK) "$(PYTHON)" check_int16.py
+	@echo
 	@echo "== INT 21h file services =="
 	@cd src && $(SKIPOK) "$(PYTHON)" check_int21.py
 	@echo

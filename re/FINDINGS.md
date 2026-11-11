@@ -2858,3 +2858,50 @@ to compare two all-zero buffers (sec. 5.6).
 Also switched the AH=0C/0D pixel page read from the numeric `cpu.r[3]` to
 `cpu.r[BX]`; `3` is BX in this enum, which is why it happened to work, but the
 numeric form is what silently aliased DH to BX in the INT 13h bug.
+
+## 40. INT 16h returns a scan code, and the key buffer is 16 deep (IMPLEMENTED)
+
+The clone buffered one byte per key and answered `AH = 00` for every
+character. The original does neither.
+
+**Buffer layout.** `ds:0x621264` is an array of scan/ASCII pairs, two bytes
+per entry with the scan code first:
+
+- `0x5628A5` stores the scan code at `[buf + idx*2]`, `0x5628C9` the ASCII at
+  `[buf + idx*2 + 1]`, and `0x5628D8` increments the count at `ds:0x621270`.
+- INT 16h AH=01 reads them back the same way: `0x524B5D` takes `[buf+idx*2]`
+  into AH (`+0xBB`) and `0x524BA7` takes `[buf+idx*2+1]` into AL (`+0xBA`),
+  then sets ZF=0 via `+0x3E = 0xFFFF`. With no key pending it sets ZF=1
+  through `+0x3C = 0xFFFF` (`0x524BCD`).
+- The scan code is computed per key, not looked up in a shipped table: the
+  character arrives from `[obj+0x770]` (`0x562759`), `0x4ACC90` narrows the
+  variant, and `[obj+0x774]` fills the six-word key struct (`0x5627CE`).
+
+**Documented contract.** emu8086's own
+`documentation/8086_bios_and_dos_interrupts.html` says, for both AH=00 and
+AH=01: *"AH = BIOS scan code. AL = ASCII character."* So AH=00 was a plain
+contract violation, not a licence taken by the clone.
+
+**Cap.** `0x56287C` loads the count and `cmp ax,0x10 / jge 0x562906` skips the
+store past 16 entries - the arm it jumps to waits and returns without
+buffering. The clone had a 255-byte ring.
+
+**Implementation.** The clone keeps a parallel `kb_scan[]` beside `kb[]`,
+`bios_scan()` maps a character to its standard set-1 code (letters are
+`0x1E + (c - 'A')`, digits `1`-`0` are `0x02`-`0x0B`, Enter `1C`, Esc `01`,
+Tab `0F`, Space `39`, Backspace `0E`), and `KB_DEPTH` is 16. Both AH=00 and
+AH=01 now return `AH = scan, AL = ASCII`.
+
+**Two of my own test expectations were wrong, and the emulator was right.**
+I first asserted `'K'` was scan `25h` (it is `28h`, since `A` is `1Eh`) and
+that `'B'` was `30h` (it is `1Fh`; `30h` is `S`). Both times the run output
+contradicted me and I corrected the test, not the code. Worth stating plainly
+because the temptation is to "fix" working code until an invented number
+matches.
+
+The pre-existing INT 21h checks (`int16-peek-returns-key`,
+`int16-peek-does-not-consume`) asserted the old `0x4B00` shape and had to be
+updated to `0x284B`: they were pinning the bug, not the contract.
+
+Gate: `src/check_int16.py` (13 checks, wired into `make test`). Negative
+control - forcing `AH = 0` again turns 11 of them red.

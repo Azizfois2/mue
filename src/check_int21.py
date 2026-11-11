@@ -2263,10 +2263,14 @@ def main():
         bx = reg(out, "BX")
         cx = reg(out, "CX")
         di = reg(out, "DI")
-        check("int16-peek-returns-key", bx == 0x4B00,
+        # FINDINGS 40: INT 16h reports AH = BIOS scan code, AL = ASCII.  'K' is
+        # scan 28h / ASCII 4Bh in set 1 (A=1Eh, so K=1Eh+10=28h).  These checks
+        # used to demand 0x4B00, which was the old AH=00 behaviour, not the
+        # documented contract.
+        check("int16-peek-returns-key", bx == 0x284B,
               hex(bx) if bx is not None else None)
         check("int16-peek-zf-clear", di is not None and not (di & 0x40), di)
-        check("int16-peek-does-not-consume", cx == 0x4B00,
+        check("int16-peek-does-not-consume", cx == 0x284B,
               hex(cx) if cx is not None else None)
 
         rc, out = run(mue, T_INT16_NONE, d, b"")

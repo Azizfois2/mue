@@ -37,7 +37,45 @@ int  dos_exit_requested;
 int  dos_exit_code;
 
 /* ---- keyboard queue -------------------------------------------------- */
+/* BIOS set-1 scan codes for the ASCII characters a terminal can produce.
+ *
+ * The original derives a scan code for every buffered key: [obj+0x770] reads
+ * the character, 0x4ACC90 narrows it and [obj+0x774] fills the scan/ASCII
+ * pair that ds:0x621264 holds at two bytes per entry (scan at +0, ASCII at
+ * +1: 0x5628A5 and 0x5628C9 write them, 0x524B5D/0x524BA7 read them back for
+ * INT 16h AH=00/01).  Its own documentation states the contract plainly:
+ * "INT 16h / AH = 00h ... return: AH = BIOS scan code. AL = ASCII
+ * character."  The clone used to leave AH = 00 for every key.
+ *
+ * The table is the standard set-1 map, which is what a real BIOS returns, so
+ * a guest that tests AH (arrow keys, Enter vs Ctrl-M) sees familiar values. */
+static unsigned char bios_scan(unsigned char ch)
+{
+    /* letters and digits are contiguous in set 1 */
+    if (ch >= 'a' && ch <= 'z') ch = (unsigned char)(ch - 'a' + 'A');
+    if (ch >= 'A' && ch <= 'Z') return (unsigned char)(0x1E + (ch - 'A'));
+
+    switch (ch) {
+    case '1': return 0x02;  case '2': return 0x03;  case '3': return 0x04;
+    case '4': return 0x05;  case '5': return 0x06;  case '6': return 0x07;
+    case '7': return 0x08;  case '8': return 0x09;  case '9': return 0x0A;
+    case '0': return 0x0B;
+    case '-': return 0x0C;  case '=': return 0x0D;
+    case '[': return 0x1A;  case ']': return 0x1B;
+    case ';': return 0x27;  case '\'': return 0x28; case '`': return 0x29;
+    case '\\': return 0x2B; case ',': return 0x33;
+    case '.': return 0x34;  case '/': return 0x35;
+    case ' ': return 0x39;
+    case '\r': case '\n': return 0x1C;         /* Enter */
+    case 0x08: return 0x0E;                    /* Backspace */
+    case 0x09: return 0x0F;                    /* Tab */
+    case 0x1B: return 0x01;                    /* Esc */
+    default:   return 0x00;                    /* no scan code known */
+    }
+}
+
 static unsigned char kb[256];
+static unsigned char kb_scan[256];             /* parallel BIOS scan codes */
 static int kb_head, kb_tail;
 static const char *scripted = NULL;      /* redirected stdin text */
 static size_t scripted_pos;
@@ -47,6 +85,7 @@ void dos_push_key(int ch)
     int nt = (kb_tail + 1) & 0xFF;
     if (nt == kb_head) return;
     kb[kb_tail] = (unsigned char)ch;
+    kb_scan[kb_tail] = bios_scan((unsigned char)ch);
     kb_tail = nt;
 }
 
@@ -55,6 +94,12 @@ void dos_push_key(int ch)
  * not copied, so it has to stay alive for the rest of the run; NULL goes back
  * to the host stream.  Anything already typed is dropped, because a script
  * describes stdin from the start of the run. */
+/* The original's key buffer holds 16 entries and silently drops anything
+ * beyond that: 0x56287C loads the count, `cmp ax,0x10 / jge 0x562906` and the
+ * arm it skips to waits then returns without storing.  Each entry is a
+ * scan/ASCII pair at ds:0x621264 (two bytes each). */
+#define KB_DEPTH 16
+
 void dos_feed_stdin(const char *text)
 {
     scripted = text;
@@ -83,10 +128,16 @@ static int host_stdin_byte(void)
 
 /* Queue one host byte when the buffer is empty.  Returns 0 at end of input,
  * which only a redirected stdin can reach. */
+static int kb_count(void)
+{
+    return (kb_tail - kb_head) & 0xFF;
+}
+
 static int kb_refill(void)
 {
     int c;
     if (kb_head != kb_tail) return 1;
+    if (kb_count() >= KB_DEPTH) return 0;
     if (scripted) {
         c = scripted[scripted_pos] ? (unsigned char)scripted[scripted_pos++] : -1;
     } else {
@@ -115,11 +166,16 @@ static int dos_stdin_console(void)
 }
 
 /* Pop a key, waiting for one when nothing is buffered. */
+/* Last key's BIOS scan code, kept beside the character so INT 16h can report
+ * both halves of AX. */
+static int kb_last_scan;
+
 static int kb_pop(void)
 {
     int v;
     if (!kb_refill()) return -1;
     v = kb[kb_head];
+    kb_last_scan = kb_scan[kb_head];
     kb_head = (kb_head + 1) & 0xFF;
     return v;
 }
@@ -128,6 +184,7 @@ static int kb_pop(void)
 static int kb_peek(void)
 {
     if (!kb_refill()) return -1;
+    kb_last_scan = kb_scan[kb_head];
     return kb[kb_head];
 }
 
@@ -1961,17 +2018,21 @@ static void int10(void)
 static void int16(void)
 {
     int ah = (cpu.r[0] >> 8) & 0xFF;
+
+    /* INT 16h returns the scan code in AH and the character in AL, which the
+     * original documents as "AH = BIOS scan code. AL = ASCII character." and
+     * implements through the ds:0x621264 pairs (FINDINGS 40). */
     switch (ah) {
     case 0x00: case 0x10: {
         int c = kb_pop();
-        if (c < 0) c = 0;
-        cpu.r[0] = (uint16_t)((c << 8) | 0);
+        if (c < 0) { c = 0; kb_last_scan = 0; }
+        cpu.r[0] = (uint16_t)((kb_last_scan << 8) | (c & 0xFF));
         cpu.flags &= ~F_ZF;
         break; }
     case 0x01: case 0x11: {                 /* peek: wait, but do not consume */
         int c = kb_peek();                  /* blocks on a terminal */
         if (c >= 0) { cpu.flags &= ~F_ZF;
-            cpu.r[0] = (uint16_t)((c << 8) | 0); }
+            cpu.r[0] = (uint16_t)((kb_last_scan << 8) | (c & 0xFF)); }
         else { cpu.flags |= F_ZF; cpu.r[0] = 0; }
         break; }
     default: break;
