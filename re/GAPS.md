@@ -102,6 +102,21 @@ no rename at all.
 casual reading; a guest checking Ctrl-Break state gets nothing back. Note the
 clone already handles INT 33h (mouse reset) separately - do not confuse them.
 
+### 1.6a INT 10h: all 13 documented subfunctions verified by side effect
+
+`src/check_int10sem.py`, 15 checks. Not "an arm exists" but "the thing the
+BIOS is supposed to change actually changed": cursor shape round-trips
+through AH=03h with two different values; page selection is proved by keeping
+independently movable cursors on two pages; scroll is proved by the text
+moving and the freed rows blanking; AH=08h reads back what AH=09h wrote,
+attribute included; AH=0Ah changes the character but not the attribute;
+AH=0Ch/0Dh round-trip two different colours and leave an untouched pixel as
+background; AH=0Eh prints and advances; AH=13h puts text where each AL mode
+claims.
+
+**This found a real bug**: AH=13h ignored BL and drew every string in the
+default grey (FINDINGS 48).
+
 ### 1.6 INT 10h AH=11h - character generator  `0x522CD8`
 
 **This one is NOT a real gap in behaviour.** The original's arm is
