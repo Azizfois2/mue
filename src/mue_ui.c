@@ -52,6 +52,8 @@
 #include "mue_icons.h"
 #include "mue_highlight.h"
 #include "mue_source.h"
+#include "mue_core.h"
+#include "cpu.h"
 #include <FL/fl_draw.H>
 
 #include <stdio.h>
@@ -150,42 +152,52 @@ public:
     HexList(int x, int y, int w, int h)
         : Fl_Widget(x, y, w, h, 0), nrows(0), base(0) {}
     int nrows;
-    /* Physical address shown in the first row.  The address field reads
-     * "0050:0000", so the list must start at CS*16+IP = 0x500.  Showing 00000
-     * here contradicted the address box: the two are the same location. */
+    /* Physical address shown in the first row. */
     unsigned base;
-    /* Row height and font size, chosen to match the original: bold 14pt
-     * monospace on 18px rows, so roughly 22 rows fill the panel. */
+    /* Row height and font size, chosen to match the original: bold 13pt
+     * monospace on 18px rows. */
     static const int ROW_H = 18;
+
+    /* One row per byte: address, the byte in hex, the same in decimal, and
+     * the character if it is printable. The bytes come from the live
+     * machine, not from a placeholder - a memory view that does not show
+     * memory is worse than no memory view. */
     void draw() {
         draw_box(FL_DOWN_BOX, x(), y(), w(), h(), FL_WHITE);
         fl_push_clip(x() + 1, y() + 1, w() - 2, h() - 2);
-        /* Columns are spread across the full width instead of being bunched
-         * into the left 140px of a much wider box. */
         const int cx_addr = x() + 8;
-        const int cx_hex  = x() + w() - 118;
-        const int cx_dec  = x() + w() - 82;
-        const int cx_asc  = x() + w() - 48;
+        const int cx_hex  = x() + w() - 128;
+        const int cx_dec  = x() + w() - 92;
+        const int cx_asc  = x() + w() - 52;
         for (int i = 0, yy = y() + 2; i < nrows && yy + ROW_H <= y() + h() - 2;
              i++, yy += ROW_H) {
-            char a[16], d[16];
-            snprintf(a, sizeof a, "%05X:", base + i);
-            snprintf(d, sizeof d, "%03d", 0);
+            char a[24], hex[8], dec[8], asc[8];
+            unsigned char v = core_peek8(base + (unsigned)i);
+            snprintf(a, sizeof a, "%05X:", base + (unsigned)i);
+            snprintf(hex, sizeof hex, "%02X", v);
+            snprintf(dec, sizeof dec, "%03d", v);
+            if (v >= 32 && v < 127 && v != ' ') {
+                asc[0] = (char)v; asc[1] = 0;
+            } else {
+                snprintf(asc, sizeof asc, "NULL");
+            }
             fl_font(FL_COURIER, 13);
             fl_color(112, 112, 112);
-            fl_draw(a, cx_addr, yy, 62, ROW_H, FL_ALIGN_LEFT);
+            fl_draw(a, cx_addr, yy, 66, ROW_H, FL_ALIGN_LEFT);
             fl_font(FL_COURIER_BOLD, 13);
             fl_color(0, 128, 0);
-            fl_draw("00", cx_hex, yy, 26, ROW_H, FL_ALIGN_LEFT);
+            fl_draw(hex, cx_hex, yy, 26, ROW_H, FL_ALIGN_LEFT);
             fl_color(FL_BLACK);
-            fl_draw(d, cx_dec, yy, 34, ROW_H, FL_ALIGN_LEFT);
-            fl_draw("NULL", cx_asc, yy, 46, ROW_H, FL_ALIGN_LEFT);
+            fl_draw(dec, cx_dec, yy, 34, ROW_H, FL_ALIGN_LEFT);
+            fl_draw(asc, cx_asc, yy, 46, ROW_H, FL_ALIGN_LEFT);
         }
         fl_pop_clip();
     }
     /* Rows that actually fit, so the caller does not have to guess. */
     int rows_that_fit() const { return (h() - 6) / ROW_H; }
 };
+
+static HexList *mem_list;   /* the memory panel, filled from live state */
 /* The gutter: one grey line number per source line, right-aligned, drawn at
  * the same line spacing the editor uses.  Drawn by hand because a multi-line
  * label wraps at the box width and produced garbled text. */
@@ -208,6 +220,7 @@ public:
 static FlagCell  *flagcell[NFLAG];
 static SourceView          *editor_text;
 static char                 guest_src[16384];
+static int                  run_fast;   /* run with no step delay */
 static Fl_Double_Window    *emu_window;   /* hidden until `emulate` */
 static Fl_Multiline_Output *screen_area, *dis_area;
 static Fl_Box    *status_editor, *status_emul;
@@ -284,53 +297,50 @@ static void refresh_state(void)
 }
 
 /* ====================================================================== */
-/* run the verified CLI and scrape its dump                                */
+/* driving the core in-process                                             */
 
-static int run_guest(const char *src, RegState *out)
+/* Pull the machine state out of the core into the panels' RegState. */
+static void state_from_core(RegState *st)
 {
-    char dir[512], path[600], cmd[1400], line[512];
-    FILE *f, *p;
-    const char *tmp = getenv("TEMP");
-    if (!tmp || !tmp[0]) tmp = ".";
-    snprintf(dir, sizeof dir, "%s\\mue_ui_run", tmp);
-    snprintf(path, sizeof path, "%s\\guest.asm", dir);
-#ifdef _WIN32
-    { char mk[700]; snprintf(mk, sizeof mk, "cmd /c mkdir \"%s\" 2>nul", dir); system(mk); }
-#endif
-    f = fopen(path, "wb");
-    if (!f) return 0;
-    fputs(src, f);
-    fclose(f);
-    snprintf(cmd, sizeof cmd, "\"%s\" \"%s\" 2>&1", MUE_CLI_EXE, path);
-    p = popen(cmd, "r");
-    if (!p) return 0;
-    memset(out, 0, sizeof *out);
-    while (fgets(line, sizeof line, p)) {
-        unsigned v;
-        if (sscanf(line, " AX=%4x", &v) == 1) out->ax = (unsigned short)v;
-        else if (sscanf(line, " BX=%4x", &v) == 1) out->bx = (unsigned short)v;
-        else if (sscanf(line, " CX=%4x", &v) == 1) out->cx = (unsigned short)v;
-        else if (sscanf(line, " DX=%4x", &v) == 1) out->dx = (unsigned short)v;
-        else if (sscanf(line, " SP=%4x", &v) == 1) out->sp = (unsigned short)v;
-        else if (sscanf(line, " BP=%4x", &v) == 1) out->bp = (unsigned short)v;
-        else if (sscanf(line, " SI=%4x", &v) == 1) out->si = (unsigned short)v;
-        else if (sscanf(line, " DI=%4x", &v) == 1) out->di = (unsigned short)v;
-        else if (sscanf(line, " CS=%4x", &v) == 1) out->cs = (unsigned short)v;
-        else if (sscanf(line, " DS=%4x", &v) == 1) out->ds = (unsigned short)v;
-        else if (sscanf(line, " ES=%4x", &v) == 1) out->es = (unsigned short)v;
-        else if (sscanf(line, " SS=%4x", &v) == 1) out->ss = (unsigned short)v;
-        else if (sscanf(line, " IP=%4x", &v) == 1) out->ip = (unsigned short)v;
-        else if (sscanf(line, " FLAGS=%4x", &v) == 1) out->flags = (unsigned short)v;
-        else if (strstr(line, "instructions executed:"))
-            out->icount = strtol(strstr(line, ":") + 1, NULL, 10);
-    }
-    pclose(p);
-    out->valid = 1;
-    return 1;
+    unsigned short r8[8], sr4[4], ip, flags;
+    long ic;
+    core_regs(r8, sr4, &ip, &flags, &ic);
+    st->ax = r8[AX]; st->cx = r8[CX]; st->dx = r8[DX]; st->bx = r8[BX];
+    st->sp = r8[SP]; st->bp = r8[BP]; st->si = r8[SI]; st->di = r8[DI];
+    st->es = sr4[ES]; st->cs = sr4[CS]; st->ss = sr4[SS]; st->ds = sr4[DS];
+    st->ip = ip;
+    st->flags = flags;
+    st->icount = ic;
+    st->valid = 1;
 }
 
-/* ====================================================================== */
-/* callbacks                                                               */
+/* Redraw the memory and disassembly panels from live machine state. */
+static void refresh_views(void)
+{
+    unsigned short cs, ip;
+    char buf[4096];
+
+    core_cs_ip(&cs, &ip);
+
+    if (dis_area) {
+        core_disasm_list(buf, sizeof buf, 22);
+        dis_area->value(buf);
+        dis_area->redraw();
+    }
+    if (mem_list) {
+        /* The memory panel shows the bytes at CS:IP, as the original does
+         * by default. */
+        mem_list->base = ((uint32_t)cs << 4) + ip;
+        mem_list->nrows = mem_list->rows_that_fit();
+        mem_list->redraw();
+    }
+    if (screen_area) {
+        char scr[2200];
+        core_screen_text(scr, sizeof scr);
+        screen_area->value(scr);
+        screen_area->redraw();
+    }
+}
 
 static void cb_emulate(Fl_Widget *, void *)
 {
@@ -345,21 +355,37 @@ static void cb_emulate(Fl_Widget *, void *)
         emu_window->resize(emu_window->x(), emu_window->y(),
                            emu_window->w(), emu_window->h());
         emu_window->redraw();
-        refresh_state();
         Fl::check();
         Fl::flush();
     }
     if (!editor_text) return;
-    prev = cur;
+
     snprintf(guest_src, sizeof guest_src, "%s",
-             editor_text ? editor_text->text().c_str() : "");
-    if (run_guest(guest_src, &cur)) {
-        refresh_state();
-        if (status_editor) status_editor->copy_label("emulated");
-    } else if (status_editor) {
-        status_editor->copy_label("could not run the guest");
+             editor_text->text().c_str());
+    {
+        char err[512];
+        if (!core_load(guest_src, err, sizeof err)) {
+            if (status_emul) {
+                status_emul->copy_label(err[0] ? err : "assembly failed");
+                status_emul->redraw();
+            }
+            if (status_editor) {
+                status_editor->copy_label(err[0] ? err : "assembly failed");
+                status_editor->redraw();
+            }
+            return;
+        }
     }
-    if (status_editor) status_editor->redraw();
+
+    prev = cur;
+    core_run(4000000);
+    state_from_core(&cur);
+    refresh_state();
+    refresh_views();
+    if (status_editor) {
+        status_editor->copy_label("emulated");
+        status_editor->redraw();
+    }
 }
 
 static void cb_compile(Fl_Widget *, void *)
@@ -375,26 +401,85 @@ static void cb_reset(Fl_Widget *, void *)
 {
     memset(&cur, 0, sizeof cur);
     memset(&prev, 0, sizeof prev);
-    cur.valid = prev.valid = 0;
     if (screen_area) screen_area->value("");
     if (dis_area) dis_area->value("");
     for (int i = 0; i < NGEN; i++) {
-        regh[i]->copy_label("00"); regh[i]->color(C_FIELD);
-        regl[i]->copy_label("00"); regl[i]->color(C_FIELD);
+        regh[i]->copy_label("00"); regh[i]->color(C_FIELD); regh[i]->redraw();
+        regl[i]->copy_label("00"); regl[i]->color(C_FIELD); regl[i]->redraw();
     }
     for (int i = 0; i < NSEG; i++) {
         segbox[i]->copy_label("0000"); segbox[i]->color(C_FIELD);
+        segbox[i]->redraw();
     }
+    for (int i = 0; i < NFLAG; i++) if (flagcell[i]) flagcell[i]->value(0);
     refresh_state();
     if (status_emul) { status_emul->copy_label("reset"); status_emul->redraw(); }
 }
 
+/* One instruction, with the panels updated afterwards - this is the whole
+ * point of linking the core into the UI rather than scraping the CLI. */
 static void cb_step(Fl_Widget *, void *)
 {
+    if (!core_loaded()) {
+        /* Nothing loaded yet: load and run nothing, so a user who steps
+         * first gets a sensible starting state rather than a dead button. */
+        cb_emulate(0, 0);
+        return;
+    }
+    prev = cur;
+    if (!core_step()) {
+        if (status_emul) {
+            status_emul->copy_label(core_halted() ? "halted"
+                                                  : "cannot step further");
+            status_emul->redraw();
+        }
+        return;
+    }
+    state_from_core(&cur);
+    refresh_state();
+    refresh_views();
     if (status_emul) {
-        status_emul->copy_label("single step needs the in-process core");
+        char b[96];
+        snprintf(b, sizeof b, "step %ld", cur.icount);
+        status_emul->copy_label(b);
         status_emul->redraw();
     }
+}
+
+/* Continuous run: step on a timer so the screen and registers stay live
+ * instead of freezing until the program ends. */
+static void run_timer(void *)
+{
+    if (!core_loaded() || core_halted()) {
+        if (status_emul) {
+            status_emul->copy_label(core_halted() ? "halted" : "stopped");
+            status_emul->redraw();
+        }
+        return;
+    }
+    prev = cur;
+    core_run(run_fast ? 20000 : 1000);
+    state_from_core(&cur);
+    refresh_state();
+    refresh_views();
+    if (status_emul) {
+        char b[96];
+        snprintf(b, sizeof b, "%ld instructions executed", cur.icount);
+        status_emul->copy_label(b);
+        status_emul->redraw();
+    }
+    if (!core_halted()) Fl::repeat_timeout(0.05, run_timer);
+    else if (status_emul) {
+        status_emul->copy_label("halted");
+        status_emul->redraw();
+    }
+}
+
+static void cb_run(Fl_Widget *, void *)
+{
+    if (!core_loaded()) { cb_emulate(0, 0); return; }
+    if (core_halted()) return;
+    Fl::add_timeout(0.05, run_timer);
 }
 
 static const char *zero_memory_disasm(void)
@@ -634,6 +719,8 @@ static Fl_Double_Window *build_emulator(void)
          * it is greyed here too rather than silently doing nothing. */
         for (int i = 0; i < 5; i++) {
             Fl_Button *b = make_tool(6 + i * 88, 28, 84, 46, nm[i], ic[i]);
+            if (i == 3) b->callback(cb_step);
+            if (i == 4) b->callback(cb_run);
             if (i == 2) { b->deimage(icon_grayed(icon_step_back())); b->deactivate(); }
         }
         Fl_Slider *sl = new Fl_Slider(6 + 5 * 88 + 14, 38, 190, 16, "");
@@ -703,6 +790,7 @@ static Fl_Double_Window *build_emulator(void)
 
         HexList *hl = new HexList(M + 196, 130, 272, PANEL_H - 52);
         hl->nrows = hl->rows_that_fit();
+        mem_list = hl;
         Fl_Scrollbar *sb = new Fl_Scrollbar(M + 190 + 274, 130, 16,
                                             PANEL_H - 52);
         sb->linesize(1);
@@ -764,7 +852,6 @@ static Fl_Double_Window *build_emulator(void)
             b->box(FL_UP_BOX);
             b->labelsize(11);
             if (i == 2) b->callback(cb_reset);
-            if (i == 0) b->callback(cb_step);
         }
     }
     /* The buttons are created before the screen panel so that they paint on
