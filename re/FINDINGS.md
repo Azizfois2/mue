@@ -3306,3 +3306,38 @@ the first version let `TimeoutExpired` abort the script instead of reporting,
 which is exactly the silent-failure shape this section is about.
 
 The stale comment now points at `check_int15.py`.
+
+## 50. INT 33h: `cpu.r[2] = 0` is DX, not AX - the numeric-index hazard again
+
+Auditing which interrupts had no test at all found INT 33h (mouse) at zero
+coverage. Reading the arm turned up a bug of exactly the kind recorded in the
+key decisions:
+
+    case 0x33: cpu.r[2] = 0; return 1; /* mouse reset */
+
+`cpu.r[]` is `{AX, CX, DX, BX, SP, BP, SI, DI}`, so **r[2] is DX**. The line
+zeroed DX and left AX holding the function number, which means:
+
+- a guest calling 0000h (reset) saw AX = 0000h by luck, because the function
+  number *is* zero - so the reset looked correct;
+- a guest calling 0001h/0002h/0003h saw AX = the function number echoed back,
+  which is a plausible "success" answer and would tell a program a mouse
+  exists;
+- and DX was destroyed for every one of them.
+
+That is why it survived: the only function anyone would test (0000h) happened
+to give the right answer, and the wrong behaviour on 1/2/3 looked harmless.
+
+**Fixed** to name the register: 0000h answers AX=0 (how DOS says "no mouse
+installed"); 0001h/0002h/0003h leave AX as the caller set it, like a driver
+with no mouse present. Nothing else is touched.
+
+`src/check_int33.py` pins this per register - AX per function, plus DX and BX
+sentinel checks, because the bug's signature was exactly "a register nobody
+asked about changed". Negative control: restoring `cpu.r[2] = 0` fails all
+four `int33-NNNN-preserves-dx` checks with DI=0.
+
+**What the narrow contract is.** emu8086's reference lists INT 33h/0000h-0003h
+and gives no register contract for any of them, so the clone's obligation is
+only: accept the call, report no mouse, damage nothing else. That is now
+stated at the use site rather than implied.

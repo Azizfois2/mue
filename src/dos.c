@@ -2456,7 +2456,24 @@ int dos_interrupt(int n)
     case 0x23: break;
     case 0x24: return 1;                /* critical error handler */
     case 0x28: return 1;                /* DOS idle */
-    case 0x33: cpu.r[2] = 0; return 1; /* mouse reset */
+    /* INT 33h mouse.  emu8086's reference lists exactly four functions
+     * (0000h-0003h) and gives no register contract for any of them, so what a
+     * guest may rely on is limited to "the call is accepted".  The clone has
+     * no mouse, and says so the way DOS does: function 0000h (reset) reports
+     * "no mouse installed" as AX=0.
+     *
+     * This line used to read `cpu.r[2] = 0`, which is DX, not AX - the
+     * registers are {AX,CX,DX,BX,SP,BP,SI,DI}, so a numeric index silently
+     * zeroed the wrong register and left AX holding the function number.
+     * Always use the enum names (this is the hazard noted in the key
+     * decisions); see check_int33.py, which pins AX per function. */
+    case 0x33: {
+        uint16_t fn = cpu.r[AX];
+        if (fn == 0x0000) cpu.r[AX] = 0x0000;   /* reset: no mouse present */
+        /* 0001h show / 0002h hide / 0003h read position-and-buttons are all
+         * no-ops with no mouse: a real driver leaves AX alone for them. */
+        return 1;
+    }
     case 0x03:                          /* debugger breakpoint */
     case 0x04:                          /* overflow */
         return 0;
