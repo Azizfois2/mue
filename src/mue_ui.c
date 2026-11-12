@@ -223,6 +223,10 @@ static SourceView          *editor_text;
 static char                 guest_src[16384];
 static int                  run_fast;   /* run with no step delay */
 static Fl_Double_Window    *emu_window;   /* hidden until `emulate` */
+static Fl_Double_Window    *stack_window, *source_window;
+static Fl_Double_Window    *vars_window, *debug_window, *flags_window;
+static Fl_Multiline_Output *stack_area, *source_area;
+static Fl_Multiline_Output *vars_area, *debug_area, *flags_area;
 static Fl_Multiline_Output *screen_area, *dis_area;
 static Fl_Box    *status_editor, *status_emul;
 static RegState   cur, prev;
@@ -315,6 +319,13 @@ static void state_from_core(RegState *st)
     st->valid = 1;
 }
 
+/* The side panels refill from live state; declared here because
+ * refresh_views() keeps them in step and is defined first. */
+static void fill_stack(void);
+static void fill_vars(void);
+static void fill_debug(void);
+static void fill_flags(void);
+
 /* Redraw the memory and disassembly panels from live machine state. */
 static void refresh_views(void)
 {
@@ -341,6 +352,12 @@ static void refresh_views(void)
         screen_area->value(scr);
         screen_area->redraw();
     }
+    /* Keep any open side window in step with the machine.  Each fills itself
+     * only when it exists, so this costs nothing when none are open. */
+    if (stack_window && stack_window->shown()) fill_stack();
+    if (vars_window  && vars_window->shown())  fill_vars();
+    if (debug_window && debug_window->shown()) fill_debug();
+    if (flags_window && flags_window->shown()) fill_flags();
 }
 
 static void cb_emulate(Fl_Widget *, void *)
@@ -392,6 +409,266 @@ static void cb_emulate(Fl_Widget *, void *)
 static void cb_open_calc(Fl_Widget *, void *)  { tools_open_calculator(); }
 static void cb_open_conv(Fl_Widget *, void *)  { tools_open_convertor(); }
 static void cb_open_opts(Fl_Widget *, void *)  { tools_open_options(); }
+
+/* Shared close handler for the windows the emulator can open: hide rather
+ * than destroy, so reopening is cheap and keeps the last contents. */
+static void cb_close_window(Fl_Widget *w, void *)
+{
+    w->hide();
+}
+
+/* ---- the `stack` window ----------------------------------------------
+ * emu8086's tooltip for cmdStack is "memory at SS:SP from bottom to top", so
+ * this is a memory view anchored at the stack pointer and read upward - NOT a
+ * call trace.  It shows the physical address, the word, and the byte pair, so
+ * a pushed return address can be followed without doing the arithmetic. */
+static void fill_stack(void)
+{
+    char buf[8192];
+    int o = 0, i;
+    unsigned short r8[8], sr4[4], ip, flags;
+    long ic;
+
+    if (!stack_area) return;
+    if (!core_loaded()) {
+        stack_area->value("no program loaded");
+        stack_area->redraw();
+        return;
+    }
+    core_regs(r8, sr4, &ip, &flags, &ic);
+    {
+        uint32_t base = ((uint32_t)sr4[SS] << 4) + r8[SP];
+        uint16_t ss = sr4[SS], sp = r8[SP];
+
+        o += snprintf(buf + o, sizeof buf - o,
+                      "SS:SP = %04X:%04X   physical %05X\n\n", ss, sp, base);
+        o += snprintf(buf + o, sizeof buf - o,
+                      "addr   word   bytes\n");
+        for (i = 0; i < 24 && o < (int)sizeof buf - 40; i++) {
+            uint16_t w = core_peek16(base + (uint32_t)i * 2);
+            o += snprintf(buf + o, sizeof buf - o,
+                          "%05X  %04X   %02X %02X\n",
+                          base + (uint32_t)i * 2, w,
+                          w & 0xFF, w >> 8);
+        }
+    }
+    stack_area->value(buf);
+    stack_area->redraw();
+}
+
+static void cb_show_stack(Fl_Widget *, void *)
+{
+    if (!stack_window) {
+        stack_window = new Fl_Double_Window(300, 380, "stack");
+        stack_area = new Fl_Multiline_Output(6, 6, 288, 368);
+        stack_area->box(FL_DOWN_BOX);
+        stack_area->color(FL_WHITE);
+        stack_area->textcolor(C_TEXT);
+        stack_area->textfont(FL_COURIER_BOLD);
+        stack_area->textsize(13);
+        stack_window->end();
+        stack_window->callback(cb_close_window, &stack_window);
+    }
+    fill_stack();
+    stack_window->show();
+}
+
+/* ---- the `source` window ---------------------------------------------
+ * cmdShowActualSource's tooltip is "original source code": this shows the
+ * program the user wrote, not a disassembly.  The highlighting is the same
+ * tokeniser the editor uses, so the window reads like the editor pane. */
+static void cb_show_source(Fl_Widget *, void *)
+{
+    if (!source_window) {
+        source_window = new Fl_Double_Window(560, 460, "original source code");
+        source_area = new Fl_Multiline_Output(6, 6, 548, 448);
+        source_area->box(FL_DOWN_BOX);
+        source_area->color(FL_WHITE);
+        source_area->textcolor(C_TEXT);
+        source_area->textfont(FL_COURIER_BOLD);
+        source_area->textsize(13);
+        source_window->end();
+        source_window->callback(cb_close_window, &source_window);
+    }
+    source_area->value(guest_src[0] ? guest_src : "no program loaded");
+    source_window->show();
+    source_area->redraw();
+}
+
+/* ---- the remaining three panels -------------------------------------- */
+
+/* `screen` just brings the always-visible screen panel to the front: in
+ * emu8086 the button re-shows the panel when the window is tall enough for
+ * it, and it is the same screen the program draws into. */
+static void cb_show_screen_panel(Fl_Widget *, void *)
+{
+    if (screen_area) {
+        refresh_views();
+        screen_area->redraw();
+    }
+}
+
+/* `vars` - cmdVars.  The clone has no symbol table in the core yet, so this
+ * shows the data segment itself: DS:0000 upward, which is where a .COM
+ * program's `db`/`dw` variables actually live.  That is the real memory, and
+ * naming it plainly is better than inventing a symbol list we cannot fill. */
+static void fill_vars(void)
+{
+    char buf[8192];
+    int o = 0, i;
+    unsigned short r8[8], sr4[4], ip, flags;
+    long ic;
+
+    if (!vars_area) return;
+    if (!core_loaded()) {
+        vars_area->value("no program loaded");
+        vars_area->redraw();
+        return;
+    }
+    core_regs(r8, sr4, &ip, &flags, &ic);
+    {
+        uint32_t base = (uint32_t)sr4[DS] << 4;
+
+        o += snprintf(buf + o, sizeof buf - o,
+                      "DS = %04X   (variables live here)\n"
+                      "no symbol table in this build - raw data segment:\n\n"
+                      "addr   +0 +1 +2 +3 +4 +5 +6 +7\n", sr4[DS]);
+        for (i = 0; i < 32 && o < (int)sizeof buf - 64; i++) {
+            int k;
+            o += snprintf(buf + o, sizeof buf - o, "%05X ", base + (uint32_t)i * 8);
+            for (k = 0; k < 8; k++)
+                o += snprintf(buf + o, sizeof buf - o, " %02X",
+                              core_peek8(base + (uint32_t)i * 8 + (uint32_t)k));
+            o += snprintf(buf + o, sizeof buf - o, " \n");
+        }
+    }
+    vars_area->value(buf);
+    vars_area->redraw();
+}
+
+static void cb_show_vars(Fl_Widget *, void *)
+{
+    if (!vars_window) {
+        vars_window = new Fl_Double_Window(340, 620, "variables");
+        vars_area = new Fl_Multiline_Output(6, 6, 328, 608);
+        vars_area->box(FL_DOWN_BOX);
+        vars_area->color(FL_WHITE);
+        vars_area->textcolor(C_TEXT);
+        vars_area->textfont(FL_COURIER_BOLD);
+        vars_area->textsize(13);
+        vars_window->end();
+        vars_window->callback(cb_close_window, &vars_window);
+    }
+    fill_vars();
+    vars_window->show();
+}
+
+/* `debug` - cmdLog, captioned `log and debug.exe emulation`.  It records what
+ * has run: the instruction count and the last few executed instructions, the
+ * way debug.exe's trace does. */
+static void fill_debug(void)
+{
+    char buf[8192];
+    int o = 0;
+    unsigned short r8[8], sr4[4], ip, flags;
+    long ic;
+
+    if (!debug_area) return;
+    if (!core_loaded()) {
+        debug_area->value("no program loaded");
+        debug_area->redraw();
+        return;
+    }
+    core_regs(r8, sr4, &ip, &flags, &ic);
+    o += snprintf(buf + o, sizeof buf - o,
+                  "instructions executed: %ld\n"
+                  "CS:IP = %04X:%04X   halted: %s\n\n"
+                  "registers\n"
+                  "AX=%04X BX=%04X CX=%04X DX=%04X\n"
+                  "SI=%04X DI=%04X BP=%04X SP=%04X\n"
+                  "DS=%04X ES=%04X SS=%04X CS=%04X  flags=%04X\n\n"
+                  "upcoming\n",
+                  ic, sr4[CS], ip, core_halted() ? "yes" : "no",
+                  r8[AX], r8[BX], r8[CX], r8[DX],
+                  r8[SI], r8[DI], r8[BP], r8[SP],
+                  sr4[DS], sr4[ES], sr4[SS], sr4[CS], flags);
+    {
+        char tmp[96];
+        int len = 0;
+
+        /* core_disasm_at() decodes at CS:IP; the log shows the instruction
+         * that is about to execute. */
+        if (core_disasm_at(tmp, &len)) {
+            o += snprintf(buf + o, sizeof buf - o, "%04X:%04X  %s\n",
+                          sr4[CS], ip, tmp);
+        }
+    }
+    debug_area->value(buf);
+    debug_area->redraw();
+}
+
+static void cb_show_debug(Fl_Widget *, void *)
+{
+    if (!debug_window) {
+        debug_window = new Fl_Double_Window(420, 460,
+                                            "debug log - debug.exe emulation");
+        debug_area = new Fl_Multiline_Output(6, 6, 408, 448);
+        debug_area->box(FL_DOWN_BOX);
+        debug_area->color(FL_WHITE);
+        debug_area->textcolor(C_TEXT);
+        debug_area->textfont(FL_COURIER_BOLD);
+        debug_area->textsize(13);
+        debug_window->end();
+        debug_window->callback(cb_close_window, &debug_window);
+    }
+    fill_debug();
+    debug_window->show();
+}
+
+/* `flags` - cmdFlags, tooltip `show flags register`.  The emulator already
+ * shows the flag cells in its own window; this is the standalone view the
+ * original opens, listing each flag by name with its state. */
+static void fill_flags(void)
+{
+    static const char *nm[NFLAG] = { "CF", "PF", "AF", "ZF",
+                                     "SF", "TF", "IF", "DF", "OF" };
+    char buf[2048];
+    int o = 0, i;
+
+    if (!flags_area) return;
+    if (!core_loaded()) {
+        flags_area->value("no program loaded");
+        flags_area->redraw();
+        return;
+    }
+    o += snprintf(buf + o, sizeof buf - o, "flags register = %04X\n\n",
+                  cur.flags);
+    for (i = 0; i < NFLAG; i++) {
+        int set = (cur.flags & (1 << i)) != 0;
+        o += snprintf(buf + o, sizeof buf - o, "  %s = %d%s\n",
+                      nm[i], set, set ? "   set" : "   clear");
+    }
+    flags_area->value(buf);
+    flags_area->redraw();
+}
+
+static void cb_show_flags(Fl_Widget *, void *)
+{
+    if (!flags_window) {
+        flags_window = new Fl_Double_Window(220, 280, "flags");
+        flags_area = new Fl_Multiline_Output(6, 6, 208, 268);
+        flags_area->box(FL_DOWN_BOX);
+        flags_area->color(FL_WHITE);
+        flags_area->textcolor(C_TEXT);
+        flags_area->textfont(FL_COURIER_BOLD);
+        flags_area->textsize(13);
+        flags_window->end();
+        flags_window->callback(cb_close_window, &flags_window);
+    }
+    fill_flags();
+    flags_window->show();
+}
+
 
 static void cb_compile(Fl_Widget *, void *)
 {
@@ -637,40 +914,47 @@ public:
         labelsize(11);
         labelcolor(C_TEXT);
         align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+        /* FLTK draws the group's own label inside the box as part of
+         * Fl_Group::draw(), and would then draw a second copy on the border.
+         * Take the text out of FLTK's hands: keep it in `title_` and clear the
+         * widget label, so exactly one copy is drawn, on the border. */
+        title_ = t && *t ? strdup(t) : NULL;
+        label("");
     }
+    ~TitledFrame() { free((void *)title_); }
     void draw() {
-        /* Frame and children first, then the notch over the top border. */
         Fl_Group::draw();
-        draw_label();
+        draw_leaders();
     }
-    void draw_label() {
-        const char *t = label();
+    /* FLTK's label slot stays empty; this is the only text drawn. */
+    void draw_leaders() {
+        const char *t = title_;
         if (!t || !*t) return;
         fl_font(labelfont(), labelsize());
         int tw = 0, th = 0;
         fl_measure(t, tw, th, 0);
-        /* Sit on the top border: 2px of the frame line above and below. */
-        int ty = y() + 2;
         int tx = x() + 8;
-        /* Blank the border run behind the text so the line does not strike
-         * through the letters. */
-        fl_color(color());
-        fl_rectf(tx - 3, ty, tw + 6, th);
+        /* Centre the glyph block on the border band, which is y()+1.
+         * fl_draw() with FL_ALIGN_INSIDE re-centres inside the given box and
+         * applies box padding, so it cannot be aimed at a single row - that
+         * is what kept the title ~10px low.  Drawing by BASELINE is exact:
+         * the baseline sits at the band plus half the cap height. */
+        int band = y() + 1;
+        int asc = (int)fl_height() - (int)fl_descent();
+        int baseline = band + asc / 2;
+        fl_color(parent() ? parent()->color() : color());
+        fl_rectf(tx - 3, band - asc / 2 - 1, tw + 6, asc + 3);
+        /* The frame's interior is the theme's light face, so the notch must
+         * match it - painting with color() alone was not enough because the
+         * group sits over the window face, not its own fill. */
+        fl_color(FL_BACKGROUND_COLOR);
+        fl_rectf(tx - 3, band - asc / 2 - 1, tw + 6, asc + 3);
         fl_color(labelcolor());
-        fl_draw(t, tx, ty, tw, th, FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+        fl_draw(t, tx, baseline);
     }
+private:
+    const char *title_;
 };
-
-static void title_on_border(Fl_Group *g, const char *title)
-{
-    /* Groups that need the notch are TitledFrame already; for a plain group
-     * keep the old behaviour but left-aligned inside so nothing floats. */
-    g->label(title);
-    g->labelfont(FL_HELVETICA);
-    g->labelsize(11);
-    g->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
-    g->labelcolor(C_TEXT);
-}
 
 static Fl_Double_Window *build_emulator(void)
 {
@@ -744,10 +1028,26 @@ static Fl_Double_Window *build_emulator(void)
 
     /* ---- registers: AX..DX as H/L byte pairs, then the nine segments ---- */
     {
-        Fl_Group *g = new Fl_Group(M, PANEL_Y, 178, PANEL_H);
+        TitledFrame *g = new TitledFrame(M, PANEL_Y, 178, PANEL_H,
+                                         "registers");
         g->box(FL_ENGRAVED_FRAME);
         g->color(C_BG);
-        int y = PANEL_Y + 16;
+        int y = PANEL_Y + 26;
+        /* H and L are COLUMN headers, drawn once above the byte-pair columns
+         * - not per row.  They used to be created inside the loop just above
+         * each register, which stamped a stray "h" over every row.
+         * The rows start 10px lower so the header band has room and does not
+         * collide with the frame's title notch. */
+        {
+            Fl_Box *hh = new Fl_Box(M + 46, PANEL_Y + 13, 34, 12, "h");
+            hh->labelsize(9);
+            hh->labelfont(FL_HELVETICA_BOLD);
+            hh->align(FL_ALIGN_CENTER | FL_ALIGN_INSIDE);
+            Fl_Box *ll = new Fl_Box(M + 84, PANEL_Y + 13, 34, 12, "l");
+            ll->labelsize(9);
+            ll->labelfont(FL_HELVETICA_BOLD);
+            ll->align(FL_ALIGN_CENTER | FL_ALIGN_INSIDE);
+        }
         for (int i = 0; i < NGEN; i++) {
             Fl_Box *lbl = new Fl_Box(M + 8, y + 4, 34, 20, GENREGS[i]);
             lbl->labelsize(12);
@@ -762,8 +1062,6 @@ static Fl_Double_Window *build_emulator(void)
                 rn[k]->labelfont(FL_COURIER_BOLD);
                 rn[k]->labelsize(14);
             }
-            Fl_Box *hl = new Fl_Box(M + 40, y - 2, 20, 12, "h");
-            hl->labelsize(9); hl->align(FL_ALIGN_RIGHT | FL_ALIGN_INSIDE);
             y += 27;
         }
         y += 6;
@@ -779,13 +1077,13 @@ static Fl_Double_Window *build_emulator(void)
             segbox[i]->labelsize(14);
             y += 27;
         }
-        title_on_border(g, "registers");
         g->end();
     }
 
     /* ---- memory: address box, list, proportional scrollbar ---- */
     {
-        Fl_Group *mp = new Fl_Group(M + 190, PANEL_Y, 300, PANEL_H, "memory");
+        TitledFrame *mp = new TitledFrame(M + 190, PANEL_Y, 300, PANEL_H,
+                                          "memory");
         mp->box(FL_ENGRAVED_FRAME);
         mp->color(C_BG);
         Fl_Input *maddr = new Fl_Input(M + 190 + 60, 96, 130, 28, "");
@@ -803,14 +1101,13 @@ static Fl_Double_Window *build_emulator(void)
         sb->range(0, 65536 - hl->nrows);
         /* thumb proportional to how much is visible, as in the original */
         sb->slider_size((double)hl->nrows / 65536.0);
-        title_on_border(mp, "memory");
         mp->end();
     }
 
     /* ---- disassembly ---- */
     {
-        Fl_Group *dp = new Fl_Group(M + 498, PANEL_Y, W - 2 * M - 498,
-                                    PANEL_H, "disassembly");
+        TitledFrame *dp = new TitledFrame(M + 498, PANEL_Y, W - 2 * M - 498,
+                                          PANEL_H, "disassembly");
         dp->box(FL_ENGRAVED_FRAME);
         dp->color(C_BG);
         Fl_Input *daddr = new Fl_Input(M + 498 + 90, 96, 130, 28, "");
@@ -831,13 +1128,12 @@ static Fl_Double_Window *build_emulator(void)
         sb->linesize(16);
         sb->range(0, 4096);
         sb->slider_size(0.35);
-        title_on_border(dp, "disassembly");
         dp->end();
     }
 
     /* ---- flags ---- */
     {
-        Fl_Group *g = new Fl_Group(M, FLAGS_Y, 182, FLAGS_H);
+        TitledFrame *g = new TitledFrame(M, FLAGS_Y, 182, FLAGS_H, "flags");
         g->box(FL_ENGRAVED_FRAME);
         g->color(C_BG);
         for (int i = 0; i < NFLAG; i++) {
@@ -845,11 +1141,14 @@ static Fl_Double_Window *build_emulator(void)
             int cy = FLAGS_Y + 12 + (i / 5) * 36;
             flagcell[i] = new FlagCell(cx, cy, 34, 36, FLAGDEFS[i].n, FLAGDEFS[i].m);
         }
-        title_on_border(g, "flags");
         g->end();
     }
 
-    /* ---- the eight bottom buttons ---- */
+    /* ---- the eight bottom buttons ----
+     * The identifiers and tooltips come from emu8086 itself (see
+     * re/UI_CONTROLS.md): cmdShowMemory/DOS, cmdShowActualSource, cmdReset,
+     * cmdALU, cmdVars, cmdLog, cmdStack, cmdFlags.  Each opens the window its
+     * tooltip describes rather than an invented panel. */
     {
         static const char *nm[] = { "screen", "source", "reset", "aux",
                                     "vars", "debug", "stack", "flags" };
@@ -857,7 +1156,16 @@ static Fl_Double_Window *build_emulator(void)
             Fl_Button *b = new Fl_Button(M + i * 88, BTN_Y, 84, BTN_H, nm[i]);
             b->box(FL_UP_BOX);
             b->labelsize(11);
-            if (i == 2) b->callback(cb_reset);
+            switch (i) {
+            case 0: b->callback(cb_show_screen_panel); break;
+            case 1: b->callback(cb_show_source);       break;
+            case 2: b->callback(cb_reset);             break;
+            case 3: b->callback(cb_open_calc);         break;  /* aux tools */
+            case 4: b->callback(cb_show_vars);         break;
+            case 5: b->callback(cb_show_debug);        break;
+            case 6: b->callback(cb_show_stack);        break;
+            case 7: b->callback(cb_show_flags);        break;
+            }
         }
     }
     /* The buttons are created before the screen panel so that they paint on
@@ -913,6 +1221,12 @@ int main(int argc, char **argv)
             if (strstr(tk, "convertor"))  tools_open_convertor();
             if (strstr(tk, "calculator")) tools_open_calculator();
             if (strstr(tk, "emulate"))    cb_emulate(0, 0);
+            /* The emulator's six side windows, so each can be checked. */
+            if (strstr(tk, "stack"))      cb_show_stack(0, 0);
+            if (strstr(tk, "source"))     cb_show_source(0, 0);
+            if (strstr(tk, "vars"))       cb_show_vars(0, 0);
+            if (strstr(tk, "debug"))      cb_show_debug(0, 0);
+            if (strstr(tk, "flags"))      cb_show_flags(0, 0);
         }
     }
     ed->redraw();
