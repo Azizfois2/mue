@@ -3377,3 +3377,49 @@ other undecoded arm.
 `src/check_int1a.py`: ticks track the host clock, the value is not the old
 constant, AL is 0, two consecutive calls agree, and AH=02 reports and
 continues. Negative control restores the constants and fails two checks.
+
+## 50b. The rule for functions emu8086 does not have: use standard DOS
+
+Until now the four INT 21h arms emu8086 does not dispatch - 00h, 31h, 44h,
+4Bh - were each decided ad hoc, and two of them were decided **wrongly**.
+
+The settled rule:
+
+> **If emu8086 dispatches the function, match emu8086 exactly, bugs and all.**
+> **If emu8086 has no arm for it, implement the standard DOS behaviour.**
+> Never copy a hole.
+
+The distinction is not "is emu8086's behaviour nice", it is "does emu8086
+define behaviour here at all". An absent arm is not a specification - it is
+missing code. Reproducing it means shipping a function call that reports an
+error and continues, which is not what any DOS program means by that call.
+
+### What that changed
+
+| AH | emu8086 | Was | Now |
+|---|---|---|---|
+| 00h | absent | terminate | terminate (unchanged; it was already DOS-correct) |
+| 31h | absent | report "not supported", keep running | terminate, AL = exit code |
+| 44h | absent | standard DOS (correct) | unchanged |
+| 4Bh | absent | **opt-in** behind `MUE_EXEC=1` | **default on**, `MUE_EXEC=0` restores the refusal |
+
+4Bh had it exactly backwards. I had reasoned "the original refuses, so the
+clone should only do better when asked" - but the original does not *refuse*
+4Bh, it does not *have* 4Bh. Gating the working version behind a variable
+made the default a fabricated refusal, which is the hole, not the spec. Same
+for 31h, which reported a diagnostic and let the program run on past a call
+that is supposed to end it.
+
+`MUE_EXEC=0` is kept purely so anyone diffing against the original can
+reproduce its non-behaviour. The default is the useful, DOS-correct one.
+
+### The test change that matters more than the code change
+
+`check_int21.py`'s `run()` set `MUE_EXEC=1` in its base environment "so the
+EXEC checks can ask for it". With the gate removed that line became a
+**mask**: every EXEC check would still pass even if the default regressed to
+refusal, because the script supplied the variable its own subject depends on.
+It is gone, and the checks now exercise the real default. Verified by
+reverting the gate - 28 checks fail, including `exec-default-runs-child`.
+
+A test that sets the variable its subject is testing is not testing it.

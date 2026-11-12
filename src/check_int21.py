@@ -34,12 +34,11 @@ def run(mue, src, cwd, stdin_data=None, env=None):
     with open(a, "w") as f:
         f.write(src)
     e = None
-    # 4Bh EXEC is a clone-only capability (FINDINGS 44) and is off by default
-    # so that the default behaviour matches the original, which reports
-    # "not supported" and continues.  The EXEC checks below test that
-    # capability, so they have to ask for it.
+    # 4Bh EXEC is absent from emu8086, so it is filled from standard DOS and
+    # runs by DEFAULT (FINDINGS 50b).  Nothing is forced here: the EXEC
+    # checks must exercise the real default, or a regression that re-gated
+    # it would hide behind this script's own environment.
     base = dict(os.environ)
-    base.setdefault("MUE_EXEC", "1")
     if env:
         e = dict(base)
         e.update(env)
@@ -2019,13 +2018,14 @@ def main():
         check("getdir-invalid-drive", cx == 0x0F, cx)
         check("getdir-invalid-drive-cf", di is not None and (di & 1), di)
 
-        # 31h (TSR): the original has NO arm for it in the [ebp-0x288] chain,
-        # so it falls through to the generic "not supported yet" report and
-        # the guest keeps running.  This check used to demand BX == 0, i.e.
-        # that the clone halted - pinning the clone's own invention, not the
-        # original's behaviour (FINDINGS 43).
+        # 31h (TSR): ABSENT FROM emu8086 (no arm in the [ebp-0x288] chain),
+        # so the project rule fills it from standard DOS instead of copying
+        # the hole: terminate with AL as the exit code and DX paragraphs
+        # resident.  The guest must therefore NOT run on past the call.
+        # Earlier revisions of this check demanded the original's silent
+        # fall-through, which pinned a hole as if it were behaviour.
         rc, out = run(mue, T_TSR, d)
-        check("tsr-falls-through", reg(out, "BX") == 0xDEAD, reg(out, "BX"))
+        check("tsr-terminates", reg(out, "BX") != 0xDEAD, reg(out, "BX"))
 
         # 4Bh: child program, loaded and run, its output before the parent's.
         with open(os.path.join(d, "child.asm"), "w") as f:
@@ -2041,19 +2041,19 @@ def main():
               reg(out, "BP") == 5, reg(out, "BP"))
         check("exec-error-answers", reg(out, "BX") == 0, reg(out, "BX"))
 
-        # 4Bh is a CLONE-ONLY capability (FINDINGS 44): the original has no
-        # arm for it, so it reports "not supported" and carries on.  Both
-        # behaviours are checked, so neither can drift unnoticed.
+        # 4Bh is ABSENT FROM emu8086 (FINDINGS 44), so standard DOS is the
+        # basis and EXEC runs by default.  MUE_EXEC=0 restores emu8086's
+        # refusal for anyone diffing against the original.
         rc, out = run(mue, T_EXEC_DEFAULT, d, env={"MUE_EXEC": ""})
+        check("exec-default-runs-child",
+              "child" in guest_text(out), repr(guest_text(out))[:120])
+        rc, out = run(mue, T_EXEC_DEFAULT, d, env={"MUE_EXEC": "0"})
         # The refusal is a host diagnostic on stderr, not guest output, so the
         # combined stream is what carries it.
-        check("exec-default-not-supported",
+        check("exec-opt-out-restores-refusal",
               "not supported" in out, repr(out[-120:]))
-        check("exec-default-continues", reg(out, "BP") == 0x77,
+        check("exec-opt-out-continues", reg(out, "BP") == 0x77,
               reg(out, "BP"))
-        rc, out = run(mue, T_EXEC_DEFAULT, d, env={"MUE_EXEC": "1"})
-        check("exec-opt-in-runs-child",
-              "child" in guest_text(out), repr(guest_text(out)))
 
         # Nested exec: the grandchild's exit code has to come back two levels.
         for nm, src in (("c1", C1_ASM), ("c2", C2_ASM), ("c3", C3_ASM)):

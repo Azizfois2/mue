@@ -971,20 +971,24 @@ static void int21(void)
         break; }
 
     case 0x4B: {                                /* exec a program */
-        /* CLEAR-DIVERGENCE.  The original has no AH=4Bh arm at all: there is
-         * exactly one `mov ecx,0x4b` in the image and it is in an unrelated
-         * routine, no `cmp [ebp-0x288],al` follows it, emu8086's own interrupt
-         * reference does not document AH=4Bh, and no shipped example calls it
-         * (snake.asm's `4bh` is `left equ 4bh`).  So under emu8086 a 4Bh call
-         * hits the generic "not supported yet" report and continues.
+        /* ABSENT FROM emu8086 - there is exactly one `mov ecx,0x4b` in the
+         * image and it is in an unrelated routine, no `cmp [ebp-0x288],al`
+         * follows it, emu8086's reference does not document AH=4Bh, and no
+         * shipped example calls it (snake.asm's `4bh` is `left equ 4bh`).
          *
-         * The clone can load and run a child, which is more useful than
-         * emulating the refusal - but it is the clone's behaviour, not the
-         * original's, so it is off unless asked for.  MUE_EXEC=1 turns it on;
-         * the default matches the original. */
-        if (getenv("MUE_EXEC") == NULL || getenv("MUE_EXEC")[0] == 0) {
-            unsupported_ah("INT 21h", ah);
-            break;
+         * By the project rule, an absent function is filled from standard DOS
+         * rather than copied as a hole, so EXEC works by default: load and run
+         * the child, return its exit code in AL.  It is NOT behind a flag - a
+         * flag would make the useful behaviour opt-in and leave the default a
+         * refusal, which is the thing we are deliberately not reproducing.
+         * MUE_EXEC=0 restores the emu8086 refusal for anyone who needs to
+         * check byte-for-byte identical behaviour against the original. */
+        {
+            const char *e = getenv("MUE_EXEC");
+            if (e != NULL && e[0] == '0') {
+                unsupported_ah("INT 21h", ah);
+                break;
+            }
         }
         char name[160], want[160], host[512], path_rec[200];
         FILE *f;
@@ -1404,13 +1408,19 @@ static void int21(void)
         break;
 
     case 0x31:                                  /* terminate and stay resident */
-        /* There is NO 31h arm in the original's dispatcher (verified against
-         * the [ebp-0x288] chain), so it falls through the whole compare chain
-         * into the generic report and CARRIES ON - the guest keeps running.
-         * The clone used to halt here, which silently ended a program that the
-         * original would have continued.  Residency cannot be modelled, so
-         * report exactly as the original does and return. */
-        unsupported_ah("INT 21h", ah);
+        /* ABSENT FROM emu8086 (no 31h arm in the [ebp-0x288] chain), so by the
+         * project rule standard DOS is the correct basis here: use DOS's
+         * behaviour, not emu8086's "falls through and carries on".
+         *
+         * DOS 31h ends the program with AL as the exit code and DX as the
+         * paragraphs to keep resident.  Residency cannot be modelled in a
+         * flat address space, so the guest is terminated and the exit code is
+         * recorded - which is what a guest that calls 31h expects.  The
+         * earlier version of this arm reported "not supported" and let the
+         * program run on, which is copying a hole rather than filling it. */
+        dos_exit_code = (int)(cpu.r[AX] & 0xFF);
+        dos_exit_requested = 1;
+        cpu.halted = 1;
         break;
 
     case 0x35:                                  /* get interrupt vector */
