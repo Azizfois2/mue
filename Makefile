@@ -32,7 +32,25 @@ HEADERS := $(wildcard src/*.h)
 # rather than a failure, so `make test` still works where emu8086 is absent.
 SKIPOK = $(PYTHON) -c "import subprocess,sys; r=subprocess.run([sys.argv[1]]+sys.argv[2:]); sys.exit(0 if r.returncode==77 else r.returncode)"
 
-.PHONY: all test examples clean
+# ---- the FLTK front end ------------------------------------------------
+#
+# The UI is a separate binary that links the same core sources as the CLI,
+# compiled as C and wrapped in extern "C" (exec.c uses C compound literals
+# that g++ rejects). It is not part of `all` or `test`: FLTK is a large
+# optional dependency and the verified CLI must build without it.
+UIBIN   := src/mueui$(EXE)
+UISRC   := src/mue_ui.c src/mue_icons.c src/mue_highlight.c \
+           src/mue_source.cpp src/mue_tools.c
+CORE_C  := src/exec.c src/mem.c src/alu.c src/io.c src/dos.c \
+           src/asm_main.c src/asm_sup.c src/asm_ops.c src/exe.c src/screen.c \
+           src/mue_core.c
+CXX     ?= g++
+UICXXFLAGS ?= $(shell fltk-config --cxxflags 2>/dev/null)
+# fltk-config --ldflags omits the COM libraries FLTK's drag-and-drop needs on
+# Windows, so they are listed explicitly.
+UILDFLAGS  ?= -L/ucrt64/lib -lfltk -lole32 -luuid -lcomdlg32 -lgdi32 -luser32              -lshell32 -ladvapi32 -lws2_32 -lcomctl32 -lgdiplus -lwinspool
+
+.PHONY: all test examples clean ui
 
 all: $(BIN)
 
@@ -107,6 +125,20 @@ test: $(BIN) $(TBIN)
 examples: $(BIN)
 	@cd src && $(SKIPOK) "$(PYTHON)" check_examples.py -v
 
+# Static FLTK link, so the binary runs without the toolchain's DLLs present.
+ui: $(UIBIN)
+
+# The core is compiled as C by $(CC), because exec.c uses C compound
+# literals that g++ rejects; only the UI sources go through $(CXX).
+$(UIBIN): $(UISRC) $(CORE_C) $(HEADERS)
+	@mkdir -p src/.uiobj
+	@for f in $(CORE_C); do \
+	    $(CC) -c $(CFLAGS) $(CPPFLAGS) -o src/.uiobj/`basename $$f .c`.o $$f || exit 1; \
+	done
+	$(CXX) -static -O2 -Wall -Wno-unused-parameter $(CPPFLAGS) \
+	    -o $@ $(UISRC) src/.uiobj/*.o $(UICXXFLAGS) $(UILDFLAGS) -mwindows
+
 clean:
-	rm -f $(BIN) $(TBIN)
+	rm -f $(BIN) $(TBIN) $(UIBIN)
+	rm -rf src/.uiobj
 

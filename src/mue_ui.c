@@ -912,6 +912,7 @@ int main(int argc, char **argv)
             if (strstr(tk, "options"))    tools_open_options();
             if (strstr(tk, "convertor"))  tools_open_convertor();
             if (strstr(tk, "calculator")) tools_open_calculator();
+            if (strstr(tk, "emulate"))    cb_emulate(0, 0);
         }
     }
     ed->redraw();

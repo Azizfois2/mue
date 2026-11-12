@@ -6,6 +6,13 @@ observing the original's external behaviour. See `re/FINDINGS.md` and
 `re/CPU_SPEC.md` for the analysis, with every claim labelled CONFIRMED,
 INFERRED or DESIGN.
 
+It builds two programs:
+
+| binary | what it is |
+| --- | --- |
+| `src/mue.exe` | the command-line assembler and emulator: no toolkit, no GUI |
+| `src/mueui.exe` | the graphical front end, in FLTK, matching emu8086's own windows |
+
 This is an independent project. It is not affiliated with, endorsed by, or
 supported by the authors of emu8086. The name is used only to say what the
 program is compatible with.
@@ -50,9 +57,81 @@ That holds for all 44 paired sources in emu8086's `MyBuild` directory,
 including the MZ EXE header, and for all 46 `.list` listings byte for byte.
 See [Verification](#verification).
 
+## The graphical front end
+
+`src/mueui.exe` reproduces emu8086's own windows, so the tool is usable the
+way the original is: write a program, press emulate, watch the registers.
+
+It is written in **FLTK**, not Win32, and links FLTK statically, so the same
+source builds and looks the same on Windows, Linux and macOS. What is
+reproduced is the structure and behaviour, not the VB6 widget chrome.
+
+### What is there
+
+**The editor** — eight menus (`file`, `edit`, `bookmarks`, `assembler`,
+`emulator`, `math`, `ascii codes`, `help`), a toolbar of icon-over-label
+buttons in four groups, a line-numbered source pane with **8086 syntax
+highlighting**, and a status bar.
+
+**The emulator window**, opened by `emulate` rather than at startup — it has
+its own menus, its own toolbar (`load`, `reload`, `step back`, `single step`,
+`run` plus a step-delay slider), and six panels that update as the program
+runs:
+
+> **Status:** this window is the least finished part of the UI. The panels
+> and the stepping work; the layout is still being adjusted.
+
+- registers, `AX`–`DX` as separate high and low bytes, then
+  `CS IP SS SP BP SI DI DS ES`
+- a memory view showing real bytes at `CS:IP` — address, hex, decimal, and
+  the character where it is printable
+- a disassembly view
+- clickable flag cells (`CF PF AF ZF SF TF IF DF OF`)
+- the text screen
+- the eight bottom buttons
+
+**Three floating tool windows**, each in its own window as in the original:
+
+| window | size | resizable |
+| --- | --- | --- |
+| `options` | 639×446 | no |
+| `base convertor` | 310×340 | no |
+| `calculator - expression...` | 398×335 | yes |
+
+### Stepping is real
+
+The UI links the same emulator core as the CLI and owns the machine state
+between instructions, so `single step` executes exactly one instruction and
+repaints every panel. This replaces an earlier version that shelled out to
+`mue.exe` and scraped its final register dump, which could never show a
+program part-way through.
+
+The disassembler is separate from the executor on purpose: a disassembler
+must decode *without acting*, and must report each instruction's length so
+the next line starts in the right place.
+
+### Two FLTK findings worth recording
+
+Both cost real time and are documented so they are not repeated:
+
+**`Fl::scheme()` silently discards the text style table.** Calling it
+installed the scheme's own table and threw away the one `highlight_data()` had
+been given, so every token rendered black even though the table was correct.
+It was only there to work around cyan fields — and that cyan was really caused
+by passing packed RGB literals to `color()`, which takes a table *index*.
+
+**`highlight_data()` does not work in FLTK 1.4.4 here.** The style buffer
+matched the text byte for byte and `position_style()` returned the registered
+style character, yet a style set to bright magenta on cyan drew zero magenta
+pixels, while plain `textcolor()` on the same widget drew 448. The per-character
+style table is simply ignored when drawing. So the source pane is a
+purpose-built widget that tokenises each line and draws each glyph under its
+own colour; that is why the highlighting works.
+
 ## Build
 
     make                # -> src/mue.exe
+    make ui             # -> src/mueui.exe   (needs FLTK 1.4)
 
 (MinGW ships GNU make as `mingw32-make`; that name works too.) Without make:
 
@@ -66,7 +145,7 @@ One command runs every check and exits non-zero if any of them regresses:
 
     make test
 
-It performs three independent checks, in order:
+It runs eighteen independent checks. The first five are the core gate:
 
 1. **CPU self-test** (`src/test_cpu.c`) — flags, stack, call/ret, loop, mul/div.
 2. **Assembler vs emu8086 `.list` listings** (`src/check_asm.py`) — every emitted
@@ -81,6 +160,17 @@ It performs three independent checks, in order:
 5. **Every shipped example runs** (`src/check_run.py`) — all 85 `.asm` files
    are assembled and executed with no diagnostic and a zero exit, which is
    what "the clone can run emu8086's own programs" actually means.
+
+The remaining thirteen cover individual interrupt services and assembler
+diagnostics, so a regression names the function that broke instead of showing
+up as a mysterious failure elsewhere:
+
+`check_enc.py` encodings · `check_asmdiag.py` diagnostics · `check_int10.py`
+and `check_int10sem.py` video · `check_int13.py` floppy · `check_int15.py`
+misc services · `check_int16.py` keyboard · `check_int1a.py` timer ·
+`check_int21.py` DOS calls · `check_int21time.py` host clock ·
+`check_int33.py` mouse · `check_dirlist.py` directory walking ·
+`check_gaps.py` the deliberate divergences.
 
 Checks 2, 3 and 5 read fixtures from `C:\emu8086`, so they need emu8086
 installed; `make` alone never touches it. Where those fixtures are missing the
