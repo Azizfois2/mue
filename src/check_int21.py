@@ -2308,10 +2308,19 @@ def main():
         lines = [l.strip() for l in guest_text(out).splitlines() if l.strip()]
         inside = lines[0] if lines else ""
         back = lines[1] if len(lines) > 1 else ""
-        check("chdir-relative-enters",
-              inside.split("\\")[-1] == "rt1", repr(inside))
+        # The guest prints the directory the host reports, so the separator
+        # is the HOST's: "\\" on Windows, "/" on Linux. Splitting on a
+        # hard-coded backslash made these three checks fail on CI while the
+        # program under test was behaving correctly.
+        def base(p):
+            return os.path.basename(p.rstrip("/\\"))
+
+        def parent(p):
+            return os.path.dirname(p.rstrip("/\\"))
+
+        check("chdir-relative-enters", base(inside) == "rt1", repr(inside))
         check("chdir-parent-leaves",
-              back.split("\\")[-1] != "rt1" and back == inside.rsplit("\\", 1)[0],
+              base(back) != "rt1" and back == parent(inside),
               repr((inside, back)))
         check("chdir-missing-dir-fails",
               (reg(out, "BX") or 0) & 0xFFFF == 3 and (reg(out, "BP") or 0) & 1,

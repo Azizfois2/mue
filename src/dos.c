@@ -24,11 +24,13 @@
 #define dos_chmod   _chmod
 /* mkdir() on Windows takes one argument; POSIX takes a mode as well. */
 #define dos_mkdir(p) _mkdir(p)
+#define DOS_SEP '\\'
 #else
 #define DOS_IREAD   S_IRUSR
 #define DOS_IWRITE  S_IWUSR
 #define dos_chmod   chmod
 #define dos_mkdir(p) mkdir((p), 0755)
+#define DOS_SEP '/'
 #endif
 #include "cpu.h"
 #include "alu.h"
@@ -362,14 +364,14 @@ static int dos_apply_path(int drive, const char *path, char *out, size_t n)
 
         if (!strcmp(comp, ".")) continue;
         if (!strcmp(comp, "..")) {
-            while (o && out[o - 1] != '\\') o--;
+            while (o && out[o - 1] != DOS_SEP) o--;
             if (o) o--;
             out[o] = 0;
             continue;
         }
         if (o) {
             if (o + 1 >= n) return -1;
-            out[o++] = '\\';
+            out[o++] = DOS_SEP;
         }
         if (o + cl >= n) return -1;
         memcpy(out + o, comp, cl);
