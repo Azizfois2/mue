@@ -213,14 +213,19 @@ Each should stay documented so nobody "fixes" it later:
   `MUE_INT21_MEM_NOOP=1` restores the original's silence for comparison.
   Do not "fix" this back to bug-compatibility.
 - **`INT 21h` AH=4Bh EXEC really loads and runs a child.** The original has no
-  4Bh arm at all (FINDINGS 44) and answers "not supported". Here the clone is
-  the *less* faithful side, so this one is **off by default** (`MUE_EXEC=1`
-  enables it).
+  4Bh arm at all (FINDINGS 44), so it is *absent* rather than defined and the
+  clone fills it from standard DOS. **On by default**; `MUE_EXEC=0` restores
+  the non-behaviour for anyone diffing against the original.
+- **`INT 21h` AH=31h TSR terminates the program** with AL as the exit code.
+  Also absent from the original, same rule.
 
-Note the opposite polarities, which are deliberate: 48h/49h/4Ah are better by
-default because the original is simply unimplemented there; 4Bh is opt-in
-because the original's behaviour is defined (it reports), so matching it is
-what "faithful" means.
+Both polarities follow one rule (FINDINGS 50b): **emu8086 dispatches it ->
+match emu8086 exactly; emu8086 has no arm -> implement standard DOS.** An
+absent arm is missing code, not a specification, so reproducing it means
+shipping a call that errors and carries on. 4Bh used to be gated behind
+`MUE_EXEC=1` on the reasoning "the original refuses" - but the original does
+not refuse 4Bh, it does not *have* 4Bh, and gating the working version made
+the *default* a fabricated refusal.
 
 ### The rule
 

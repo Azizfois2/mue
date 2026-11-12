@@ -135,19 +135,28 @@ CPU self-test (`test_cpu.exe`): ALL PASS (0 failures).
 ### Where the clone is deliberately better
 
 Everywhere a comparison is possible - every example's output, every `.list`
-byte, every decoded interrupt function - `mue` matches emu8086 exactly. There
-is one place it knowingly does not, and only because emu8086 does nothing
-there:
+byte, every decoded interrupt function - `mue` matches emu8086 exactly. The
+places it knowingly does not all follow one rule:
 
-**`INT 21h` 48h/49h/4Ah (allocate/free/resize memory).** emu8086 dispatches
-these and returns **without touching a single register**, so a program cannot
-tell success from failure. `mue` implements a real memory arena instead. The
-original's silence is still available for comparison with
-`MUE_INT21_MEM_NOOP=1`.
+> **If emu8086 dispatches a function, match emu8086 exactly, bugs and all.**
+> **If emu8086 has no arm for it, implement standard DOS.** Never copy a hole.
 
-This is the intended behaviour - not an oversight, and not something to
-"fix" back. See `re/GAPS.md` section 4 for the full list of divergences and
-`re/FINDINGS.md` section 29 for the disassembly behind this one.
+An absent arm is missing code, not a specification. Reproducing it means
+shipping a call that reports an error and carries on, which is not what any
+DOS program means by that call.
+
+- **`INT 21h` 48h/49h/4Ah (allocate/free/resize memory).** emu8086 dispatches
+  these and returns **without touching a single register**, so a program
+  cannot tell success from failure. `mue` implements a real memory arena.
+  The original's silence is still available with `MUE_INT21_MEM_NOOP=1`.
+- **`INT 21h` AH=4Bh EXEC** really loads and runs a child. emu8086 has no 4Bh
+  arm at all. On by default; `MUE_EXEC=0` restores the non-behaviour.
+- **`INT 21h` AH=31h TSR** terminates with AL as the exit code. Also absent
+  from emu8086.
+
+This is intended behaviour - not an oversight, and not something to "fix"
+back. See `re/GAPS.md` section 4 for the divergence list and
+`re/FINDINGS.md` section 50b for the reasoning behind the rule.
 
 ## Licence
 
