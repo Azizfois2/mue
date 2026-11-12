@@ -53,6 +53,7 @@
 #include "mue_highlight.h"
 #include "mue_source.h"
 #include "mue_core.h"
+#include "mue_tools.h"
 #include "cpu.h"
 #include <FL/fl_draw.H>
 
@@ -388,6 +389,10 @@ static void cb_emulate(Fl_Widget *, void *)
     }
 }
 
+static void cb_open_calc(Fl_Widget *, void *)  { tools_open_calculator(); }
+static void cb_open_conv(Fl_Widget *, void *)  { tools_open_convertor(); }
+static void cb_open_opts(Fl_Widget *, void *)  { tools_open_options(); }
+
 static void cb_compile(Fl_Widget *, void *)
 {
     if (status_editor) {
@@ -523,8 +528,8 @@ static Fl_Double_Window *build_editor(void)
     mb->add("emulator/emulate", 0, cb_emulate, 0, 0);
     mb->add("emulator/single step", 0, cb_step, 0, 0);
     mb->add("emulator/reset", 0, cb_reset, 0, 0);
-    mb->add("math/calculator", 0, 0, 0, 0);
-    mb->add("math/base convertor", 0, 0, 0, 0);
+    mb->add("math/calculator", 0, cb_open_calc, 0, 0);
+    mb->add("math/base convertor", 0, cb_open_conv, 0, 0);
     mb->add("ascii codes/table", 0, 0, 0, 0);
     mb->add("help/about", 0, 0, 0, 0);
 
@@ -540,9 +545,9 @@ static Fl_Double_Window *build_editor(void)
         {"save",     0,          icon_save(),    1},   /* has a dropdown  */
         {"compile",  cb_compile, icon_compile(), 0},
         {"emulate",  cb_emulate, icon_run(),     0},
-        {"calculator", 0,        icon_calc(),    0},
-        {"convertor",  0,        icon_convert(), 0},
-        {"options",  0,          icon_options(), 0},
+        {"calculator", cb_open_calc, icon_calc(),    0},
+        {"convertor",  cb_open_conv, icon_convert(), 0},
+        {"options",    cb_open_opts, icon_options(), 0},
         {"help",     0,          icon_help(),    0},
         {"about",    0,          icon_about(),   0},
     };
@@ -699,7 +704,8 @@ static Fl_Double_Window *build_emulator(void)
     mb->textsize(12);
     mb->add("file/load", 0, 0, 0, 0);
     mb->add("file/save", 0, 0, 0, 0);
-    mb->add("math/base convertor", 0, 0, 0, 0);
+    mb->add("math/base convertor", 0, cb_open_conv, 0, 0);
+    mb->add("math/calculator", 0, cb_open_calc, 0, 0);
     mb->add("debug/single step", 0, 0, 0, 0);
     mb->add("debug/run", 0, 0, 0, 0);
     mb->add("view/memory", 0, 0, 0, 0);
@@ -897,6 +903,17 @@ int main(int argc, char **argv)
     Fl_Double_Window *ed = build_editor();
     emu_window = build_emulator();      /* built, but not shown */
     ed->show(argc, argv);
+    /* Test hook: MUE_OPEN_TOOLS=options,convertor,calculator opens the
+     * floating tool windows at startup so a check can verify each one
+     * without driving menus through synthetic clicks. */
+    {
+        const char *tk = getenv("MUE_OPEN_TOOLS");
+        if (tk) {
+            if (strstr(tk, "options"))    tools_open_options();
+            if (strstr(tk, "convertor"))  tools_open_convertor();
+            if (strstr(tk, "calculator")) tools_open_calculator();
+        }
+    }
     ed->redraw();
     Fl::flush();
     refresh_state();
