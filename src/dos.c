@@ -2315,6 +2315,55 @@ static FILE *floppy_open(int drive, const char *mode)
     snprintf(buf, sizeof buf, "FLOPPY_%d", drive);   /* relative, as original */
     return fopen(buf, mode);
 }
+
+/* ---- read-only view for a front end ---------------------------------- */
+/* The emulator's UI draws the guest's screen, so it needs to read the same
+ * VRAM that INT 10h writes.  These accessors are the entire surface:
+ * reachable through screen.h, never writable.  The guest remains the only
+ * writer, exactly as on real hardware - if the UI could write here, the two
+ * would drift and a screenshot would stop being evidence of what ran. */
+
+int dos_screen_page(void)
+{
+    return cur_page;
+}
+
+void dos_screen_cursor(int page, int *row, int *col)
+{
+    if (page < 0 || page >= VIDEO_PAGES) { if (row) *row = 0; if (col) *col = 0; return; }
+    if (row) *row = cur_row[page];
+    if (col) *col = cur_col[page];
+}
+
+unsigned char dos_screen_cell(int page, int row, int col, unsigned char *attr)
+{
+    unsigned char *c;
+    if (page < 0 || page >= VIDEO_PAGES || row < 0 || row >= VIDEO_ROWS ||
+        col < 0 || col >= VIDEO_COLS) {
+        if (attr) *attr = 0x07;
+        return ' ';
+    }
+    c = vram_cell_page(page, row, col);
+    if (attr) *attr = c[1];
+    return c[0];
+}
+
+/* Whether the guest has used the video services at all.  Before the first
+ * INT 10h there is no meaningful display, and a front end should show an
+ * empty panel rather than a fabricated 80x25 of blanks. */
+int dos_screen_touched(void)
+{
+    return vram_ready;
+}
+
+/* Video mode: 0 for every text mode, non-zero for the graphics modes the
+ * clone tracks in gfx_mode.  A front end needs this to say "graphics mode,
+ * no text rendering" instead of painting nonsense. */
+int dos_screen_mode(void)
+{
+    return gfx_mode;
+}
+
 static void int13(void)
 {
     int ah = (cpu.r[AX] >> 8) & 0xFF;

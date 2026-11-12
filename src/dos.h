@@ -15,4 +15,11 @@ void dos_boot_psp(void);        /* PSP:0x16 and the job file table of the
 void dos_feed_stdin(const char *text);
 int  dos_redirect_stdout(const char *path);   /* handle 1 to a file, `> file` */
 void dos_stdout_close(void);    /* flush and close it (atexit) */
+
+/* Read-only view of the guest's text screen, for a front end (screen.h). */
+int  dos_screen_page(void);
+void dos_screen_cursor(int page, int *row, int *col);
+unsigned char dos_screen_cell(int page, int row, int col, unsigned char *attr);
+int  dos_screen_touched(void);
+int  dos_screen_mode(void);
 #endif
