@@ -90,6 +90,9 @@ test: $(BIN) $(TBIN)
 	@echo "== INT 33h mouse: per-register contract =="
 	@cd src && $(SKIPOK) "$(PYTHON)" check_int33.py
 	@echo
+	@echo "== INT 1Ah AH=00: tick count comes from the host clock =="
+	@cd src && $(SKIPOK) "$(PYTHON)" check_int1a.py
+	@echo
 	@echo "== INT 21h file services =="
 	@cd src && $(SKIPOK) "$(PYTHON)" check_int21.py
 	@echo

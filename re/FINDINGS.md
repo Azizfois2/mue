@@ -695,9 +695,13 @@ Entry `0x524E7E` (INT byte `0x1A`, slot `[ebp-0x284]`, AH=`0x00` test at
   pipeline with `"INT 1Ah, AH=0"` (`0x4479D4`) and
   `"refer to the list of supported i..."` (`0x447904`).
 
-Clone (`src/dos.c` `int1a`): returns fixed demo values; the original reads
-the host clock. No headless oracle distinguishes them deterministically,
-so the clone is unchanged - documented for completeness.
+Clone (`src/dos.c` `int1a`): **fixed** (FINDINGS 50a). The paragraph that
+used to stand here said "no headless oracle distinguishes them
+deterministically, so the clone is unchanged" - that was wrong. The host
+clock is the oracle: the clone now computes ticks since midnight at 18.2/s
+from `localtime()` and `src/check_int1a.py` compares the guest's CX:DX to
+Python's own reading of the same clock. Leaving a confirmed arm returning
+constants because testing looked awkward is how a known-wrong value ships.
 
 ### 5.6 INT 13h clone implementation  (IMPLEMENTED + tested this pass)
 
@@ -3341,3 +3345,35 @@ four `int33-NNNN-preserves-dx` checks with DI=0.
 and gives no register contract for any of them, so the clone's obligation is
 only: accept the call, report no mouse, damage nothing else. That is now
 stated at the use site rather than implied.
+
+## 50a. INT 1Ah AH=00 returned constants, and the note excusing it was false
+
+Section 5.5 had already CONFIRMED that the original reads the host clock
+(`0x524EC6`) and splits it into CX:DX ticks plus AL. The clone returned
+`CX=1234h DX=5678h`. The note explaining why it was left alone read:
+
+    No headless oracle distinguishes them deterministically, so the clone is
+    unchanged - documented for completeness.
+
+That is not true. The oracle is the host clock, and it is available to both
+sides: the clone computes ticks since midnight at 18.2 ticks/s from
+`localtime()`, and the test compares the guest's CX:DX with Python's own
+reading of the same clock inside a 40-tick (about 2 second) window. Verified
+against the real time: at 00:12:27 the guest returned `DX=351B`, and
+`0x0x12*3600+12*60+27` scaled by 182/10 is also `0x351B`.
+
+This is the same failure as sections 47-49 in a different costume: a claim
+that testing is impossible, used to justify not testing. The claim was never
+checked, and it was wrong. **A confirmed behaviour with a known-wrong value is
+a gap regardless of how awkward the test looks** - and here the awkwardness
+was imaginary.
+
+Also removed: an AH=02 arm returning invented date values `CX=2024h
+DX=0101h`. The original dispatches only AH=00 (the `[ebp-0x26c]` chain opens
+with `xor ecx,ecx` at `0x52000d`) and emu8086's reference lists only
+`INT 1Ah/00h`, so AH=02 now reports "not supported" and continues, like every
+other undecoded arm.
+
+`src/check_int1a.py`: ticks track the host clock, the value is not the old
+constant, AL is 0, two consecutive calls agree, and AH=02 reports and
+continues. Negative control restores the constants and fails two checks.

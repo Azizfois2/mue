@@ -2372,17 +2372,33 @@ static void int1a(void)
 {
     int ah = (cpu.r[0] >> 8) & 0xFF;
     switch (ah) {
-    case 0x00:
-        cpu.r[1] = 0x1234;
-        cpu.r[2] = 0x5678;
-        setAThi(0);
+    case 0x00: {
+        /* CONFIRMED (FINDINGS 5.5): the original reads the host clock at
+         * 0x524EC6 and splits it into tick count CX:DX plus the midnight flag
+         * in AL.  It does NOT return constants - the clone used to answer
+         * CX=1234h DX=5678h, which is the right shape and the wrong data, so
+         * a guest timing anything got a frozen value. */
+        time_t t0 = time(NULL);
+        const struct tm *tm = localtime(&t0);
+        unsigned long ticks = 0;
+        if (tm) {
+            /* 18.2 ticks per second, as the PC/AT BIOS counts them. */
+            unsigned long secs = (unsigned long)tm->tm_hour * 3600UL +
+                                 (unsigned long)tm->tm_min * 60UL +
+                                 (unsigned long)tm->tm_sec;
+            ticks = (secs * 182UL) / 10UL;
+        }
+        cpu.r[1] = (uint16_t)(ticks >> 16);          /* CX = high word */
+        cpu.r[2] = (uint16_t)(ticks & 0xFFFF);       /* DX = low word  */
+        setAL(0);                                    /* midnight flag  */
         break;
-    case 0x02:
-        cpu.r[1] = 0x2024;
-        cpu.r[2] = 0x0101;
-        setAThi(1);
-        break;
+    }
     default:
+        /* Only AH=00 is dispatched by the original (the `[ebp-0x26c]` chain
+         * opens with `xor ecx,ecx` at 0x52000d); emu8086's reference lists
+         * only INT 1Ah/00h too.  The clone used to answer AH=02 with invented
+         * values; it now reports, like every other undecoded arm. */
+        unsupported_ah("INT 1Ah", ah);
         break;
     }
 }
