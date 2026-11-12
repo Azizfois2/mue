@@ -3268,3 +3268,41 @@ complained about" check catches a missing arm. It cannot catch an arm that
 runs and does the wrong thing, which is what AH=13h was doing. Those need the
 side effect, and specifically the *whole* side effect - for 13h, both the
 character and its attribute.
+
+## 49. The coverage note that wasn't: INT 15h AH=86h had no test at all
+
+`check_run.py` carried this comment:
+
+    # sweep turns the INT 15h wait off; the delay itself is checked by
+    # check_runtime.py.
+
+`check_runtime.py` contains no INT 15h test. Nothing did. The comment had
+probably been true at some point and was left behind, but its effect was to
+make the wait look guarded while it was completely unguarded: delete the
+sleep, or delete the 1000 ms cap, and the whole suite stayed green.
+
+This is a worse failure mode than a missing test, because a missing test is
+visible in the file list. A **comment pointing at a test that does not exist**
+reads as coverage, and I had been repeating "INT 15h is covered" on that
+basis.
+
+`src/check_int15.py` now asserts, by measurement:
+
+- **a real wait takes real time** - 0x0004:0x93E0 (300 ms) must take >=250 ms
+  of wall clock, and the guest must continue afterwards.
+- **the cap exists** - 0xFFFF:0xFFFF is ~71 minutes uncapped; it must return
+  within the cap plus slack. Proven by the suite finishing at all, and
+  separately by elapsed time.
+- **the cap is still a wait, not a stub** - >=500 ms. Without this, a clone
+  that returned immediately would satisfy the upper bound.
+- **MUE_NOSLEEP works** - both fast *and* still returning. If the flag broke,
+  `make test` would get slow rather than red, so it needed its own check.
+- **two waits in a row** - the call returns rather than swallowing the rest.
+
+Negative control: setting the cap aside makes the huge request sleep for 71
+minutes, and the check reports `1000000000 ms` plus
+`TIMEOUT: the wait was not capped`. That required a fix in the test itself -
+the first version let `TimeoutExpired` abort the script instead of reporting,
+which is exactly the silent-failure shape this section is about.
+
+The stale comment now points at `check_int15.py`.

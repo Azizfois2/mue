@@ -71,7 +71,7 @@ def main():
         try:
             # examples/traffic_lights.asm delays five seconds per step, so the
             # sweep turns the INT 15h wait off; the delay itself is checked by
-            # check_runtime.py.
+            # src/check_int15.py (cap, real elapsed time, MUE_NOSLEEP).
             env = dict(os.environ, MUE_NOSLEEP="1")
             p = subprocess.run([mue, winpath(f)], capture_output=True,
                                env=env, timeout=60)
