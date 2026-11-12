@@ -22,10 +22,13 @@
 #define DOS_IREAD   _S_IREAD
 #define DOS_IWRITE  _S_IWRITE
 #define dos_chmod   _chmod
+/* mkdir() on Windows takes one argument; POSIX takes a mode as well. */
+#define dos_mkdir(p) _mkdir(p)
 #else
 #define DOS_IREAD   S_IRUSR
 #define DOS_IWRITE  S_IWUSR
 #define dos_chmod   chmod
+#define dos_mkdir(p) mkdir((p), 0755)
 #endif
 #include "cpu.h"
 #include "alu.h"
@@ -1602,7 +1605,7 @@ static void int21(void)
         int r;
 
         if (dos_guest_name(name, sizeof name) != 0) { dos_file_error(3); break; }
-        r = (ah == 0x39) ? mkdir(name) : rmdir(name);
+        r = (ah == 0x39) ? dos_mkdir(name) : rmdir(name);
         if (r != 0) {
             /* DOS reports 3 when the path does not exist and 5 for every
              * other refusal (already there, not empty, is a file).  The
@@ -1784,11 +1787,11 @@ static void int21(void)
 
         if (!f) { dos_file_error(6); break; }
         if (sub == 0x00) {                      /* get */
-            struct _stat st;
+            struct stat st;
             int i = cpu.r[BX] - DOS_FIRST_HANDLE;
 
             if (i < 0 || i >= DOS_FILES || !dos_fname[i][0] ||
-                _stat(dos_fname[i], &st) != 0) { dos_file_error(6); break; }
+                stat(dos_fname[i], &st) != 0) { dos_file_error(6); break; }
             {
                 const struct tm *tm = localtime(&st.st_mtime);
                 int tt = 0, dd = 0;
