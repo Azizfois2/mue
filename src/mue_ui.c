@@ -51,6 +51,7 @@
 
 #include "mue_icons.h"
 #include "mue_highlight.h"
+#include "mue_source.h"
 #include <FL/fl_draw.H>
 
 #include <stdio.h>
@@ -205,8 +206,8 @@ public:
 };
 
 static FlagCell  *flagcell[NFLAG];
-static Fl_Text_Editor      *editor_text;
-static Fl_Text_Buffer      *mue_buf, *style_buf;
+static SourceView          *editor_text;
+static char                 guest_src[16384];
 static Fl_Double_Window    *emu_window;   /* hidden until `emulate` */
 static Fl_Multiline_Output *screen_area, *dis_area;
 static Fl_Box    *status_editor, *status_emul;
@@ -350,7 +351,9 @@ static void cb_emulate(Fl_Widget *, void *)
     }
     if (!editor_text) return;
     prev = cur;
-    if (run_guest(mue_buf ? mue_buf->text() : "", &cur)) {
+    snprintf(guest_src, sizeof guest_src, "%s",
+             editor_text ? editor_text->text().c_str() : "");
+    if (run_guest(guest_src, &cur)) {
         refresh_state();
         if (status_editor) status_editor->copy_label("emulated");
     } else if (status_editor) {
@@ -362,7 +365,7 @@ static void cb_emulate(Fl_Widget *, void *)
 static void cb_compile(Fl_Widget *, void *)
 {
     if (status_editor) {
-        const char *t = mue_buf ? mue_buf->text() : "";
+        const char *t = editor_text ? editor_text->text().c_str() : "";
         status_editor->copy_label(t && t[0] ? "compiled" : "nothing to compile");
         status_editor->redraw();
     }
@@ -491,22 +494,15 @@ static Fl_Double_Window *build_editor(void)
         nums->color(C_NUMCOL);
     }
 
-    /* A Fl_Text_Editor rather than a plain multiline input, so the text can
-     * be styled per token: Fl_Text_Display supports per-character styles,
-     * whereas Fl_Input has a single colour for the whole field. */
+    /* SourceView, not Fl_Text_Editor. FLTK's per-character style table is
+     * accepted but never consulted when drawing in this build, so the editor
+     * draws its own tokenised runs (see mue_source.h). */
     {
-        editor_text = new Fl_Text_Editor(60, 72, 924, 520);
+        editor_text = new SourceView(60, 72, 924, 520);
         editor_text->box(FL_DOWN_FRAME);
         editor_text->color(C_FIELD);
-        editor_text->selection_color(C_FIELD);
-        editor_text->textfont(FL_COURIER);
-        editor_text->textsize(13);
-        /* No textcolor() here: it forces one colour for all text and
-         * suppresses the per-token style table. */
-
-        Fl_Text_Buffer *buf = new Fl_Text_Buffer();
-        style_buf = new Fl_Text_Buffer();
-        buf->text(
+        editor_text->font_size(14);
+        editor_text->set_text(
             "org 100h\n"
             "; a small demo of the editor\n"
             "mov ax,1234h\n"
@@ -514,11 +510,6 @@ static Fl_Double_Window *build_editor(void)
             "mov cx,9ABCh\n"
             "mov dx,0DEF0h\n"
             "ret\n");
-        editor_text->buffer(buf);
-        mue_buf = buf;
-        mue_rehighlight(buf, style_buf);
-        editor_text->highlight_data(style_buf, mue_style_table,
-                                    256, 'A', 0, 0);
     }
 
     status_editor = new Fl_Box(0, H - 22, W, 20, "drag a file here to open");

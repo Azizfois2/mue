@@ -251,3 +251,24 @@ char *mue_highlight_one(const char *line, int len)
     highlight_line(line, out, len);
     return out;
 }
+
+/* ---- public per-line API used by the custom editor -------------------- */
+
+void mue_highlight_line(const char *src, char *cls, int len)
+{
+    init_styles();
+    highlight_line(src, cls, len);
+}
+
+void mue_token_rgb(int cls, unsigned char *r, unsigned char *g, unsigned char *b)
+{
+    *r = 32; *g = 32; *b = 32;                      /* plain, near-black */
+    switch (cls) {
+    case MUE_TKN_MNEM: *r = 0;   *g = 0;   *b = 170; break;  /* blue   */
+    case MUE_TKN_REG:  *r = 160; *g = 0;   *b = 0;   break;  /* red    */
+    case MUE_TKN_NUM:  *r = 0;   *g = 128; *b = 0;   break;  /* green  */
+    case MUE_TKN_CMT:  *r = 128; *g = 128; *b = 128; break;  /* grey   */
+    case MUE_TKN_STR:  *r = 128; *g = 0;   *b = 128; break;  /* purple */
+    default: break;
+    }
+}
