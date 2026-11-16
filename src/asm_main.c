@@ -1386,6 +1386,44 @@ static int asm_last_saw_model = 0;
 static int asm_last_saw_org   = 0;
 static int asm_last_is_boot_v = 0;
 
+/* ---- listing / symbol-table hand-over ---------------------------------- *
+ *
+ * `keep_lines` owns the merged source (includes spliced) until the next
+ * assembly, so asm_last_source() can hand a line back without the caller
+ * re-reading the file.  The per-line record is overwritten by each pass and
+ * therefore holds the converged one. */
+static char         **keep_lines;
+static int            keep_n;
+static asm_lineinfo   keep_li[ASM_MAX_LIST_LINES];
+static int            keep_nli;
+static label_t        keep_lab[ASM_MAX_LABELS];
+static int            keep_nlab;
+static int            keep_org;
+static asm_lineinfo   pass_li[ASM_MAX_LIST_LINES];
+static int            pass_nli;
+
+const asm_lineinfo *asm_last_lines(int *count)
+{
+    if (count) *count = keep_nli;
+    return keep_li;
+}
+
+const char *asm_last_source(int line)
+{
+    if (line < 1 || line > keep_n) return NULL;
+    return keep_lines[line - 1];
+}
+
+int asm_last_nsource(void) { return keep_n; }
+int asm_last_org(void)     { return keep_org; }
+
+const label_t *asm_last_labels(int *count)
+{
+    if (count) *count = keep_nlab;
+    return keep_lab;
+}
+
+
 /* A source carrying `#make_boot#` is a boot sector: it is loaded at 0000:7C00
  * rather than as a .COM at 0100, and examples/timer.asm, robot.asm and
  * far_call.asm all rely on that. */
@@ -1414,11 +1452,21 @@ static int pass_over(asm_t *a, char **lines, int nlines)
     a->in_macro = 0;
     asm_reset_macro_serial(); /* LOCAL names must be identical every pass */
     a->outlen = 0;
+    pass_nli = 0;
     for (i = 0; i < nlines; i++) {
         char copy[ASM_MAX_LINE];
         snprintf(copy, sizeof(copy), "%s", lines[i]);
+        if (i < ASM_MAX_LIST_LINES) {
+            pass_li[i].line = i + 1;
+            pass_li[i].addr = a->ip;   /* absolute: org is already folded in */
+            pass_li[i].off  = a->outlen;
+            pass_li[i].len  = 0;
+        }
         process_line(a, copy, i + 1);
+        if (i < ASM_MAX_LIST_LINES)
+            pass_li[i].len = a->outlen - pass_li[i].off;
     }
+    pass_nli = i < ASM_MAX_LIST_LINES ? i : ASM_MAX_LIST_LINES;
     return a->errcount;
 }
 
@@ -1541,6 +1589,15 @@ int asm_assemble_file(const char *path, int want_com, uint8_t **out, int *outlen
     a.org  = want_com ? 0x100 : 0;
     a.base = a.org;
 
+    /* Drop the previous assembly's source/listing before anything can fail. */
+    if (keep_lines) {
+        int i;
+        for (i = 0; i < keep_n; i++) free(keep_lines[i]);
+        free(keep_lines);
+        keep_lines = NULL;
+        keep_n = keep_nli = keep_nlab = 0;
+    }
+
     fclose(f);
 
     /* Splice every `include "file"` into the statement stream before any pass
@@ -1603,15 +1660,23 @@ int asm_assemble_file(const char *path, int want_com, uint8_t **out, int *outlen
      * the answer: there is no separate emit pass that could disagree with the
      * labels it recorded.  (A distinct pass 2 used to emit 7 bytes more than
      * the sizing pass on include.asm, leaving every label 7 bytes stale.) */
-    {
-        int i; for (i = 0; i < nlines; i++) free(lines[i]); free(lines);
-    }
 
     if (a.errcount) {
+        int i; for (i = 0; i < nlines; i++) free(lines[i]); free(lines);
         snprintf(errbuf, errbufsz, "%s", a.err[0] ? a.err : "assembly failed");
         free(a.out);
         return 0;
     }
+
+    /* Hand the merged source, the last pass's line records and the symbol
+     * table to the listing writer; they stay valid until the next assembly. */
+    keep_lines = lines;
+    keep_n     = nlines;
+    keep_nli   = pass_nli;
+    if (keep_nli > 0) memcpy(keep_li, pass_li, sizeof(asm_lineinfo) * (size_t)keep_nli);
+    keep_nlab  = a.nlab < ASM_MAX_LABELS ? a.nlab : ASM_MAX_LABELS;
+    if (keep_nlab > 0) memcpy(keep_lab, a.lab, sizeof(label_t) * (size_t)keep_nlab);
+    keep_org   = a.org;
 
     *out    = a.out;
     *outlen = a.outlen;

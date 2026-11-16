@@ -8,6 +8,10 @@ CC      ?= gcc
 CFLAGS  ?= -O2 -Wall -Wno-unused-parameter
 CPPFLAGS += -Isrc
 LDFLAGS ?=
+# The resource compiler that folds mue.rc into the UI binary.  It sits beside
+# the C++ compiler in a normal MinGW toolchain, so follow that if it is an
+# absolute path; otherwise expect it on PATH.
+WINDRES ?= $(if $(findstring /,$(CXX)),$(dir $(CXX))windres.exe,windres)
 
 # Windows names the binaries .exe; elsewhere they have no suffix.
 ifeq ($(OS),Windows_NT)
@@ -40,10 +44,11 @@ SKIPOK = $(PYTHON) -c "import subprocess,sys; r=subprocess.run([sys.argv[1]]+sys
 # optional dependency and the verified CLI must build without it.
 UIBIN   := src/mueui$(EXE)
 UISRC   := src/mue_ui.c src/mue_icons.c src/mue_highlight.c \
-           src/mue_source.cpp src/mue_tools.c
+           src/mue_source.cpp src/mue_tools.c \
+           src/mue_widgets.cpp src/mue_dialogs.cpp
 CORE_C  := src/exec.c src/mem.c src/alu.c src/io.c src/dos.c \
            src/asm_main.c src/asm_sup.c src/asm_ops.c src/exe.c src/screen.c \
-           src/mue_core.c
+           src/mue_core.c src/mue_paths.c
 CXX     ?= g++
 UICXXFLAGS ?= $(shell fltk-config --cxxflags 2>/dev/null)
 # fltk-config --ldflags omits the COM libraries FLTK's drag-and-drop needs on
@@ -128,17 +133,26 @@ examples: $(BIN)
 # Static FLTK link, so the binary runs without the toolchain's DLLs present.
 ui: $(UIBIN)
 
+# The Windows icon resource (Explorer, taskbar, title bar), built from the
+# same pixel art the About button draws.  windres produces a COFF object that
+# the link step below folds into the exe.
+UIRES := src/mue_res.o
+
+$(UIRES): mue.rc src/mue.ico
+	$(WINDRES) -i mue.rc -o $@
+
 # The core is compiled as C by $(CC), because exec.c uses C compound
 # literals that g++ rejects; only the UI sources go through $(CXX).
-$(UIBIN): $(UISRC) $(CORE_C) $(HEADERS)
+$(UIBIN): $(UISRC) $(CORE_C) $(HEADERS) $(UIRES)
 	@mkdir -p src/.uiobj
 	@for f in $(CORE_C); do \
 	    $(CC) -c $(CFLAGS) $(CPPFLAGS) -o src/.uiobj/`basename $$f .c`.o $$f || exit 1; \
 	done
 	$(CXX) -static -O2 -Wall -Wno-unused-parameter $(CPPFLAGS) \
-	    -o $@ $(UISRC) src/.uiobj/*.o $(UICXXFLAGS) $(UILDFLAGS) -mwindows
+	    -o $@ $(UISRC) src/.uiobj/*.o $(UIRES) $(UICXXFLAGS) $(UILDFLAGS) -mwindows
 
 clean:
 	rm -f $(BIN) $(TBIN) $(UIBIN)
+	rm -f $(UIRES)
 	rm -rf src/.uiobj
 

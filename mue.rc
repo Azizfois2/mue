@@ -1,0 +1,8 @@
+/* mue.rc - the Windows icon resource.
+ *
+ * Explorer, the taskbar and the title bar all take their picture of the
+ * program from here.  src/mue.ico is generated from the About button's chip
+ * artwork by `python re/make_icon.py`, so the icon on disk and the one drawn
+ * in the About window are the same pixels.
+ */
+1 ICON "src/mue.ico"

@@ -29,12 +29,15 @@
 #include <FL/Fl_Multiline_Output.H>
 #include <FL/Fl_Return_Button.H>
 #include <FL/Fl_Text_Editor.H>
+#include <FL/Fl_Scrollbar.H>
+#include <FL/fl_draw.H>
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "mue_tools.h"
+#include "mue_widgets.h"
 
 #define C_BG      FL_BACKGROUND_COLOR
 #define C_FIELD   FL_WHITE
@@ -136,80 +139,91 @@ void tools_open_convertor(void)
 {
     if (conv.win) { conv.win->show(); return; }
 
-    Fl_Window *w = new Fl_Window(306, 312, "base convertor");
+    /* Measured from the live dialog: window 252x253, so the FLTK client is
+     * 246x224.  Three VB6 frames, a narrow hex field, two decimal columns, a
+     * short ascii field and full-width oct/bin fields. */
+    Fl_Window *w = new Fl_Window(246, 224, "base convertor");
     w->color(C_BG);
-    w->size_range(306, 312, 306, 312);      /* not resizable, as recorded */
-
-    int y = 10, x = 12;
-    conv.b8  = new Fl_Round_Button(x, y, 70, 18, "8 bit");
-    conv.b16 = new Fl_Round_Button(x + 80, y, 70, 18, "16 bit");
-    conv.b8->type(FL_RADIO_BUTTON);
-    conv.b16->type(FL_RADIO_BUTTON);
-    conv.b8->value(1);
-    conv.b8->callback(conv_bits);
-    conv.b16->callback(conv_bits);
-    y += 26;
+    w->size_range(246, 224, 246, 224);      /* not resizable, as recorded */
 
     {
-        Fl_Box *l = new Fl_Box(x, y, 30, 20, "hex:");
+        MueGroup *g = new MueGroup(5, 9, 237, 55, 0);
+        conv.b8  = new Fl_Round_Button(20, 14, 66, 16, "8 bit");
+        conv.b16 = new Fl_Round_Button(128, 14, 70, 16, "16 bit");
+        conv.b8->type(FL_RADIO_BUTTON);
+        conv.b16->type(FL_RADIO_BUTTON);
+        conv.b8->value(1);
+        conv.b8->labelsize(11);
+        conv.b16->labelsize(11);
+        conv.b8->callback(conv_bits);
+        conv.b16->callback(conv_bits);
+
+        Fl_Box *l = new Fl_Box(8, 34, 36, 18, "hex:");
+        l->labelsize(11);
         l->align(FL_ALIGN_RIGHT | FL_ALIGN_INSIDE);
-        conv.hex = new Fl_Input(x + 36, y, 240, 22);
+        conv.hex = new Fl_Input(94, 36, 43, 19);
         conv.hex->box(FL_DOWN_BOX);
-        conv.hex->textfont(FL_COURIER);
+        conv.hex->textfont(FL_COURIER_BOLD);
+        conv.hex->textsize(12);
         conv.hex->when(FL_WHEN_CHANGED);
         conv.hex->callback(conv_from, (void *)"hex");
-        y += 30;
+        g->end();
     }
 
-    /* signed / unsigned columns over the dec: row */
     {
-        Fl_Box *h1 = new Fl_Box(x + 36, y, 110, 16, "signed");
-        Fl_Box *h2 = new Fl_Box(x + 150, y, 120, 16, "unsigned");
+        MueGroup *g = new MueGroup(5, 76, 237, 53, 0);
+        Fl_Box *h1 = new Fl_Box(57, 82, 79, 14, "signed");
+        Fl_Box *h2 = new Fl_Box(153, 82, 79, 14, "unsigned");
         h1->labelsize(11); h2->labelsize(11);
         h1->align(FL_ALIGN_CENTER);
         h2->align(FL_ALIGN_CENTER);
-        y += 18;
-        Fl_Box *l = new Fl_Box(x, y, 30, 20, "dec:");
-        l->align(FL_ALIGN_RIGHT | FL_ALIGN_INSIDE);
-        conv.dec_s = new Fl_Output(x + 36, y, 108, 22);
-        conv.dec_u = new Fl_Output(x + 150, y, 126, 22);
-        conv.dec_s->box(FL_DOWN_BOX);
-        conv.dec_u->box(FL_DOWN_BOX);
-        conv.dec_s->textfont(FL_COURIER);
-        conv.dec_u->textfont(FL_COURIER);
-        y += 30;
-    }
 
-    {
-        Fl_Box *l = new Fl_Box(x, y, 66, 20, "ascii char:");
+        Fl_Box *l = new Fl_Box(4, 99, 36, 18, "dec:");
         l->labelsize(11);
         l->align(FL_ALIGN_RIGHT | FL_ALIGN_INSIDE);
-        conv.ch = new Fl_Output(x + 72, y, 40, 22);
+        conv.dec_s = new Fl_Output(57, 100, 79, 19);
+        conv.dec_u = new Fl_Output(153, 100, 79, 19);
+        conv.dec_s->box(FL_DOWN_BOX);
+        conv.dec_u->box(FL_DOWN_BOX);
+        conv.dec_s->textfont(FL_COURIER_BOLD);
+        conv.dec_u->textfont(FL_COURIER_BOLD);
+        conv.dec_s->textsize(12);
+        conv.dec_u->textsize(12);
+        g->end();
+    }
+
+    {
+        Fl_Box *l = new Fl_Box(30, 142, 84, 18, "ascii char:");
+        l->labelsize(11);
+        l->align(FL_ALIGN_RIGHT | FL_ALIGN_INSIDE);
+        conv.ch = new Fl_Output(141, 140, 24, 16);
         conv.ch->box(FL_DOWN_BOX);
         conv.ch->textfont(FL_COURIER_BOLD);
-        y += 30;
+        conv.ch->textsize(12);
     }
 
     {
-        Fl_Box *l = new Fl_Box(x, y, 30, 20, "oct:");
+        Fl_Box *l = new Fl_Box(9, 164, 36, 18, "oct:");
+        l->labelsize(11);
         l->align(FL_ALIGN_RIGHT | FL_ALIGN_INSIDE);
-        conv.oct = new Fl_Input(x + 36, y, 240, 22);
+        conv.oct = new Fl_Input(53, 164, 182, 21);
         conv.oct->box(FL_DOWN_BOX);
-        conv.oct->textfont(FL_COURIER);
+        conv.oct->textfont(FL_COURIER_BOLD);
+        conv.oct->textsize(12);
         conv.oct->when(FL_WHEN_CHANGED);
         conv.oct->callback(conv_from, (void *)"oct");
-        y += 30;
     }
 
     {
-        Fl_Box *l = new Fl_Box(x, y, 30, 20, "bin:");
+        Fl_Box *l = new Fl_Box(9, 194, 36, 18, "bin:");
+        l->labelsize(11);
         l->align(FL_ALIGN_RIGHT | FL_ALIGN_INSIDE);
-        conv.bin = new Fl_Input(x + 36, y, 240, 22);
+        conv.bin = new Fl_Input(53, 194, 182, 21);
         conv.bin->box(FL_DOWN_BOX);
-        conv.bin->textfont(FL_COURIER);
+        conv.bin->textfont(FL_COURIER_BOLD);
+        conv.bin->textsize(12);
         conv.bin->when(FL_WHEN_CHANGED);
         conv.bin->callback(conv_from, (void *)"bin");
-        y += 30;
     }
 
     w->end();
@@ -361,9 +375,38 @@ typedef struct {
     Fl_Text_Buffer *buf;
     Fl_Round_Button *as_dec, *as_hex, *as_oct, *as_bin;
     Fl_Check_Button *signed_ck;
+    Fl_Scrollbar *vbar, *hbar;
 } calc_t;
 
 static calc_t calc;
+
+/* A text box with both scrollbars always on show, like the VB6 control in the
+ * original: FLTK hides them when the text fits, which changes the pane's
+ * shape.  They are therefore separate widgets laid out around the editor. */
+static void calc_pane_scroll(Fl_Widget *w, void *)
+{
+    if (w == calc.vbar)
+        calc.text->scroll((int)calc.vbar->value(), 0);
+    else
+        calc.text->scroll(1, (int)calc.hbar->value());
+}
+
+static void calc_sync_bars(void)
+{
+    int len = calc.buf->length();
+    int lines = calc.buf->count_lines(0, len) + 1;
+    int widest = 0, i, vis;
+    for (i = 0; i < lines; i++) {
+        int a = calc.buf->skip_lines(0, i);
+        int b = calc.buf->skip_lines(a, 1);
+        int n = b - a - 1;
+        if (n > widest) widest = n;
+    }
+    vis = calc.text->h() / (calc.text->textsize() + 4);
+    if (vis < 1) vis = 1;
+    calc.vbar->value(1, vis, 1, lines);
+    calc.hbar->value(0, calc.text->w(), 0, widest * 8 + 1);
+}
 
 static int calc_base(void)
 {
@@ -421,6 +464,7 @@ static void calc_eval(Fl_Widget *, void *)
         calc.buf->append("\n");
         calc.text->insert_position(calc.buf->length());
         calc.text->show_insert_position();
+        calc_sync_bars();
     }
 }
 
@@ -433,64 +477,126 @@ static int calc_enter_key(int, Fl_Text_Editor *)
 static void calc_clear(Fl_Widget *, void *)
 {
     calc.buf->text("");
+    calc_sync_bars();
 }
+
+/* The dotted triangle VB6 paints in a resizable form's bottom-right corner. */
+class CalcGrip : public Fl_Box {
+public:
+    CalcGrip(int X, int Y, int W, int H) : Fl_Box(X, Y, W, H)
+    {
+        box(FL_FLAT_BOX);
+        color(mue_face());
+    }
+    void draw() override
+    {
+        draw_box();
+        fl_color((Fl_Color)0x808080);
+        /* three diagonal rows of dots, the way VB6 paints the grip */
+        for (int row = 0; row < 3; row++) {
+            int y0 = y() + h() - 3 - row * 4;
+            for (int i = 0; i <= row; i++) {
+                int x0 = x() + w() - 3 - i * 4;
+                fl_point(x0, y0);
+                fl_point(x0 + 1, y0 + 1);
+            }
+        }
+    }
+};
+
+/* The calculator is resizable, like the VB6 form, but its controls do not
+ * stretch: VB6 leaves them where they are and grows the text pane, which is
+ * also what keeps the window from looking broken when it is maximised. */
+class CalcWindow : public Fl_Window {
+public:
+    CalcWindow(int X, int Y, int W, int H, const char *L)
+        : Fl_Window(X, Y, W, H, L), head(0), grip(0) {}
+    Fl_Group *head;
+    CalcGrip *grip;
+    void layout()
+    {
+        if (head) head->size(w() - 12, head->h());
+        if (calc.text) calc.text->resize(8, 98, w() - 30, h() - 121);
+        if (calc.vbar) calc.vbar->resize(w() - 22, 98, 15, h() - 121);
+        if (calc.hbar) calc.hbar->resize(8, h() - 23, w() - 30, 15);
+        if (grip) grip->position(w() - 22, h() - 23);
+    }
+    void resize(int X, int Y, int W, int H) override
+    {
+        Fl_Window::resize(X, Y, W, H);
+        layout();
+    }
+};
 
 void tools_open_calculator(void)
 {
     if (calc.win) { calc.win->show(); return; }
 
-    Fl_Window *w = new Fl_Window(384, 298, "calculator - expression...");
+    /* Window 319x247 with a thick resizable frame leaves a 303x208 client. */
+    CalcWindow *w = new CalcWindow(0, 0, 303, 208, "calculator - expression...");
     w->color(C_BG);
-    w->resizable(w);
+    w->size_range(303, 208);
 
-    int y = 8;
     {
-        Fl_Box *l = new Fl_Box(10, y + 2, 84, 18, "show result as");
-        l->labelsize(11);
-        l->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+        MueGroup *g = new MueGroup(2, 8, 291, 42, "show result as");
+        w->head = g;
+        calc.as_dec = new Fl_Round_Button(18, 24, 64, 16, "decimal");
+        calc.as_hex = new Fl_Round_Button(86, 24, 46, 16, "hex");
+        calc.as_oct = new Fl_Round_Button(148, 24, 46, 16, "oct");
+        calc.as_bin = new Fl_Round_Button(210, 24, 46, 16, "bin");
+        calc.as_dec->type(FL_RADIO_BUTTON);
+        calc.as_hex->type(FL_RADIO_BUTTON);
+        calc.as_oct->type(FL_RADIO_BUTTON);
+        calc.as_bin->type(FL_RADIO_BUTTON);
+        calc.as_dec->value(1);
+        calc.as_dec->labelsize(11);
+        calc.as_hex->labelsize(11);
+        calc.as_oct->labelsize(11);
+        calc.as_bin->labelsize(11);
+        g->end();
     }
-    calc.as_dec = new Fl_Round_Button(100,  y, 68, 18, "decimal");
-    calc.as_hex = new Fl_Round_Button(172,  y, 56, 18, "hex");
-    calc.as_oct = new Fl_Round_Button(232,  y, 56, 18, "oct");
-    calc.as_bin = new Fl_Round_Button(292,  y, 56, 18, "bin");
-    calc.as_dec->type(FL_RADIO_BUTTON);
-    calc.as_hex->type(FL_RADIO_BUTTON);
-    calc.as_oct->type(FL_RADIO_BUTTON);
-    calc.as_bin->type(FL_RADIO_BUTTON);
-    calc.as_dec->value(1);
-    y += 26;
 
     {
-        Fl_Group *g = new Fl_Group(10, y, 200, 54, "treat hex,oct,bin as:");
-        g->box(FL_ENGRAVED_FRAME);
-        g->labelsize(11);
-        g->align(FL_ALIGN_TOP_LEFT);
-        calc.signed_ck = new Fl_Check_Button(20, y + 6, 80, 18, "signed");
+        MueGroup *g = new MueGroup(2, 58, 228, 36, "treat hex,oct,bin as:");
+        calc.signed_ck = new Fl_Check_Button(10, 68, 76, 16, "signed");
         calc.signed_ck->labelsize(11);
-        Fl_Round_Button *wd = new Fl_Round_Button(20, y + 28, 60, 18, "word");
-        Fl_Round_Button *by = new Fl_Round_Button(90, y + 28, 60, 18, "byte");
+        Fl_Round_Button *wd = new Fl_Round_Button(114, 68, 60, 16, "word");
+        Fl_Round_Button *by = new Fl_Round_Button(176, 68, 52, 16, "byte");
         wd->type(FL_RADIO_BUTTON); by->type(FL_RADIO_BUTTON);
         wd->value(1);
+        wd->labelsize(11); by->labelsize(11);
         /* greyed out until signed is ticked, as in the original */
         wd->deactivate(); by->deactivate();
         g->end();
     }
     {
-        Fl_Button *cl = new Fl_Button(300, y, 74, 24, "clear");
-        Fl_Button *hp = new Fl_Button(300, y + 28, 74, 24, "help");
-        cl->labelsize(11); hp->labelsize(11);
+        MueButton *cl = new MueButton(234, 54, 62, 20, "clear");
+        MueButton *hp = new MueButton(234, 76, 62, 20, "help");
         cl->callback(calc_clear);
     }
-    y += 60;
 
     calc.buf = new Fl_Text_Buffer();
-    calc.text = new Fl_Text_Editor(10, y, 364, 298 - y - 12);
+    calc.text = new Fl_Text_Editor(8, 98, 273, 87);
     calc.text->box(FL_DOWN_BOX);
     calc.text->color(FL_WHITE);
-    calc.text->textfont(FL_COURIER);
-    calc.text->textsize(13);
+    calc.text->textfont(FL_COURIER_BOLD);
+    calc.text->textsize(12);
     calc.text->buffer(calc.buf);
     calc.buf->text("1+2\n");
+
+    /* The original's text box keeps both scrollbars on show (VB6
+     * `ScrollBars = 3`), with a resize grip in the corner between them. */
+    calc.vbar = new Fl_Scrollbar(281, 98, 15, 87);
+    calc.vbar->type(FL_VERTICAL);
+    calc.vbar->callback(calc_pane_scroll);
+    calc.hbar = new Fl_Scrollbar(8, 185, 273, 15);
+    calc.hbar->type(FL_HORIZONTAL);
+    calc.hbar->callback(calc_pane_scroll);
+    {
+        w->grip = new CalcGrip(281, 185, 15, 15);
+    }
+    calc_sync_bars();
+
     /* Enter evaluates rather than inserting a newline. The editor's key
      * binding takes a Key_Func (key, editor) that returns non-zero when it
      * handled the key, so the callback is wrapped rather than passed
@@ -516,124 +622,129 @@ void tools_open_options(void)
 {
     if (opts.win) { opts.win->show(); return; }
 
-    Fl_Window *w = new Fl_Window(635, 418, "options");
+    /* Measured 508x333 overall, so a 502x304 client.  Two columns of VB6
+     * frames: the left one holds the typing options and the keyword colours,
+     * the right one the font/tabs/line-number frames, with close/reset all
+     * above the full-width file-association button. */
+    Fl_Window *w = new Fl_Window(502, 304, "options");
     w->color(C_BG);
-    w->size_range(635, 418, 635, 418);      /* fixed size, as recorded */
+    w->size_range(502, 304, 502, 304);      /* fixed size, as recorded */
 
     /* ---- left column ---- */
     {
-        Fl_Box *l = new Fl_Box(12, 12, 100, 18, "auto-indent mode:");
+        Fl_Box *l = new Fl_Box(8, 6, 96, 18, "auto-indent mode:");
         l->labelsize(11);
         l->align(FL_ALIGN_RIGHT | FL_ALIGN_INSIDE);
-        Fl_Choice *ch = new Fl_Choice(118, 12, 170, 22);
+        Fl_Choice *ch = new Fl_Choice(108, 6, 136, 21);
         ch->add("indent on PROC|indent on {|no auto-indent");
         ch->value(0);
+        ch->labelsize(11);
+        ch->textsize(11);
     }
     {
-        Fl_Check_Button *c1 = new Fl_Check_Button(12, 44, 270, 18,
+        Fl_Check_Button *c1 = new Fl_Check_Button(8, 30, 236, 16,
                                                   "confine caret to text");
-        Fl_Check_Button *c2 = new Fl_Check_Button(12, 66, 270, 18,
+        Fl_Check_Button *c2 = new Fl_Check_Button(8, 50, 236, 16,
                                                   "keyword case normalization");
-        Fl_Check_Button *c3 = new Fl_Check_Button(12, 88, 290, 18,
+        Fl_Check_Button *c3 = new Fl_Check_Button(8, 70, 236, 16,
                               "show line numbers on thumb scroll");
         c1->labelsize(11); c2->labelsize(11); c3->labelsize(11);
     }
     {
-        Fl_Group *g = new Fl_Group(12, 116, 290, 130, " keywords ");
-        g->box(FL_ENGRAVED_FRAME);
-        g->labelsize(11);
-        Fl_Choice *item = new Fl_Choice(24, 140, 160, 22);
+        MueGroup *g = new MueGroup(8, 94, 236, 122, "keywords");
+        Fl_Box *il = new Fl_Box(14, 108, 34, 18, "item:");
+        il->labelsize(11);
+        il->align(FL_ALIGN_RIGHT | FL_ALIGN_INSIDE);
+        Fl_Choice *item = new Fl_Choice(54, 108, 180, 21);
         item->add("(none)|instruction|register|number|comment");
         item->value(0);
-        Fl_Box *sep = new Fl_Box(24, 168, 266, 2);
-        sep->box(FL_ENGRAVED_FRAME);
+        item->labelsize(11);
+        item->textsize(11);
 
-        Fl_Box *fl = new Fl_Box(24, 178, 92, 18, "foreground color");
+        Fl_Box *fl = new Fl_Box(14, 134, 96, 18, "foreground color:");
         fl->labelsize(11);
-        fl->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
-        Fl_Box *sw1 = new Fl_Box(120, 176, 40, 20);
+        fl->align(FL_ALIGN_RIGHT | FL_ALIGN_INSIDE);
+        Fl_Box *sw1 = new Fl_Box(116, 134, 36, 18);
         sw1->box(FL_DOWN_BOX);
         sw1->color(FL_WHITE);
-        sw1->deactivate();
 
-        Fl_Box *bl = new Fl_Box(24, 202, 92, 18, "background color");
+        Fl_Box *bl = new Fl_Box(14, 158, 96, 18, "background color:");
         bl->labelsize(11);
-        bl->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
-        Fl_Box *sw2 = new Fl_Box(120, 200, 40, 20);
+        bl->align(FL_ALIGN_RIGHT | FL_ALIGN_INSIDE);
+        Fl_Box *sw2 = new Fl_Box(116, 158, 36, 18);
         sw2->box(FL_DOWN_BOX);
         sw2->color(FL_WHITE);
-        sw2->deactivate();
 
-        Fl_Choice *fs = new Fl_Choice(24, 226, 160, 22);
+        Fl_Box *sl = new Fl_Box(14, 182, 96, 18, "font style:");
+        sl->labelsize(11);
+        sl->align(FL_ALIGN_RIGHT | FL_ALIGN_INSIDE);
+        Fl_Choice *fs = new Fl_Choice(116, 182, 118, 21);
         fs->add("normal|bold|italic");
         fs->value(0);
-        fs->deactivate();
+        fs->labelsize(11);
+        fs->textsize(11);
         g->end();
     }
 
     /* ---- right column ---- */
     {
-        Fl_Group *g = new Fl_Group(318, 12, 300, 96, " fonts and colors ");
-        g->box(FL_ENGRAVED_FRAME);
-        g->labelsize(11);
-        Fl_Box *l = new Fl_Box(330, 30, 62, 18, "control:");
+        MueGroup *g = new MueGroup(252, 8, 242, 92, "fonts and colors");
+        Fl_Box *l = new Fl_Box(260, 24, 56, 18, "control:");
         l->labelsize(11);
         l->align(FL_ALIGN_RIGHT | FL_ALIGN_INSIDE);
-        Fl_Choice *ch = new Fl_Choice(398, 30, 190, 22);
+        Fl_Choice *ch = new Fl_Choice(320, 24, 166, 21);
         ch->add("source code editor|memory|disassembly|screen");
         ch->value(0);
+        ch->labelsize(11);
+        ch->textsize(11);
 
-        Fl_Box *bl = new Fl_Box(330, 58, 92, 18, "background color");
+        Fl_Box *bl = new Fl_Box(260, 52, 96, 18, "background color:");
         bl->labelsize(11);
-        bl->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
-        Fl_Box *sw = new Fl_Box(428, 56, 44, 20);
+        bl->align(FL_ALIGN_RIGHT | FL_ALIGN_INSIDE);
+        Fl_Box *sw = new Fl_Box(362, 52, 36, 18);
         sw->box(FL_DOWN_BOX);
         sw->color(FL_WHITE);
 
-        Fl_Button *btn = new Fl_Button(430, 80, 90, 22, "set font ...");
-        btn->labelsize(11);
+        MueButton *btn = new MueButton(386, 74, 100, 20, "set font ...");
         g->end();
     }
     {
-        Fl_Group *g = new Fl_Group(318, 116, 300, 62, " tabs ");
-        g->box(FL_ENGRAVED_FRAME);
-        g->labelsize(11);
-        Fl_Box *l = new Fl_Box(330, 136, 60, 18, "tab size:");
+        MueGroup *g = new MueGroup(252, 108, 242, 58, "tabs");
+        Fl_Box *l = new Fl_Box(260, 122, 60, 18, "tab size:");
         l->labelsize(11);
         l->align(FL_ALIGN_RIGHT | FL_ALIGN_INSIDE);
-        Fl_Input *ti = new Fl_Input(396, 136, 50, 22);
+        Fl_Input *ti = new Fl_Input(326, 122, 44, 20);
         ti->value("4");
-        Fl_Check_Button *c = new Fl_Check_Button(330, 158, 270, 18,
-                                "convert tabs to spaces while typing");
+        Fl_Check_Button *c = new Fl_Check_Button(260, 144, 226, 16,
+                                 "convert tabs to spaces while typing");
         c->labelsize(11);
         c->value(1);
         g->end();
     }
     {
-        Fl_Group *g = new Fl_Group(318, 186, 300, 60, " line numbers ");
-        g->box(FL_ENGRAVED_FRAME);
-        g->labelsize(11);
-        Fl_Box *l1 = new Fl_Box(330, 204, 44, 18, "style:");
+        MueGroup *g = new MueGroup(252, 174, 242, 58, "line numbers");
+        Fl_Box *l1 = new Fl_Box(260, 188, 44, 18, "style:");
         l1->labelsize(11);
         l1->align(FL_ALIGN_RIGHT | FL_ALIGN_INSIDE);
-        Fl_Choice *sc = new Fl_Choice(380, 204, 100, 22);
+        Fl_Choice *sc = new Fl_Choice(310, 188, 100, 21);
         sc->add("decimal|hexadecimal");
         sc->value(0);
-        Fl_Box *l2 = new Fl_Box(330, 228, 44, 18, "start at:");
+        sc->labelsize(11);
+        sc->textsize(11);
+        Fl_Box *l2 = new Fl_Box(260, 210, 44, 18, "start at:");
         l2->labelsize(11);
         l2->align(FL_ALIGN_RIGHT | FL_ALIGN_INSIDE);
-        Fl_Input *si = new Fl_Input(380, 228, 50, 22);
+        Fl_Input *si = new Fl_Input(310, 210, 44, 20);
         si->value("1");
         g->end();
     }
 
     /* ---- buttons ---- */
     {
-        Fl_Return_Button *cl = new Fl_Return_Button(400, 262, 100, 26, "close");
-        Fl_Button *ra = new Fl_Button(510, 262, 100, 26, "reset all");
-        Fl_Button *as = new Fl_Button(12, 380, 611, 26,
+        MueButton *cl = new MueButton(262, 240, 110, 24, "close");
+        MueButton *ra = new MueButton(384, 240, 110, 24, "reset all");
+        MueButton *as = new MueButton(8, 272, 486, 24,
                                       "associate .asm and .inc files");
-        cl->labelsize(11); ra->labelsize(11); as->labelsize(11);
         cl->callback((Fl_Callback *)tools_close_options_cb);
     }
 
@@ -646,3 +757,4 @@ void tools_close_options_cb(Fl_Widget *, void *)
 {
     if (opts.win) opts.win->hide();
 }
+

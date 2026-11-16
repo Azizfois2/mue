@@ -1,12 +1,23 @@
-/* mue_source.cpp - implementation of the self-drawing source editor. */
+/* mue_source.cpp - implementation of the self-drawing source editor.
+ *
+ * Two shapes come out of this one widget, both measured from emu8086 4.08:
+ *
+ *   editor  white field, 27px #E6E6E6 line-number strip with #A0A0A0
+ *           digits, Courier-bold 13 source, 12px line pitch.
+ *   source  the same, read-only, with a #FFFF00 band behind the line that
+ *           is about to execute.
+ */
 #include <FL/Fl.H>
 #include <FL/fl_draw.H>
 #include <FL/Enumerations.H>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <ctype.h>
 
 #include "mue_source.h"
 #include "mue_highlight.h"
+#include "mue_widgets.h"
 
 SourceView::SourceView(int X, int Y, int W, int H, const char *L)
     : Fl_Widget(X, Y, W, H, L)
@@ -15,7 +26,11 @@ SourceView::SourceView(int X, int Y, int W, int H, const char *L)
     color(FL_WHITE);
     cur_ = anchor_ = 0;
     scroll_line_ = scroll_x_ = 0;
-    fs_ = 14;
+    fs_ = 13;
+    gutter_ = 0;
+    gw_ = 0;
+    hl_ = -1;
+    ro_ = 0;
     relayout();
 }
 
@@ -24,7 +39,13 @@ void SourceView::relayout()
     fl_font(FL_COURIER_BOLD, fs_);
     cw_ = (int)(fl_width("M") + 0.5f);
     if (cw_ < 1) cw_ = 8;
-    lh_ = fs_ + 4;
+    /* Measured from cap4/win2.png: 9px character advance, 12px line pitch,
+     * and a 27px gutter (content x 26..52) whose digits end at x 44.  The
+     * 13pt Courier face stays: its 8px glyph widths plus a 1px gap produce
+     * the measured 9px cells. */
+    cw_ = 9;
+    lh_ = 12;
+    gw_ = 27;
     clamp_scroll();
 }
 
@@ -85,9 +106,11 @@ int SourceView::pos_of(int ln, int col) const
     return s + col;
 }
 
+int SourceView::text_x() const { return x() + gutter_w() + 2; }
+
 int SourceView::cols_visible() const
 {
-    int n = (w() - 6) / cw_;
+    int n = (w() - gutter_w() - 6) / cw_;
     return n > 0 ? n : 1;
 }
 
@@ -139,6 +162,31 @@ void SourceView::erase_sel()
 
 /* ---- drawing ---------------------------------------------------------- */
 
+void SourceView::draw_gutter()
+{
+    int gx = x() + 1;
+    int gy = y() + 1;
+    int gh = h() - 2;
+    int gw = gutter_w();
+
+    fl_color(mue_gutter_bg());
+    fl_rectf(gx, gy, gw, gh);
+
+    /* Digits: two columns wide, light grey, right aligned, one per row.
+     * emu8086 numbers from 01, not 00. */
+    mue_mono_font(fs_);
+    fl_color(mue_gutter_line());
+    int n = line_count();
+    for (int ln = scroll_line_; ln < n && ln < scroll_line_ + rows_visible();
+         ln++) {
+        int yy = y() + 2 + (ln - scroll_line_) * lh_;
+        char num[16];
+        snprintf(num, sizeof num, "%02d", ln + 1);
+        fl_draw(num, gx, yy, gw - 10, lh_,
+                FL_ALIGN_RIGHT | FL_ALIGN_INSIDE);
+    }
+}
+
 void SourceView::draw_line(int ln, int y)
 {
     int s = line_start(ln);
@@ -152,16 +200,13 @@ void SourceView::draw_line(int ln, int y)
     mue_highlight_line(buf_.data() + s, cls, len);
 
     /* One character at a time, advancing the pen by the glyph's real
-     * advance width. Two things went wrong when this drew whole runs:
-     * fl_draw() with a width argument clips the text to that width rather
-     * than measuring it, and the run's x was computed both inside and
-     * outside the call, so every run after the first landed in the wrong
-     * place and the line came out as overlapping mojibake. Advancing per
-     * glyph also keeps positions correct for any font, proportional or not.
+     * advance width. fl_draw() with a width argument clips the text to that
+     * width rather than measuring it, so whole-run drawing silently collapsed
+     * runs; per-glyph advance also keeps positions right for any face.
      */
     fl_font(FL_COURIER_BOLD, fs_);
-    int pen = x() + 3 - scroll_x_ * cw_;
-    int base = y + lh_ - 4;
+    int pen = text_x() - scroll_x_ * cw_ + 1;
+    int base = y + lh_ - 3;
     char one[2];
     one[1] = 0;
     for (int i = 0; i < len; i++) {
@@ -177,8 +222,23 @@ void SourceView::draw_line(int ln, int y)
 
 void SourceView::draw()
 {
+    /* The widget's own box is a sunken frame; the interior has to be filled
+     * explicitly, because FL_DOWN_FRAME paints only the frame. */
     draw_box();
-    fl_push_clip(x() + 2, y() + 2, w() - 4, h() - 4);
+    fl_color(color());
+    fl_rectf(x() + 1, y() + 1, w() - 2, h() - 2);
+
+    if (gutter_) draw_gutter();
+
+    fl_push_clip(x() + 1, y() + 1, w() - 2, h() - 2);
+
+    /* Yellow band behind the current instruction (source window only). */
+    if (hl_ >= 0 && hl_ >= scroll_line_ &&
+        hl_ < scroll_line_ + rows_visible()) {
+        int vy = y() + 2 + (hl_ - scroll_line_) * lh_;
+        fl_color(mue_yellow());
+        fl_rectf(x() + gutter_w() + 1, vy, w() - gutter_w() - 2, lh_);
+    }
 
     /* Selection highlight behind the text. */
     int a = sel_start(), b = sel_end();
@@ -191,7 +251,7 @@ void SourceView::draw()
             if (to < from) continue;
             int vy = y() + 2 + (ln - scroll_line_) * lh_;
             if (vy + lh_ < y() || vy > y() + h()) continue;
-            fl_rectf(x() + 2 + (from - scroll_x_) * cw_, vy,
+            fl_rectf(text_x() + 1 + (from - scroll_x_) * cw_, vy,
                      (to - from) * cw_, lh_);
         }
     }
@@ -206,10 +266,10 @@ void SourceView::draw()
     }
 
     /* Caret. */
-    if (Fl::focus() == this) {
+    if (Fl::focus() == this && !ro_) {
         int ln = line_of(cur_), col = col_of(cur_);
         int vy = y() + 2 + (ln - scroll_line_) * lh_;
-        int vx = x() + 2 + (col - scroll_x_) * cw_;
+        int vx = text_x() + 1 + (col - scroll_x_) * cw_;
         if (vy >= y() && vy < y() + h() && vx >= x() && vx <= x() + w()) {
             fl_color(FL_BLACK);
             fl_line(vx, vy, vx, vy + lh_ - 2);
@@ -239,7 +299,7 @@ int SourceView::handle(int ev)
         int ln = scroll_line_ + (Fl::event_y() - y() - 2) / lh_;
         if (ln < 0) ln = 0;
         if (ln >= line_count()) ln = line_count() - 1;
-        int col = scroll_x_ + (Fl::event_x() - x() - 2) / cw_;
+        int col = scroll_x_ + (Fl::event_x() - text_x() - 1) / cw_;
         if (col < 0) col = 0;
         cur_ = anchor_ = pos_of(ln, col);
         if (Fl::event_clicks()) {
@@ -261,7 +321,7 @@ int SourceView::handle(int ev)
         int ln = scroll_line_ + (Fl::event_y() - y() - 2) / lh_;
         if (ln < 0) ln = 0;
         if (ln >= line_count()) ln = line_count() - 1;
-        int col = scroll_x_ + (Fl::event_x() - x() - 2) / cw_;
+        int col = scroll_x_ + (Fl::event_x() - text_x() - 1) / cw_;
         if (col < 0) col = 0;
         cur_ = pos_of(ln, col);
         redraw();
@@ -271,6 +331,36 @@ int SourceView::handle(int ev)
     case FL_KEYBOARD: {
         int k = Fl::event_key();
         int shift = Fl::event_state(FL_SHIFT);
+        if (ro_) {
+            /* A viewer still scrolls and moves its caret; it never edits. */
+            switch (k) {
+            case FL_Up: {
+                int ln = line_of(cur_), col = col_of(cur_);
+                if (ln > 0) cur_ = anchor_ = pos_of(ln - 1, col);
+                break;
+            }
+            case FL_Down: {
+                int ln = line_of(cur_), col = col_of(cur_);
+                if (ln < line_count() - 1) cur_ = anchor_ = pos_of(ln + 1, col);
+                break;
+            }
+            case FL_Page_Up:
+                scroll_line_ -= rows_visible() - 1;
+                clamp_scroll();
+                redraw();
+                return 1;
+            case FL_Page_Down:
+                scroll_line_ += rows_visible() - 1;
+                clamp_scroll();
+                redraw();
+                return 1;
+            default:
+                break;
+            }
+            ensure_visible();
+            redraw();
+            return 1;
+        }
         switch (k) {
         case FL_Left:
             if (shift) { if (cur_ > 0) cur_--; }
@@ -321,7 +411,7 @@ int SourceView::handle(int ev)
             insert("    ", 4);
             break;
         default: {
-            /* printable characters, and Ctrl-A/ctrl-C style is left to FLTK */
+            /* printable characters; shortcuts are left to FLTK */
             const char *t = Fl::event_text();
             int n = Fl::event_length();
             if (n > 0 && t) insert(t, n);

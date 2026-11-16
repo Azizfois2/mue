@@ -30,6 +30,12 @@ void sb_begin(void)
 
 void sb_end(void) { journal_on = 0; }
 
+/* Read access for callers that keep their own multi-level history: the
+ * journal itself only remembers the last step. */
+int      sb_count(void) { return journal_n; }
+uint32_t sb_phys_at(int i) { return journal[i].phys; }
+uint8_t  sb_old_at(int i)  { return journal[i].old; }
+
 int sb_undo(void)
 {
     int i;

@@ -15,11 +15,21 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
+#include <time.h>
+#ifdef _WIN32
+#  include <direct.h>
+#  define mue_mkdir(p) _mkdir(p)
+#else
+#  include <sys/stat.h>
+#  define mue_mkdir(p) mkdir(p, 0777)
+#endif
 
 #include "cpu.h"
 #include "dos.h"
 #include "asm.h"
 #include "mue_core.h"
+#include "mue_paths.h"
 
 /* ---- register naming ------------------------------------------------- */
 
@@ -41,28 +51,266 @@ static uint32_t P(uint16_t seg, uint16_t off)
 
 /* ---- load ------------------------------------------------------------- */
 
-int core_load(const char *src, char *err, int errsz)
+/* Step-back journal accessors, defined in mem.c. */
+void     sb_begin(void);
+void     sb_end(void);
+int      sb_count(void);
+uint32_t sb_phys_at(int i);
+uint8_t  sb_old_at(int i);
+void     core_hist_clear(void);
+
+/* ---- build artefacts ---------------------------------------------------
+ *
+ * emu8086 does not merely run a program: every build leaves five files in
+ * MyBuild\, and its listing and symbol-table windows read them back
+ * (re/FILESYSTEM.md section 2).  The binary carries a trailing underscore --
+ * `hello.com_` -- and the other four are named after it:
+ *
+ *   hello.com_          the image the emulator loads
+ *   hello.com_.debug    per-line address record, for the listing/step-back
+ *   hello.com_.list     machine code beside the source
+ *   hello.com_.symbol   the symbol table
+ *   hello.com_.~asm     the source as it was at build time
+ *
+ * The same five names without the underscore are what an explicit export
+ * writes, which is why the dialogs try the underscored name first.
+ */
+static void split_stem(const char *path, char *stem, int stemsz)
+{
+    const char *b = path ? path : "";
+    const char *s1 = strrchr(b, '\\');
+    const char *s2 = strrchr(b, '/');
+    const char *dot;
+    int n;
+    if (s1 && (!s2 || s1 > s2)) b = s1 + 1;
+    else if (s2) b = s2 + 1;
+    dot = strrchr(b, '.');
+    n = dot ? (int)(dot - b) : (int)strlen(b);
+    if (n <= 0) { snprintf(stem, (size_t)stemsz, "untitled"); return; }
+    if (n >= stemsz) n = stemsz - 1;
+    memcpy(stem, b, (size_t)n);
+    stem[n] = 0;
+}
+
+static int sym_cmp(const void *a, const void *b)
+{
+    const label_t *x = (const label_t *)a, *y = (const label_t *)b;
+    return strcmp(x->name, y->name);
+}
+
+static void write_list(FILE *f, const char *name, const uint8_t *bin, int n)
+{
+    int count = 0, i, k;
+    const asm_lineinfo *li = asm_last_lines(&count);
+    time_t t = time(NULL);
+    struct tm *tmv = localtime(&t);
+
+    fprintf(f, "MUE GENERATED LISTING. MACHINE CODE <- SOURCE.\n\n");
+    fprintf(f, "%s -- mue assembler\n\n", name);
+    if (tmv)
+        fprintf(f, "[ %02d/%02d/%04d  --  %02d:%02d:%02d ]\n\n",
+                tmv->tm_mon + 1, tmv->tm_mday, tmv->tm_year + 1900,
+                tmv->tm_hour, tmv->tm_min, tmv->tm_sec);
+    fprintf(f, "===================================================================================================\n");
+    fprintf(f, "[LINE]     LOC: MACHINE CODE                          SOURCE\n");
+    fprintf(f, "===================================================================================================\n\n");
+
+    for (i = 0; i < count; i++) {
+        const char *src = asm_last_source(li[i].line);
+        char bytes[64];
+        int used = 0;
+        if (!src) src = "";
+        bytes[0] = 0;
+        for (k = 0; k < li[i].len && k < 12; k++) {
+            int off = li[i].off + k;
+            if (off >= 0 && off < n)
+                used += snprintf(bytes + used, sizeof bytes - (size_t)used,
+                                 "%02X ", bin[off]);
+        }
+        if (li[i].len > 0)
+            fprintf(f, "[%4d]    %04X: %-38s%s\n", li[i].line, li[i].addr,
+                    bytes, src);
+        else
+            fprintf(f, "[%4d]        : %-38s%s\n", li[i].line, "", src);
+        for (k = 12; k < li[i].len; k += 12) {
+            int j;
+            used = 0;
+            bytes[0] = 0;
+            for (j = k; j < li[i].len && j < k + 12; j++) {
+                int off = li[i].off + j;
+                if (off >= 0 && off < n)
+                    used += snprintf(bytes + used, sizeof bytes - (size_t)used,
+                                     "%02X ", bin[off]);
+            }
+            fprintf(f, "                %s\n", bytes);
+        }
+    }
+}
+
+static void write_symbols(FILE *f, const char *name)
+{
+    int count = 0, i;
+    const label_t *lab = asm_last_labels(&count);
+    label_t *copy = count ? (label_t *)malloc(sizeof(label_t) * (size_t)count) : NULL;
+
+    fprintf(f, "< THE SYMBOL TABLE >  %s  --  mue assembler\n", name);
+    fprintf(f, "===================================================================================================\n");
+    fprintf(f, "Name                     \tOffset    \tSize      \tType      \tSegment\n");
+    fprintf(f, "===================================================================================================\n");
+    if (!copy) return;
+    memcpy(copy, lab, sizeof(label_t) * (size_t)count);
+    qsort(copy, (size_t)count, sizeof(label_t), sym_cmp);
+    for (i = 0; i < count; i++) {
+        char up[64], offs[16], szs[16];
+        const char *type = copy[i].is_proc ? "PROC"
+                         : (copy[i].size > 0 ? "VAR" : "LABEL");
+        int size = copy[i].is_proc ? -1 : (copy[i].size > 0 ? copy[i].size : -1);
+        int k;
+        for (k = 0; copy[i].name[k] && k < (int)sizeof up - 1; k++)
+            up[k] = (char)toupper((unsigned char)copy[i].name[k]);
+        up[k] = 0;
+        snprintf(offs, sizeof offs, "%05X", copy[i].value);
+        snprintf(szs, sizeof szs, "%d", size);
+        /* emu8086 pads every column to ten characters and upper-cases the
+         * name, because its symbol table is case-insensitive. */
+        fprintf(f, "%-25s\t%-10s\t%-10s\t%-10s\t(NOSEG)\n",
+                up, offs, szs, type);
+    }
+    free(copy);
+}
+
+/* Our own record for the step-back/listing panel: one line per emitted
+ * statement plus the image facts.  emu8086's .debug is its own binary format;
+ * mue writes text so the file is inspectable and versioned. */
+static void write_debug(FILE *f, const char *name, int binlen, int org)
+{
+    int count = 0, i;
+    const asm_lineinfo *li = asm_last_lines(&count);
+    fprintf(f, "mue debug info 1\n");
+    fprintf(f, "image %s\n", name);
+    fprintf(f, "org %04X\n", org);
+    fprintf(f, "bytes %d\n", binlen);
+    for (i = 0; i < count; i++)
+        if (li[i].len > 0)
+            fprintf(f, "line %d %04X %d\n", li[i].line, li[i].addr, li[i].len);
+}
+
+static char last_image_name[260];
+/* The image of the last successful assembly.  Compile shows the assembler
+ * status window *before* asking where the .bin goes, so the bytes have to
+ * survive until the Save-As box returns. */
+static uint8_t last_image[0x10000];
+static int last_image_len;
+static char last_src[65536];
+
+const char *core_last_image_name(void)
+{
+    return last_image_name;
+}
+
+/* Write the image and its four sidecars.  `to` is the file chosen in
+ * Compile's Save-As box; NULL asks for the MyBuild\<stem>.<ext>_ convention
+ * (what Emulate writes). */
+static void write_build(const char *src_path, const char *src,
+                        const uint8_t *bin, int n, const char *to)
+{
+    char stem[128] = "untitled", name[260];
+    char path[MUE_MAXP], img[MUE_MAXP];
+    const char *dir = mue_dir_build();
+    const char *ext = asm_last_was_exe() ? "exe"
+                    : (asm_last_is_boot() ? "bin" : "com");
+    FILE *f;
+
+    split_stem(src_path, stem, sizeof stem);
+    if (to) {
+        /* emu8086 writes the image where Save-As pointed, with the same four
+         * sidecars beside it and those names without the underscore. */
+        const char *b = to;
+        const char *s;
+        char dirbuf[MUE_MAXP];
+        for (s = to; *s; s++) if (*s == '\\' || *s == '/') b = s + 1;
+        snprintf(name, sizeof name, "%s", b);
+        snprintf(img, sizeof img, "%s", to);
+        snprintf(dirbuf, sizeof dirbuf, "%s", to);
+        s = strrchr(dirbuf, '\\');
+        if (!s) s = strrchr(dirbuf, '/');
+        if (s) { *((char *)s) = 0; mue_mkdirs(dirbuf); }
+    } else {
+        snprintf(name, sizeof name, "%s.%s_", stem, ext);
+        if (!mue_mkdirs(dir)) return;
+        snprintf(img, sizeof img, "%s\\%s", dir, name);
+    }
+    snprintf(last_image_name, sizeof last_image_name, "%s", name);
+    mue_write_file(img, bin, n);
+
+    /* The source as it stood at build time: that is what `.~asm` is, and it is
+     * what the listing's SOURCE column is produced from. */
+    snprintf(path, sizeof path, "%s.~asm", img);
+    mue_write_file(path, src, (int)strlen(src));
+
+    snprintf(path, sizeof path, "%s.list", img);
+    f = fopen(path, "wb");
+    if (f) { write_list(f, name, bin, n); fclose(f); }
+
+    snprintf(path, sizeof path, "%s.symbol", img);
+    f = fopen(path, "wb");
+    if (f) { write_symbols(f, name); fclose(f); }
+
+    snprintf(path, sizeof path, "%s.debug", img);
+    f = fopen(path, "wb");
+    if (f) { write_debug(f, name, n, asm_last_org()); fclose(f); }
+}
+
+const char *core_image_ext(void)
+{
+    return asm_last_was_exe() ? "exe" : (asm_last_is_boot() ? "bin" : "com");
+}
+
+static int last_image_size;
+
+int core_last_size(void)
+{
+    return last_image_size;
+}
+
+int core_assemble(const char *src, const char *src_path, char *err, int errsz)
 {
     char dir[512], path[600];
     FILE *f;
     uint8_t *p = NULL;
     int n = 0;
     const char *tmp = getenv("TEMP");
+    int trace = getenv("MUE_TRACE") != 0;
+    clock_t t0 = clock(), t1, t2, t3;
+    (void)src_path;
     if (err && errsz) err[0] = 0;
     if (!tmp || !tmp[0]) tmp = ".";
 
     snprintf(dir, sizeof dir, "%s\\mue_ui_live", tmp);
-#ifdef _WIN32
-    { char mk[700]; snprintf(mk, sizeof mk, "cmd /c mkdir \"%s\" 2>nul", dir); system(mk); }
-#endif
+    /* Creating the work directory used to cost ~600ms here because it went
+     * through `system("cmd /c mkdir")`: every Emulate/Compile click spawned a
+     * shell. A direct mkdir is microseconds, and a failure is harmless (the
+     * directory already exists, or the fopen below reports the real error). */
+    mue_mkdir(dir);
     snprintf(path, sizeof path, "%s\\guest.asm", dir);
+    t1 = clock();
 
     f = fopen(path, "wb");
     if (!f) { snprintf(err, errsz, "cannot write %s", path); return 0; }
     fputs(src, f);
     fclose(f);
 
-    if (!asm_assemble_file(path, 1, &p, &n, err, errsz ? errsz : 0)) return 0;
+    int asm_ok = asm_assemble_file(path, 1, &p, &n, err, errsz ? errsz : 0);
+    t2 = clock();
+    if (!asm_ok) return 0;
+
+    /* Keep the image and its source: Compile asks where it goes only after
+     * this returns (emu8086 shows the status window first), and Emulate
+     * writes nothing at all. */
+    last_image_len = n;
+    if (n > 0) memcpy(last_image, p, (size_t)n);
+    snprintf(last_src, sizeof last_src, "%s", src);
+    last_image_size = n;
 
     memset(MEM, 0, sizeof(MEM));
     if (n > 0xFF00) n = 0xFF00;
@@ -78,26 +326,156 @@ int core_load(const char *src, char *err, int errsz)
     dos_boot_psp();
     loaded = 1;
     cpu.halted = 0;
+    core_hist_clear();
+    t3 = clock();
+    if (trace)
+        fprintf(stderr, "core_assemble: mkdir %ld write+asm %ld rest %ld total %ld ms (n=%d)\n",
+                (long)((t1 - t0) * 1000 / CLOCKS_PER_SEC),
+                (long)((t2 - t1) * 1000 / CLOCKS_PER_SEC),
+                (long)((t3 - t2) * 1000 / CLOCKS_PER_SEC),
+                (long)((t3 - t0) * 1000 / CLOCKS_PER_SEC), n);
     return 1;
+}
+
+int core_load(const char *src, const char *src_path, char *err, int errsz)
+{
+    if (!core_assemble(src, src_path, err, errsz)) return 0;
+    write_build(src_path, last_src, last_image, last_image_len, NULL);
+    return 1;
+}
+
+int core_save_image(const char *path)
+{
+    if (!path || !path[0] || last_image_len <= 0) return 0;
+    write_build(NULL, last_src, last_image, last_image_len, path);
+    return 1;
+}
+
+int core_code_after_end(const char *src)
+{
+    const char *p = src;
+    int seen_end = 0;
+    while (p && *p) {
+        const char *eol = strchr(p, '\n');
+        const char *s = p;
+        size_t len = eol ? (size_t)(eol - p) : strlen(p);
+        size_t i;
+        while (*s == ' ' || *s == '\t') { s++; len--; }
+        if (!seen_end) {
+            if (len >= 3 &&
+                (s[0] == 'e' || s[0] == 'E') &&
+                (s[1] == 'n' || s[1] == 'N') &&
+                (s[2] == 'd' || s[2] == 'D') &&
+                (len == 3 || s[3] == ' ' || s[3] == '\t' ||
+                 s[3] == '\r' || s[3] == ';'))
+                seen_end = 1;
+        } else {
+            for (i = 0; i < len; i++)
+                if (s[i] != ' ' && s[i] != '\t' && s[i] != '\r' &&
+                    s[i] != ';') return 1;
+        }
+        if (!eol) break;
+        p = eol + 1;
+    }
+    return 0;
 }
 
 /* ---- stepping --------------------------------------------------------- */
 
+/* One history entry: the CPU exactly as it was before the step, plus the
+ * bytes that step overwrote. Registers live in cpu_t, so copying the struct
+ * restores IP, flags, the fetch cursor and the halt latch in one go. */
+typedef struct {
+    cpu_t     c;
+    int       n;
+    uint32_t *a;
+    uint8_t  *v;
+} hist_t;
+
+#define HIST_MAX 400
+static hist_t hist[HIST_MAX];
+static int    hn;
+
+void core_hist_clear(void)
+{
+    int i;
+    for (i = 0; i < hn; i++) {
+        free(hist[i].a);
+        free(hist[i].v);
+    }
+    hn = 0;
+}
+
+int core_back_depth(void) { return hn; }
+
+static void hist_push(const cpu_t *before)
+{
+    int n = sb_count(), i;
+    hist_t *h;
+
+    if (hn == HIST_MAX) {
+        free(hist[0].a);
+        free(hist[0].v);
+        memmove(&hist[0], &hist[1], sizeof(hist_t) * (HIST_MAX - 1));
+        hn--;
+    }
+    h = &hist[hn++];
+    h->c = *before;
+    h->n = n;
+    h->a = n ? (uint32_t *)malloc(sizeof(uint32_t) * (size_t)n) : NULL;
+    h->v = n ? (uint8_t *)malloc((size_t)n) : NULL;
+    for (i = 0; i < n; i++) {
+        h->a[i] = sb_phys_at(i);
+        h->v[i] = sb_old_at(i);
+    }
+}
+
 int core_step(void)
 {
+    cpu_t before;
+    int ok;
+
     if (cpu.halted) return 0;
-    return cpu_step();
+    before = cpu;
+    sb_begin();
+    ok = cpu_step();
+    sb_end();
+    if (!ok) return 0;
+    hist_push(&before);
+    return 1;
+}
+
+int core_step_back(void)
+{
+    hist_t *h;
+    int i;
+
+    if (hn <= 0) return 0;
+    h = &hist[--hn];
+    /* Undo memory in reverse, then put the CPU back exactly as it was. */
+    for (i = h->n - 1; i >= 0; i--) MEM[h->a[i] & 0xFFFFF] = h->v[i];
+    cpu = h->c;
+    free(h->a);
+    free(h->v);
+    h->a = NULL;
+    h->v = NULL;
+    h->n = 0;
+    return 1;
 }
 
 int core_run(int max)
 {
     int n = 0;
+    /* A run is not journalled, and keeping stale entries would let `step
+     * back` rewind into a state the run already left. */
+    core_hist_clear();
     while (!cpu.halted && n < max) {
         if (!cpu_step()) break;
         n++;
     }
     return n;
 }
+
 
 int core_halted(void) { return cpu.halted; }
 
@@ -211,16 +589,20 @@ int core_disasm_here(char *out, int *len)
     return core_disasm_at(out, len);
 }
 
-/* Disassemble one instruction at CS:IP without running it. */
-int core_disasm_at(char *out, int *len)
+/* Disassemble one instruction at an arbitrary segment:offset without running
+ * it.  The disassembly pane needs this because its anchor is independent of
+ * CS:IP (the user can type any address into the address field), and step-back
+ * needs to re-highlight a line that is not the current one. */
+int core_disasm_seg(unsigned short seg, unsigned short off, char *out, int *len)
 {
     dis_t d;
     uint8_t op;
     char a[64], b[64];
 
-    d.seg = cpu.sr[CS];
-    d.off = cpu.ip;
+    d.seg = seg;
+    d.off = off;
     d.p = P(d.seg, d.off);
+
     d.n = 0;
     d.segov = -1;
 
@@ -252,14 +634,12 @@ int core_disasm_at(char *out, int *len)
             uint8_t m = d8(&d);
             mod = m >> 6; rm = m & 7; reg = (m >> 3) & 7;
             rm_str(&d, mod, rm, width, a, sizeof a);
-            if (form == 0) snprintf(out, 200, "%s %s,%s%s", ALU[alu],
-                                    seg_prefix(&d), a, rn[reg]);
-            else if (form == 1) snprintf(out, 200, "%s %s,%s%s", ALU[alu],
-                                         rn[reg], seg_prefix(&d), a);
-            else if (form == 2) snprintf(out, 200, "%s %s,%s%s", ALU[alu],
-                                         seg_prefix(&d), a, rn[reg]);
-            else snprintf(out, 200, "%s %s%s,%s", ALU[alu], seg_prefix(&d),
-                          a, rn[reg]);
+            if (form == 0 || form == 1)
+                snprintf(out, 200, "%s %s,%s%s", ALU[alu],
+                         seg_prefix(&d), a, rn[reg]);
+            else
+                snprintf(out, 200, "%s %s%s,%s", ALU[alu], rn[reg],
+                         seg_prefix(&d), a);
         } else {
             /* accumulator, immediate */
             unsigned v = width == 1 ? d8(&d) : d16(&d);
@@ -285,6 +665,10 @@ int core_disasm_at(char *out, int *len)
     case 0x64: case 0x65: case 0x66: case 0x67:
     case 0x68: case 0x69: case 0x6A: case 0x6B:
         snprintf(out,200,"db %02X", op); goto done;
+    case 0x6C: snprintf(out,200,"insb"); goto done;
+    case 0x6D: snprintf(out,200,"insw"); goto done;
+    case 0x6E: snprintf(out,200,"outsb"); goto done;
+    case 0x6F: snprintf(out,200,"outsw"); goto done;
     case 0x70: case 0x71: case 0x72: case 0x73:
     case 0x74: case 0x75: case 0x76: case 0x77:
     case 0x78: case 0x79: case 0x7A: case 0x7B:
@@ -295,12 +679,14 @@ int core_disasm_at(char *out, int *len)
         goto done;
     }
     case 0x80: case 0x81: case 0x82: case 0x83: {
-        int width = (op == 0x80 || op == 0x82 || op == 0x83) ? 1 : 2;
+        int width = (op == 0x80 || op == 0x82) ? 1 : 2;
         int mod, rm, reg;
         uint8_t m = d8(&d);
         mod = m >> 6; rm = m & 7; reg = (m >> 3) & 7;
         rm_str(&d, mod, rm, width, a, sizeof a);
-        unsigned v = (width == 1) ? d8(&d) : d16(&d);
+        unsigned v;
+        if (op == 0x83) v = (unsigned)(int8_t)d8(&d) & 0xFFFF;
+        else v = (width == 1) ? d8(&d) : d16(&d);
         snprintf(out, 200, "%s %s,%X", ALU[reg], a, v);
         goto done;
     }
@@ -568,11 +954,18 @@ done:
     return 1;
 }
 
+/* Disassemble one instruction at CS:IP. */
+int core_disasm_at(char *out, int *len)
+{
+    return core_disasm_seg(cpu.sr[CS], cpu.ip, out, len);
+}
+
 void core_disasm_list(char *out, int outsz, int rows)
 {
     int o = 0, i;
-    uint16_t cs;
-    int ip;
+    unsigned short cs;
+    int ip, len;
+
     if (outsz <= 0) return;
     out[0] = 0;
     cs = cpu.sr[CS];
@@ -580,14 +973,97 @@ void core_disasm_list(char *out, int outsz, int rows)
 
     for (i = 0; i < rows; i++) {
         char txt[200];
-        int len = 0;
-        cpu.sr[CS] = cs;
-        cpu.ip = (uint16_t)ip;
-        core_disasm_at(txt, &len);
+        len = 0;
+        core_disasm_seg(cs, (unsigned short)ip, txt, &len);
         if (len <= 0) break;
         o += snprintf(out + o, (size_t)(outsz - o), "%04X:%04X  %-16s\n",
                       cs, (unsigned)(ip & 0xFFFF), txt);
         if (o >= outsz - 100) break;
         ip = (ip + len) & 0xFFFF;
     }
+}
+
+/* Length of the instruction at seg:off, or 0 when nothing decodes. */
+int core_insn_len_at(unsigned short seg, unsigned short off)
+{
+    char txt[200];
+    int len = 0;
+    core_disasm_seg(seg, off, txt, &len);
+    return len;
+}
+
+/* Disassemble `rows` instructions from an arbitrary anchor, reporting each
+ * line's address and length so the caller can highlight the right row and
+ * select exactly the bytes of the current instruction.
+ *
+ * `addrs`, `lens` and `text` are all caller arrays of at least `rows`
+ * entries; `text` is one flat buffer of `rows * tstride` bytes. */
+void core_disasm_rows(unsigned short seg, unsigned short first_off, int rows,
+                      unsigned short *addrs, int *lens, char *text,
+                      int tstride)
+{
+    int i;
+    unsigned off = first_off;
+
+    for (i = 0; i < rows; i++) {
+        int len = 0;
+        char *slot = text + (size_t)i * tstride;
+        slot[0] = 0;
+        core_disasm_seg(seg, (unsigned short)off, slot, &len);
+        if (len <= 0) { addrs[i] = (unsigned short)off; lens[i] = 0; continue; }
+        addrs[i] = (unsigned short)off;
+        lens[i] = len;
+        off = (off + len) & 0xFFFF;
+    }
+}
+
+/* ====================================================================== */
+/* writing state                                                           */
+/*                                                                         */
+/* The register pane and the memory pane are editable, as in the original: */
+/* typing a value and pressing Enter changes the machine. These go through  */
+/* the same poke8/poke16 the CPU uses, so the journal sees them too.       */
+/* ====================================================================== */
+
+void core_write_reg(int idx, unsigned short v)
+{
+    if (idx >= 0 && idx < 8)        cpu.r[idx] = v;
+    else if (idx >= 8 && idx < 12)  cpu.sr[idx - 8] = v;
+    else if (idx == 12)             cpu.ip = v;
+    else if (idx == 13)             cpu.flags = v;
+    if (idx == 12) cpu.phys = P(cpu.sr[CS], cpu.ip);
+}
+
+void core_write_flags(unsigned short f) { cpu.flags = f; }
+
+/* Absolute write: `phys` is a physical address, not a segment:offset. */
+void core_write8(uint32_t phys, unsigned char v) { poke8(phys, v); }
+void core_write16(uint32_t phys, unsigned short v) { poke16(phys, v); }
+
+/* ====================================================================== */
+/* screen                                                                  */
+/* ====================================================================== */
+
+void core_screen_cells(unsigned char *chars, unsigned char *attrs)
+{
+    int row, col, o = 0;
+    int page = dos_screen_page();
+
+    for (row = 0; row < 25; row++) {
+        for (col = 0; col < 80; col++) {
+            unsigned char a = 0x07;
+            unsigned char c = dos_screen_cell(page, row, col, &a);
+            if (chars) chars[o] = c;
+            if (attrs) attrs[o] = a;
+            o++;
+        }
+    }
+}
+
+void core_screen_cursor(int *row, int *col)
+{
+    int r = 0, c = 0;
+    dos_screen_cursor(dos_screen_page(), &r, &c);
+    if (row) *row = r;
+    if (col) *col = c;
 }

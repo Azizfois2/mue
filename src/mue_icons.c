@@ -31,28 +31,35 @@
 #define IC_GREEN  46, 184,  46
 #define IC_BLUE   47, 111, 216
 #define IC_TEAL   30, 159, 168
+#define IC_BRIGHT  0, 208,  0
+#define IC_STEPGRAY 172, 172, 172
 #define IC_GRAY  154, 154, 154
 #define IC_DARK   32,  32,  32
 #define IC_WHITE 255, 255, 255
 #define IC_LGRAY 216, 216, 216
 #define IC_BG_ON_TOOL 255, 255, 255
 
-/* Every icon starts on white so it reads on the grey toolbar, and ends by
- * grabbing the surface. Pushing/popping per icon keeps them independent. */
+/* Every icon starts on the toolbar face so it reads as a flat glyph on the
+ * grey toolbar, and ends by grabbing the surface. Pushing/popping per icon
+ * keeps them independent. */
 #define ICON_BEGIN()                                                   \
     Fl_Image_Surface s(24, 24);                                        \
     Fl_Surface_Device::push_current(&s);                               \
-    fl_color(IC_WHITE); fl_rectf(0, 0, 24, 24)
+    fl_color(240, 240, 240); fl_rectf(0, 0, 24, 24)
 
-/* Copy the surface into an image that OWNS its pixels. Fl_Image_Surface
- * hands back an image pointing at the surface's own buffer, which is released
- * when the surface goes out of scope; the icons appeared at the wrong place
- * and size until they were copied here. */
+/* Copy the surface into an image that OWNS its pixels, then materialise it at
+ * the 16px toolbar size.  Fl_Image_Surface hands back an image pointing at
+ * the surface's own buffer, which is released when the surface goes out of
+ * scope; and drawing a 24x24 surface with draw(x,y,16,16) CROPS it to the
+ * top-left 16x16 instead of scaling it, which is what clipped the icons. */
 #define ICON_END()                                                     \
     do {                                                               \
         Fl_RGB_Image *tmp_ = s.image();                                \
-        Fl_RGB_Image *img_ = tmp_ ? (Fl_RGB_Image *)tmp_->copy() : 0;  \
+        Fl_RGB_Image *full_ = tmp_ ? (Fl_RGB_Image *)tmp_->copy() : 0; \
         Fl_Surface_Device::pop_current();                              \
+        if (!full_) return 0;                                          \
+        Fl_RGB_Image *img_ = (Fl_RGB_Image *)full_->copy(16, 16);      \
+        delete full_;                                                  \
         return img_;                                                   \
     } while (0)
 
@@ -75,14 +82,33 @@ Fl_RGB_Image *icon_new(void)
     ICON_END();
 }
 
+static Fl_RGB_Image *pix_art(const char *const *rows);
+
 Fl_RGB_Image *icon_open(void)
 {
-    ICON_BEGIN();
-    fl_color(IC_YEL);  fl_polygon(2, 8, 9, 8, 11, 5, 4, 5);
-    fl_color(IC_YEL);  fl_polygon(5, 11, 22, 11, 19, 19, 2, 19);
-    fl_color(IC_GOLD); fl_rectf(5, 17, 14, 2);
-    outline(3, 7, 17, 12);
-    ICON_END();
+    /* The original's "Load"/"open" glyph: a dithered yellow folder with a
+     * dark olive body and a black outline, and the little white-and-black
+     * arrow that leaves its top-right corner.  Transcribed 1:1 from the
+     * 16x16 art in the reference capture. */
+    static const char *const art[16] = {
+        "................",
+        "................",
+        ".........TTT....",
+        "........TPPPT.T.",
+        "........P...PTK.",
+        ".TTT........TKK.",
+        "TIRITTTTTTT.PPP.",
+        "KCACIRIRIRK.....",
+        "KACACACACAK.....",
+        "KCACAFUFUFKTTTTT",
+        "KACAFEEEEEEEEEKP",
+        "KCAFEDDDDDDDDHP.",
+        "KAFEDDDDDDDDHP..",
+        "KFEDDDDDDDDHP...",
+        "KKHHHHHHHHHP....",
+        "PPPPPPPPPPP.....",
+    };
+    return pix_art(art);
 }
 
 Fl_RGB_Image *icon_star(void)
@@ -145,13 +171,17 @@ Fl_RGB_Image *icon_run(void)
 Fl_RGB_Image *icon_calc(void)
 {
     ICON_BEGIN();
-    fl_color(IC_DARK);  fl_rectf(4, 3, 16, 18);
-    fl_color(IC_TEAL);  fl_rectf(6, 5, 12, 5);
-    fl_color(IC_LGRAY);
-    for (int r = 0; r < 2; r++)
+    /* Blue body, pale screen, six keys - the original's calculator. */
+    fl_color(IC_BLUE);  fl_rectf(4, 3, 16, 18);
+    fl_color(198, 232, 200);
+    fl_rectf(6, 5, 12, 5);
+    fl_color(IC_WHITE);
+    for (int r = 0; r < 3; r++)
         for (int c = 0; c < 3; c++)
-            fl_rectf(6 + c * 4, 12 + r * 4, 3, 3);
-    outline(4, 3, 16, 18);
+            fl_rectf(6 + c * 4, 12 + r * 3, 3, 2);
+    fl_color(IC_DARK);
+    fl_rect(4, 3, 16, 18);
+    fl_rect(6, 5, 12, 5);
     ICON_END();
 }
 
@@ -169,85 +199,255 @@ Fl_RGB_Image *icon_convert(void)
     ICON_END();
 }
 
+/* ---- pixel-art icons ---------------------------------------------------
+ * The options/help/about glyphs are literal 16x16 bitmaps.  Drawing them on
+ * the shared 24x24 surface and shrinking to 16 with copy(16,16) turned their
+ * 1px outlines into grey smudges and, with the old font-drawn "?"/"M", put
+ * parts of a glyph outside the surface.  The originals are crisp 16px art, so
+ * these are authored at exactly that size and handed over untouched. */
+static Fl_RGB_Image *pix_art_n(const char *const *rows, int scale)
+{
+    int w = 16 * scale;
+    unsigned char *buf = new unsigned char[w * w * 3];
+    if (!buf) return 0;
+    for (int y = 0; y < w; y++) {
+        for (int x = 0; x < w; x++) {
+            unsigned char *p = buf + (y * w + x) * 3;
+            int r = 240, g = 240, b = 240;           /* toolbar face */
+            switch (rows[y / scale][x / scale]) {
+            case '#': r =  32; g =  32; b =  32; break;   /* outline      */
+            case 'Y': r = 245; g = 197; b =  24; break;   /* yellow       */
+            case 'O': r = 212; g = 160; b =  23; break;   /* yellow shade */
+            case 'G': r =  46; g = 184; b =  46; break;   /* chip green   */
+            case 'w': r = 154; g = 154; b = 154; break;   /* wrench grey  */
+            case 'r': r = 150; g =  30; b =  30; break;   /* hammer red   */
+            case 'o': r = 140; g = 140; b =  40; break;   /* hammer olive */
+            /* The emulator's five action icons are transcribed pixel for
+             * pixel from the original's 16x16 art, so its own 8-bit palette
+             * has to be reproduced exactly rather than approximated. */
+            case 'K': r =   0; g =   0; b =   0; break;   /* black        */
+            case 'A': r = 255; g = 255; b =  51; break;   /* folder light */
+            case 'C': r = 255; g = 255; b = 204; break;   /* folder pale  */
+            case 'D': r = 128; g = 128; b =   0; break;   /* folder body  */
+            case 'E': r = 102; g = 102; b =   0; break;   /* folder edge  */
+            case 'F': r =  51; g =  51; b =   0; break;
+            case 'H': r =  25; g =  25; b =   0; break;
+            case 'I': r = 204; g = 204; b =   0; break;
+            case 'B': r =   0; g =   0; b = 255; break;   /* reload blue  */
+            case 'J': r =  48; g =  48; b = 252; break;
+            case 'L': r = 192; g = 192; b = 243; break;
+            case 'M': r = 160; g = 160; b = 160; break;   /* disabled grey*/
+            case 'N': r = 176; g = 176; b = 176; break;
+            case 'P': r = 192; g = 192; b = 192; break;
+            case 'Q': r = 224; g = 224; b = 224; break;
+            case 'R': r = 204; g = 204; b = 204; break;
+            case 'S': r = 179; g = 179; b = 179; break;
+            case 'T': r =  48; g =  48; b =  48; break;
+            case 'U': r =  51; g =  51; b =  51; break;
+            case 'V': r =   0; g = 128; b = 128; break;   /* teal         */
+            case 'W': r =  48; g = 150; b = 150; break;
+            case 'X': r = 192; g = 218; b = 218; break;
+            case 'Z': r =   0; g = 255; b =   0; break;   /* bright green */
+            case 'z': r =   0; g = 230; b =  25; break;
+            case 'y': r =   0; g = 153; b = 102; break;
+            }
+            p[0] = (unsigned char)r;
+            p[1] = (unsigned char)g;
+            p[2] = (unsigned char)b;
+        }
+    }
+    Fl_RGB_Image *img = new Fl_RGB_Image(buf, w, w, 3);
+    if (img->array == (const uchar *)buf) img->alloc_array = 1;
+    else delete[] buf;
+    return img;
+}
+
+static Fl_RGB_Image *pix_art(const char *const *rows)
+{
+    return pix_art_n(rows, 1);
+}
+
 Fl_RGB_Image *icon_options(void)
 {
-    ICON_BEGIN();
-    /* Hammer head across the top, wrench handle below it: two distinct
-     * shapes rather than a bare X, which read as a cancel symbol. */
-    fl_color(IC_GRAY); fl_rectf(4, 6, 16, 5);          /* hammer head */
-    outline(4, 6, 16, 5);
-    fl_color(IC_LGRAY); fl_rectf(11, 11, 3, 10);       /* handle      */
-    outline(11, 11, 3, 10);
-    fl_color(IC_GRAY); fl_rectf(5, 13, 4, 6);          /* wrench jaw  */
-    outline(5, 13, 4, 6);
-    fl_color(IC_BG_ON_TOOL); fl_rectf(6, 14, 2, 2);
-    ICON_END();
+    /* A grey open-end wrench and a hammer with a dark red handle and an
+     * olive head, crossing in an X. */
+    static const char *const art[16] = {
+        "...........###..",
+        "..........#ooo##",
+        ".####.....#oooo#",
+        "#wwww#....#ooo##",
+        "#w##w#...#ooo##.",
+        "#w#.#w#..#oo##..",
+        ".#w#ww#.#oo##...",
+        "..#www#ww#......",
+        "....#rrw#.......",
+        "...#rr#w#.......",
+        "..#rr#.w#.......",
+        ".#rr#..#w#......",
+        ".#r#....#w#.....",
+        "#rr#.....#w#....",
+        "#r#.......#w#...",
+        ".#........###...",
+    };
+    return pix_art(art);
 }
 
 Fl_RGB_Image *icon_help(void)
 {
-    ICON_BEGIN();
-    fl_color(IC_YEL);  fl_pie(3, 2, 18, 18, 0, 360);
-    fl_color(IC_GOLD); fl_arc(3, 2, 18, 18, 200, 340);
-    fl_color(IC_DARK);
-    fl_line_style(FL_SOLID, 2);
-    fl_arc(8, 6, 8, 8, 200, 20);
-    fl_line(12, 13, 12, 15);
-    fl_rectf(11, 16, 2, 2);
-    fl_line_style(0);
-    ICON_END();
+    /* A yellow question mark with a dark outline, as the original draws it:
+     * a thick hook, a narrow stem and a detached dot. */
+    static const char *const art[16] = {
+        "................",
+        ".....######.....",
+        "....#YYYYYY#....",
+        "...#YY####YO#...",
+        "...#Y##..##YO#..",
+        "...#Y#....#YO#..",
+        "....##....#YO#..",
+        ".........#YYO#..",
+        "........#YYO#...",
+        ".......#YYO#....",
+        ".......#YY#.....",
+        ".......####.....",
+        "................",
+        ".......#YY#.....",
+        ".......#YY#.....",
+        ".......####.....",
+    };
+    return pix_art(art);
 }
+
+/* Green chip with pins: emu8086's logo chip.  The die carries an "M" for mue
+ * instead of the original's "E".  This is also the program's icon, so
+ * re/make_icon.py reads this very table to build src/mue.ico. */
+static const char *const about_art[16] = {
+    "................",
+    "...#..#..#..#...",
+    ".##############.",
+    ".#GGGGGGGGGGGG#.",
+    ".#GG#GGGGG#GGG#.",
+    ".#GG##GGG##GGG#.",
+    ".#GG#G#G#G#GGG#.",
+    ".#GG#GG#GG#GGG#.",
+    ".#GG#GGGGG#GGG#.",
+    ".#GG#GGGGG#GGG#.",
+    ".#GG#GGGGG#GGG#.",
+    ".#GGGGGGGGGGGG#.",
+    ".##############.",
+    "...#..#..#..#...",
+    "................",
+    "................",
+};
 
 Fl_RGB_Image *icon_about(void)
 {
-    ICON_BEGIN();
-    fl_color(IC_GREEN); fl_rectf(6, 6, 12, 12);
-    outline(6, 6, 12, 12);
-    fl_color(IC_DARK);
-    for (int i = 0; i < 3; i++) {
-        fl_rectf(8 + i * 4, 2, 1, 4);
-        fl_rectf(8 + i * 4, 18, 1, 4);
-        fl_rectf(2, 8 + i * 4, 4, 1);
-        fl_rectf(18, 8 + i * 4, 4, 1);
-    }
-    ICON_END();
+    return pix_art(about_art);
+}
+
+/* The window/exe icon: the same chip at 32x32, which is the large-icon size
+ * Windows asks for. */
+Fl_RGB_Image *icon_app(void)
+{
+    return pix_art_n(about_art, 2);
 }
 
 Fl_RGB_Image *icon_reload(void)
 {
-    ICON_BEGIN();
-    fl_color(IC_BLUE);
-    fl_line_style(FL_SOLID, 3);
-    fl_arc(4, 4, 16, 16, 40, 320);
-    fl_line_style(0);
-    fl_polygon(17, 3, 22, 8, 15, 9);
-    ICON_END();
+    /* Blue rounded loop, open at the top-left, with the arrow head turning
+     * in at that corner. */
+    static const char *const art[16] = {
+        ".......J........",
+        "......JB........",
+        ".....JBBJJJJ....",
+        "....JBBBBBBBJ...",
+        "....LBBBBBBBBJ..",
+        "JJJ..LBBLLLBBB..",
+        "BBB...LB...BBB..",
+        "BBB....L...BBB..",
+        "BBB........BBB..",
+        "BBB........BBB..",
+        "BBB........BBB..",
+        "BBB........BBB..",
+        "BBB........BBB..",
+        "BBBJJJJJJJJBBB..",
+        "LBBBBBBBBBBBBL..",
+        ".LBBBBBBBBBBL...",
+    };
+    return pix_art(art);
 }
 
 Fl_RGB_Image *icon_step_back(void)
 {
-    ICON_BEGIN();
-    fl_color(IC_TEAL);
-    fl_polygon(17, 4, 6, 12, 17, 20);
-    fl_rectf(4, 4, 2, 16);
-    ICON_END();
+    /* A hollow grey triangle pointing left with the stop bar after it: the
+     * original draws step-back in the disabled grey, because the button only
+     * becomes live after an instruction has executed. */
+    static const char *const art[16] = {
+        "................",
+        ".......NNN..NN..",
+        "......NMMM..MM..",
+        ".....NMMMM..MM..",
+        "....NMM.MM..MM..",
+        "...NMM..MM..MM..",
+        "..NMM...MM..MM..",
+        ".NMM....MM..MM..",
+        ".QMMS...MM..MM..",
+        "..QMMN..MM..MM..",
+        "...QMMN.MM..MM..",
+        "....QMMNMM..MM..",
+        ".....QMMMM..MM..",
+        "......QMMM..MM..",
+        ".......Q....Q...",
+        "................",
+    };
+    return pix_art(art);
 }
 
 Fl_RGB_Image *icon_step(void)
 {
-    ICON_BEGIN();
-    fl_color(IC_TEAL);
-    fl_polygon(7, 4, 18, 12, 7, 20);
-    fl_rectf(18, 4, 2, 16);
-    ICON_END();
+    /* Teal bar, then a bright green right triangle outlined in teal. */
+    static const char *const art[16] = {
+        "................",
+        "..WW..WWW.......",
+        "..VV..VVVW......",
+        "..VV..VVVVW.....",
+        "..VV..VVzVVW....",
+        "..VV..VVZzVVW...",
+        "..VV..VVZZzVVW..",
+        "..VV..VVZZZzVVW.",
+        "..VV..VVZZZyVVX.",
+        "..VV..VVZZyVVX..",
+        "..VV..VVZyVVX...",
+        "..VV..VVyVVX....",
+        "..VV..VVVVX.....",
+        "..VV..VVVX......",
+        "..XX..XXX.......",
+        "................",
+    };
+    return pix_art(art);
 }
 
 Fl_RGB_Image *icon_ffwd(void)
 {
-    ICON_BEGIN();
-    fl_color(IC_BLUE); fl_polygon(3, 4, 13, 12, 3, 20);
-    fl_color(IC_TEAL); fl_polygon(12, 4, 22, 12, 12, 20);
-    ICON_END();
+    /* run: two bright green right triangles, each outlined in teal. */
+    static const char *const art[16] = {
+        "................",
+        ".WWW..WWW.......",
+        ".VVVW.XVVW......",
+        ".VVVVW.XVVW.....",
+        ".VVzVVW.XVVW....",
+        ".VVZzVVW.XVVW...",
+        ".VVZZzVVW.XVVW..",
+        ".VVZZZzVVW.XVVW.",
+        ".VVZZZyVVX.WVVX.",
+        ".VVZZyVVX.WVVX..",
+        ".VVZyVVX.WVVX...",
+        ".VVyVVX.WVVX....",
+        ".VVVVX.WVVX.....",
+        ".VVVX.WVVX......",
+        ".XXX..XXX.......",
+        "................",
+    };
+    return pix_art(art);
 }
 
 /* A greyed copy for disabled buttons. FLTK's own inactive rendering is not

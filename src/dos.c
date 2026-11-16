@@ -2311,7 +2311,10 @@ static FILE *floppy_open(int drive, const char *mode)
         const char *env = getenv("MUE_FLOPPY");
         if (env && env[0] && (f = fopen(env, mode)) != NULL) return f;
     }
-    snprintf(buf, sizeof buf, "C:/emu8086/FLOPPY_%d", drive);
+    snprintf(buf, sizeof buf, "%s/FLOPPY_%d",
+             (getenv("MUE_HOME") && *getenv("MUE_HOME")) ? getenv("MUE_HOME")
+                                                         : "C:/emu8086",
+             drive);
     if ((f = fopen(buf, mode)) != NULL) return f;
     if (drive == 0) {
         const char *env = getenv("EMUB086_FLOPPY");

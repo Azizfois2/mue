@@ -131,7 +131,12 @@ own colour; that is why the highlighting works.
 ## Build
 
     make                # -> src/mue.exe
-    make ui             # -> src/mueui.exe   (needs FLTK 1.4)
+    make ui             # -> src/mueui.exe   (needs FLTK 1.4 + windres)
+
+The UI binary carries the program icon from `src/mue.ico` through `mue.rc`;
+regenerate the icon from the About button's artwork with
+`python re/make_icon.py`. `windres` is taken from the same toolchain directory
+as `CXX` when that is an absolute path.
 
 (MinGW ships GNU make as `mingw32-make`; that name works too.) Without make:
 

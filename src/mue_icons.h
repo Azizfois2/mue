@@ -16,6 +16,9 @@ Fl_RGB_Image *icon_convert(void);
 Fl_RGB_Image *icon_options(void);
 Fl_RGB_Image *icon_help(void);
 Fl_RGB_Image *icon_about(void);
+/* The program icon: the About chip, doubled to 32x32 for the title bar,
+ * taskbar and Alt-Tab list.  src/mue.ico carries the same artwork. */
+Fl_RGB_Image *icon_app(void);
 Fl_RGB_Image *icon_reload(void);
 Fl_RGB_Image *icon_step_back(void);
 Fl_RGB_Image *icon_step(void);

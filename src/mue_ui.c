@@ -1,36 +1,12 @@
-/* mue_ui.c - the emulator's windows.
+/* mue_ui.c - the emulator's windows, shaped like emu8086 4.08.
  *
- * Reconstructed from a description of the running emu8086 4.08, recorded in
- * re/UI_REFERENCE.md.  That description is the authority here; the older
- * documentation GIFs are secondary and, where they disagree, the description
- * wins because it is the same build being cloned.
+ * re/UI_SPEC.md is the authority: every size, colour and band boundary below
+ * was measured from a live capture of the program being cloned. The editor
+ * and the emulator are different layouts and are built separately.
  *
- * There are TWO windows, and they are genuinely different layouts:
- *
- *   1. the main editor   - menus file/edit/bookmarks/assembler/emulator/math/
- *                          ascii codes/help; a toolbar of icon+label buttons
- *                          in four groups; a line-numbered editor; a status
- *                          bar reading "drag a file here to open".
- *
- *   2. the emulator      - its own menus file/math/debug/view/external/virtual
- *                          devices/virtual drive/help; toolbar Load/reload/
- *                          step back/single step/run plus a step-delay slider;
- *                          registers (AX..DX as H+L byte pairs, then CS IP SS
- *                          SP BP SI DI DS ES); a memory view; a disassembly
- *                          view; and eight bottom buttons screen/source/reset/
- *                          aux/vars/debug/stack/flags.
- *
- * Keeping them in one file but as two separate window builders is deliberate:
- * my first attempt tried to draw both layouts into a single window and the
- * panels overlapped.
- *
- * What is NOT copied is VB6 chrome.  The user chose cross-platform over Win32
- * compatibility, so widget style is FLTK's own and renders identically
- * everywhere.  Layout and behaviour are reproduced, because those are what
- * make the tool usable.
- *
- * This is a SEPARATE binary from `mue`.  The verified CLI links no toolkit, so
- * the test suite's oracle can never be perturbed by UI work.
+ * The window client sizes follow the original's *client* rectangles, because
+ * emu8086's menu bar is non-client. FLTK draws its menu bar inside the client,
+ * so 24px of menu is added above the measured control geometry.
  */
 #include <FL/Fl.H>
 #include <FL/Fl_Window.H>
@@ -38,1199 +14,1370 @@
 #include <FL/Fl_Box.H>
 #include <FL/Fl_Button.H>
 #include <FL/Fl_Group.H>
-#include <FL/Fl_Input.h>
-#include <FL/Fl_Multiline_Input.H>
-#include <FL/Fl_Multiline_Output.H>
+#include <FL/Fl_Input.H>
 #include <FL/Fl_Menu_Bar.H>
+#include <FL/Fl_Menu_Button.H>
 #include <FL/Fl_Slider.H>
 #include <FL/Fl_Scrollbar.H>
-#include <FL/Fl_Image_Surface.H>
-#include <FL/Fl_Text_Editor.H>
-#include <FL/Fl_Text_Buffer.H>
-#include <FL/Fl_Text_Display.H>
-
-#include "mue_icons.h"
-#include "mue_highlight.h"
-#include "mue_source.h"
-#include "mue_core.h"
-#include "mue_tools.h"
-#include "cpu.h"
+#include <FL/Fl_File_Chooser.H>
 #include <FL/fl_draw.H>
+#include <FL/x.H>
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
+#include <time.h>
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#  include <shellapi.h>
+#  include <commdlg.h>
+#endif
 
-/* FLTK's color() argument is an INDEX into its colour table, not an RGB
- * value.  Passing 0xFFFFFF does not give white: it indexes far past the end
- * of the table and lands on whatever entry happens to be there - on this
- * build, cyan.  That is what painted every panel cyan.
- *
- * These are the standard FLTK colour indices, which resolve to the right
- * system colours on every platform: */
-#define C_BG      FL_BACKGROUND_COLOR    /* light grey face            */
-#define C_TOOLBAR FL_BACKGROUND_COLOR
-#define C_GUTTER  FL_DARK3               /* editor gutter, darker grey */
-#define C_NUMCOL  FL_LIGHT2              /* line-number strip          */
-#define C_FIELD   FL_WHITE               /* white text fields          */
-#define C_TEXT    FL_FOREGROUND_COLOR    /* black                      */
-#define C_DIM     FL_DARK2               /* dimmed labels              */
-#define C_CHANGED FL_YELLOW              /* a register that moved      */
-#define C_GREEN   FL_DARK_GREEN
+#include "mue_widgets.h"
+#include "mue_icons.h"
+#include "mue_source.h"
+#include "mue_core.h"
+#include "mue_paths.h"
+#include "mue_tools.h"
+#include "mue_dialogs.h"
+#include "cpu.h"
 
 /* ====================================================================== */
-/* state                                                                   */
+/* machine state                                                           */
 
 typedef struct {
-    unsigned short ax, bx, cx, dx, sp, bp, si, di;
-    unsigned short cs, ds, es, ss, ip, flags;
+    unsigned short r[8], sr[4], ip, flags;
     long icount;
-    int valid;
 } RegState;
 
-static const char *GENREGS[] = { "AX", "BX", "CX", "DX" };
-#define NGEN ((int)(sizeof GENREGS / sizeof GENREGS[0]))
+static RegState cur, prev;
+static char guest_src[65536];
+static char source_path[512] = "";
+static int  loaded;
+static int  follow = 1;          /* panes track CS:IP until the user anchors */
+static int  running;
+static int  step_delay;
 
-/* Order taken from the description: CS, IP, SS, SP, BP, SI, DI, DS, ES. */
-static const char *SEGREGS[] = {
-    "CS", "IP", "SS", "SP", "BP", "SI", "DI", "DS", "ES"
-};
-#define NSEG ((int)(sizeof SEGREGS / sizeof SEGREGS[0]))
+static Fl_Double_Window *editor_window, *emu_window;
+static SourceView *editor_text, *source_view;
+static MueStatus *ed_status;
+static Fl_Scrollbar *ed_vscroll, *ed_hscroll;
+static Fl_Scrollbar *mem_scroll, *dis_scroll;
+static MemList *mem_list;
+static DisasmList *dis_list;
+static MueField *mem_addr, *dis_addr;
 
-static const struct { const char *n; unsigned short m; } FLAGDEFS[] = {
-    {"CF", 0x0001}, {"PF", 0x0004}, {"AF", 0x0010}, {"ZF", 0x0040},
-    {"SF", 0x0080}, {"TF", 0x0100}, {"IF", 0x0200}, {"DF", 0x0400},
-    {"OF", 0x0800},
-};
-#define NFLAG ((int)(sizeof FLAGDEFS / sizeof FLAGDEFS[0]))
+/* registers: four byte pairs (AX BX CX DX), nine word fields */
+static MueField *byte_f[4][2];
+static MueField *word_f[9];
+static Fl_Box *reg_label[13];
+static Fl_Button *step_back_btn;
+static MueSlider *delay_slider;
+static Fl_Box *mem_hdr_keepalive;
 
-static Fl_Box    *regh[NGEN], *regl[NGEN], *segbox[NSEG];
+/* core register index for the displayed order */
+static const int BYTE_REG[4] = { AX, BX, CX, DX };
+static const int WORD_REG[9] = { 9, 12, 10, 4, 5, 6, 7, 11, 8 };
+/* 9=CS 12=IP 10=SS 4=SP 5=BP 6=SI 7=DI 11=DS 8=ES */
 
+/* ====================================================================== */
+/* helpers                                                                 */
 
-
-
-/* A single CPU flag: name on top, 0/1 value below, clickable to toggle.
- * In the original these cells can be clicked to flip the flag, so this is a
- * button rather than a label - the value is the point of the panel, and a
- * label cannot be interacted with. */
-class FlagCell : public Fl_Widget {
-public:
-    FlagCell(int x, int y, int w, int h, const char *nm, unsigned short mask)
-        : Fl_Widget(x, y, w, h, 0), bit(mask), val(0) {
-        strncpy(name, nm, sizeof name - 1);
-        name[sizeof name - 1] = 0;
-        box(FL_DOWN_BOX);
-        color(FL_WHITE);
-    }
-    char name[4];
-    unsigned short bit;
-    int val;
-    void value(int v) { val = v ? 1 : 0; color(val ? FL_YELLOW : FL_WHITE); redraw(); }
-    int handle(int e) {
-        if (e == FL_PUSH) { value(!val); do_callback(); return 1; }
-        return Fl_Widget::handle(e);
-    }
-    void draw() {
-        draw_box(box(), x(), y(), w(), h(), color());
-        /* Dark text: the labels were faded grey and unreadable on white. */
-        fl_font(FL_HELVETICA, 10);
-        fl_color(32, 32, 32);
-        fl_draw(name, x() + 1, y() + 4, w() - 2, 14, FL_ALIGN_CENTER);
-        char v[2] = { (char)('0' + val), 0 };
-        fl_font(FL_COURIER_BOLD, 12);
-        /* Bold, and nudged down so the value is not flush against the name. */
-        fl_color(val ? 0 : 90, val ? 0 : 90, val ? 0 : 90);
-        fl_draw(v, x() + 1, y() + 19, w() - 2, 15, FL_ALIGN_CENTER);
-    }
-};
-
-/* The memory list.  Each row has four fields in four colours - grey address,
- * green byte, black decimal, bold black ASCII - so it cannot be a plain
- * Fl_Multiline_Output, which paints all its text one colour.  Drawing the
- * rows by hand also gives the taller row spacing the original has. */
-class HexList : public Fl_Widget {
-public:
-    HexList(int x, int y, int w, int h)
-        : Fl_Widget(x, y, w, h, 0), nrows(0), base(0) {}
-    int nrows;
-    /* Physical address shown in the first row. */
-    unsigned base;
-    /* Row height and font size, chosen to match the original: bold 13pt
-     * monospace on 18px rows. */
-    static const int ROW_H = 18;
-
-    /* One row per byte: address, the byte in hex, the same in decimal, and
-     * the character if it is printable. The bytes come from the live
-     * machine, not from a placeholder - a memory view that does not show
-     * memory is worse than no memory view. */
-    void draw() {
-        draw_box(FL_DOWN_BOX, x(), y(), w(), h(), FL_WHITE);
-        fl_push_clip(x() + 1, y() + 1, w() - 2, h() - 2);
-        const int cx_addr = x() + 8;
-        const int cx_hex  = x() + w() - 128;
-        const int cx_dec  = x() + w() - 92;
-        const int cx_asc  = x() + w() - 52;
-        for (int i = 0, yy = y() + 2; i < nrows && yy + ROW_H <= y() + h() - 2;
-             i++, yy += ROW_H) {
-            char a[24], hex[8], dec[8], asc[8];
-            unsigned char v = core_peek8(base + (unsigned)i);
-            snprintf(a, sizeof a, "%05X:", base + (unsigned)i);
-            snprintf(hex, sizeof hex, "%02X", v);
-            snprintf(dec, sizeof dec, "%03d", v);
-            if (v >= 32 && v < 127 && v != ' ') {
-                asc[0] = (char)v; asc[1] = 0;
-            } else {
-                snprintf(asc, sizeof asc, "NULL");
-            }
-            fl_font(FL_COURIER, 13);
-            fl_color(112, 112, 112);
-            fl_draw(a, cx_addr, yy, 66, ROW_H, FL_ALIGN_LEFT);
-            fl_font(FL_COURIER_BOLD, 13);
-            fl_color(0, 128, 0);
-            fl_draw(hex, cx_hex, yy, 26, ROW_H, FL_ALIGN_LEFT);
-            fl_color(FL_BLACK);
-            fl_draw(dec, cx_dec, yy, 34, ROW_H, FL_ALIGN_LEFT);
-            fl_draw(asc, cx_asc, yy, 46, ROW_H, FL_ALIGN_LEFT);
-        }
-        fl_pop_clip();
-    }
-    /* Rows that actually fit, so the caller does not have to guess. */
-    int rows_that_fit() const { return (h() - 6) / ROW_H; }
-};
-
-static HexList *mem_list;   /* the memory panel, filled from live state */
-/* The gutter: one grey line number per source line, right-aligned, drawn at
- * the same line spacing the editor uses.  Drawn by hand because a multi-line
- * label wraps at the box width and produced garbled text. */
-class LineGutter : public Fl_Widget {
-public:
-    LineGutter(int x, int y, int w, int h) : Fl_Widget(x, y, w, h, 0) {}
-    void draw() {
-        draw_box(box() ? box() : FL_FLAT_BOX, x(), y(), w(), h(), color());
-        fl_font(FL_COURIER, 11);
-        fl_color(153, 153, 153);
-        int lh = 15;
-        for (int i = 1, yy = y() + 3; yy < y() + h() && i <= 200; i++, yy += lh) {
-            char b[8];
-            snprintf(b, sizeof b, "%02d", i);
-            fl_draw(b, x() + w() - 26, yy, 22, lh, FL_ALIGN_RIGHT);
-        }
-    }
-};
-
-static FlagCell  *flagcell[NFLAG];
-static SourceView          *editor_text;
-static char                 guest_src[16384];
-static int                  run_fast;   /* run with no step delay */
-static Fl_Double_Window    *emu_window;   /* hidden until `emulate` */
-static Fl_Double_Window    *stack_window, *source_window;
-static Fl_Double_Window    *vars_window, *debug_window, *flags_window;
-static Fl_Multiline_Output *stack_area, *source_area;
-static Fl_Multiline_Output *vars_area, *debug_area, *flags_area;
-static Fl_Multiline_Output *screen_area, *dis_area;
-static Fl_Box    *status_editor, *status_emul;
-static RegState   cur, prev;
-
-/* Startup register state.  The real emulator shows CS=0050 and everything
- * else zero before any program is loaded, and its address fields read
- * "0050:0000" - so CS has to start at 0050 or the panel contradicts itself. */
-static void init_startup_state(void)
+static void state_from_core(void)
 {
-    memset(&cur, 0, sizeof cur);
-    memset(&prev, 0, sizeof prev);
-    cur.cs = prev.cs = 0x0050;
-    cur.valid = prev.valid = 1;
+    prev = cur;
+    core_regs(cur.r, cur.sr, &cur.ip, &cur.flags, &cur.icount);
 }
 
-static unsigned short reg_value(const RegState *s, const char *n)
+static unsigned phys_of(unsigned short seg, unsigned short off)
 {
-    if (!strcmp(n, "AX")) { return s->ax; }
-    if (!strcmp(n, "BX")) { return s->bx; }
-    if (!strcmp(n, "CX")) { return s->cx; }
-    if (!strcmp(n, "DX")) { return s->dx; }
-    if (!strcmp(n, "SP")) { return s->sp; }
-    if (!strcmp(n, "BP")) { return s->bp; }
-    if (!strcmp(n, "SI")) { return s->si; }
-    if (!strcmp(n, "DI")) { return s->di; }
-    if (!strcmp(n, "CS")) { return s->cs; }
-    if (!strcmp(n, "DS")) { return s->ds; }
-    if (!strcmp(n, "ES")) { return s->es; }
-    if (!strcmp(n, "SS")) { return s->ss; }
-    if (!strcmp(n, "IP")) { return s->ip; }
+    return (((unsigned)seg << 4) + off) & 0xFFFFF;
+}
+
+static unsigned short parse_hex(const char *s)
+{
+    while (*s == ' ' || *s == '\t') s++;
+    return (unsigned short)strtoul(s, 0, 16);
+}
+
+/* Read the editor into guest_src, without the trailing NUL surprises. */
+static void snapshot_source(void)
+{
+    snprintf(guest_src, sizeof guest_src, "%s", editor_text->text().c_str());
+}
+
+/* The name of the image the last build wrote.  Compile lets the user choose it
+ * in a Save-As box (emu8086's binary executable files (*.com) dialog), so the
+ * answer comes from the core; fall back to the MyBuild convention when
+ * nothing has been built yet. */
+static const char *build_image_name(void)
+{
+    static char name[256];
+    char stem[128];
+    const char *b;
+    const char *dot;
+    if (core_last_image_name()[0])
+        return core_last_image_name();
+    b = strrchr(source_path, '\\');
+    b = b ? b + 1 : source_path;
+    snprintf(stem, sizeof stem, "%s", b);
+    dot = strrchr(stem, '.');
+    if (dot) stem[dot - stem] = 0;
+    if (!stem[0]) snprintf(stem, sizeof stem, "untitled");
+    snprintf(name, sizeof name, "%s.%s_", stem, core_image_ext());
+    return name;
+}
+
+/* ---- source <-> instruction mapping (for the yellow band) -------------
+ * The clone's assembler does not retain line numbers, so the band follows
+ * the ordinal of the instruction being executed. Labels, comments, blank
+ * lines and data/directive lines are skipped; that is exact for straight-line
+ * code and a close approximation across branches. */
+static int src_exec_lines[4096];
+static int src_exec_count;
+
+static int directive_word(const char *w)
+{
+    static const char *d[] = {
+        "org","end","ends","endp","segment","assume","include","name","equ",
+        "db","dw","dd","dq","dt","proc","endm","macro","local","align","even",
+        "public","extrn","extern","includelib","option",".model",".code",
+        ".data",".stack",".386",".8086"
+    };
+    for (unsigned i = 0; i < sizeof d / sizeof d[0]; i++)
+        if (strcasecmp(w, d[i]) == 0) return 1;
     return 0;
 }
 
-/* Highlight only the half that moved: if AL changed, the L box turns yellow
- * and the H box does not.  That is the point of the H/L split. */
-static void refresh_state(void)
+static void build_src_map(void)
 {
-    int i;
-    for (i = 0; i < NGEN; i++) {
-        char bh[8], bl[8];
-        unsigned short v = reg_value(&cur, GENREGS[i]);
-        unsigned short p = reg_value(&prev, GENREGS[i]);
-        int moved = cur.valid && prev.valid && v != p;
-        snprintf(bh, sizeof bh, "%02X", (v >> 8) & 0xFF);
-        snprintf(bl, sizeof bl, "%02X", v & 0xFF);
-        regh[i]->copy_label(bh);
-        regl[i]->copy_label(bl);
-        regh[i]->color(moved ? C_CHANGED : C_FIELD);
-        regl[i]->color(moved ? C_CHANGED : C_FIELD);
-        regh[i]->redraw();
-        regl[i]->redraw();
+    const char *p = editor_text->text().c_str();
+    int line = 0;
+    src_exec_count = 0;
+    while (*p && src_exec_count < 4096) {
+        const char *e = strchr(p, '\n');
+        int n = e ? (int)(e - p) : (int)strlen(p);
+        char buf[512];
+        if (n > 511) n = 511;
+        memcpy(buf, p, (size_t)n);
+        buf[n] = 0;
+        char *s = buf;
+        while (*s == ' ' || *s == '\t') s++;
+        if (*s && *s != ';' && *s != '#') {
+            char *c = strchr(s, ';');
+            if (c) *c = 0;
+            /* strip a leading label */
+            char *colon = strchr(s, ':');
+            if (colon && colon != s) {
+                int ok = 1;
+                for (char *q = s; q < colon; q++)
+                    if (!isalnum((unsigned char)*q) && *q != '_' && *q != '.')
+                        ok = 0;
+                if (ok) s = colon + 1;
+            }
+            while (*s == ' ' || *s == '\t') s++;
+            if (*s && !directive_word(s)) src_exec_lines[src_exec_count++] = line;
+        }
+        line++;
+        if (!e) break;
+        p = e + 1;
     }
-    for (i = 0; i < NSEG; i++) {
-        char b[8];
-        unsigned short v = reg_value(&cur, SEGREGS[i]);
-        unsigned short p = reg_value(&prev, SEGREGS[i]);
-        int moved = cur.valid && prev.valid && v != p;
-        snprintf(b, sizeof b, "%04X", v);
-        segbox[i]->copy_label(b);
-        segbox[i]->color(moved ? C_CHANGED : C_FIELD);
-        segbox[i]->redraw();
-    }
-    for (i = 0; i < NFLAG; i++) {
-        if (!flagcell[i]) continue;
-        flagcell[i]->value(cur.valid && (cur.flags & FLAGDEFS[i].m) != 0);
-    }
-    if (status_emul && cur.valid) {
-        char b[96];
-        snprintf(b, sizeof b, "%ld instructions executed", cur.icount);
-        status_emul->copy_label(b);
-        status_emul->redraw();
-    }
+}
+
+static int src_line_for(long icount)
+{
+    if (src_exec_count == 0) return -1;
+    long i = icount;
+    if (i < 0) i = 0;
+    if (i >= src_exec_count) i = src_exec_count - 1;
+    return src_exec_lines[i];
 }
 
 /* ====================================================================== */
-/* driving the core in-process                                             */
+/* refreshing the machine views                                            */
 
-/* Pull the machine state out of the core into the panels' RegState. */
-static void state_from_core(RegState *st)
+static void fmt_hex(char *b, int sz, unsigned v, int digits)
 {
-    unsigned short r8[8], sr4[4], ip, flags;
-    long ic;
-    core_regs(r8, sr4, &ip, &flags, &ic);
-    st->ax = r8[AX]; st->cx = r8[CX]; st->dx = r8[DX]; st->bx = r8[BX];
-    st->sp = r8[SP]; st->bp = r8[BP]; st->si = r8[SI]; st->di = r8[DI];
-    st->es = sr4[ES]; st->cs = sr4[CS]; st->ss = sr4[SS]; st->ds = sr4[DS];
-    st->ip = ip;
-    st->flags = flags;
-    st->icount = ic;
-    st->valid = 1;
+    snprintf(b, (size_t)sz, "%0*X", digits, v & (digits == 2 ? 0xFF : 0xFFFF));
 }
 
-/* The side panels refill from live state; declared here because
- * refresh_views() keeps them in step and is defined first. */
-static void fill_stack(void);
-static void fill_vars(void);
-static void fill_debug(void);
-static void fill_flags(void);
-
-/* Redraw the memory and disassembly panels from live machine state. */
-static void refresh_views(void)
+static void refresh_regs(void)
 {
-    unsigned short cs, ip;
-    char buf[4096];
-
-    core_cs_ip(&cs, &ip);
-
-    if (dis_area) {
-        core_disasm_list(buf, sizeof buf, 22);
-        dis_area->value(buf);
-        dis_area->redraw();
+    char b[16];
+    for (int r = 0; r < 4; r++) {
+        int idx = BYTE_REG[r];
+        unsigned v = cur.r[idx];
+        for (int h = 0; h < 2; h++) {
+            unsigned oldv = prev.r[idx];
+            int changed = (v & 0xFF) != (oldv & 0xFF);
+            if (h == 0) changed = ((v >> 8) & 0xFF) != ((oldv >> 8) & 0xFF);
+            fmt_hex(b, sizeof b, h ? (v & 0xFF) : (v >> 8), 2);
+            if (byte_f[r][h] && Fl::focus() != byte_f[r][h]) {
+                byte_f[r][h]->value(b);
+                byte_f[r][h]->textcolor(changed ? mue_blue() : FL_BLACK);
+                byte_f[r][h]->redraw();
+            }
+        }
     }
-    if (mem_list) {
-        /* The memory panel shows the bytes at CS:IP, as the original does
-         * by default. */
-        mem_list->base = ((uint32_t)cs << 4) + ip;
-        mem_list->nrows = mem_list->rows_that_fit();
-        mem_list->redraw();
+    for (int i = 0; i < 9; i++) {
+        int idx = WORD_REG[i];
+        unsigned v, oldv;
+        if (idx == 12) { v = cur.ip; oldv = prev.ip; }
+        else if (idx < 8) { v = cur.r[idx]; oldv = prev.r[idx]; }
+        else { v = cur.sr[idx - 8]; oldv = prev.sr[idx - 8]; }
+        fmt_hex(b, sizeof b, v, 4);
+        if (word_f[i] && Fl::focus() != word_f[i]) {
+            word_f[i]->value(b);
+            word_f[i]->textcolor(v != oldv ? mue_blue() : FL_BLACK);
+            word_f[i]->redraw();
+        }
     }
-    if (screen_area) {
-        char scr[2200];
-        core_screen_text(scr, sizeof scr);
-        screen_area->value(scr);
-        screen_area->redraw();
-    }
-    /* Keep any open side window in step with the machine.  Each fills itself
-     * only when it exists, so this costs nothing when none are open. */
-    if (stack_window && stack_window->shown()) fill_stack();
-    if (vars_window  && vars_window->shown())  fill_vars();
-    if (debug_window && debug_window->shown()) fill_debug();
-    if (flags_window && flags_window->shown()) fill_flags();
 }
+
+static void set_addr_field(MueField *f, unsigned short seg, unsigned short off)
+{
+    char b[16];
+    snprintf(b, sizeof b, "%04X:%04X", seg, off);
+    if (Fl::focus() != f) f->value(b);
+}
+
+static void refresh_panes(void)
+{
+    unsigned short cs = cur.sr[CS];
+    int len = core_insn_len_at(cs, cur.ip);
+    if (len <= 0) len = 1;
+
+    if (follow) {
+        mem_list->base(phys_of(cs, cur.ip));
+        dis_list->anchor(cs, cur.ip);
+        set_addr_field(mem_addr, cs, cur.ip);
+        set_addr_field(dis_addr, cs, cur.ip);
+    }
+    mem_list->selection_phys(phys_of(cs, cur.ip), len);
+    dis_list->current(cs, cur.ip);
+    mem_list->redraw();
+    dis_list->redraw();
+
+    if (source_view && src_exec_count) {
+        source_view->highlight_line(src_line_for(cur.icount));
+    }
+    if (step_back_btn) {
+        if (core_back_depth() > 0) step_back_btn->activate();
+        else                       step_back_btn->deactivate();
+        step_back_btn->redraw();
+    }
+}
+
+static void refresh_all(void)
+{
+    state_from_core();
+    refresh_regs();
+    if (loaded) refresh_panes();
+    if (ed_status && editor_text) {
+        ed_status->caret(editor_text->caret_line() + 1,
+                         editor_text->caret_col() + 1);
+        ed_status->redraw();
+    }
+    dlg_refresh();
+}
+
+/* ====================================================================== */
+/* actions                                                                 */
+
+static void load_file(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    char buf[65536];
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    editor_text->set_text(buf);
+    snprintf(source_path, sizeof source_path, "%s", path);
+    snprintf(guest_src, sizeof guest_src, "%s", buf);
+    build_src_map();
+    char title[600];
+    snprintf(title, sizeof title, "edit: %s", path);
+    editor_window->copy_label(title);
+    if (ed_status) ed_status->hint("drag a file here to open");
+}
+
+/* ---- start-up templates ------------------------------------------------
+ *
+ * The four radio buttons of the original's `choose code template` window are
+ * exactly the four files in inc\, which is also what file > new reads
+ * (re/FILESYSTEM.md section 4).  The literal below is only the fallback for a
+ * tree that could not be seeded.
+ */
+static char *template_read(int which)
+{
+    static const char *rel[4] = {
+        "inc\\0_com_template.txt", "inc\\1_exe_template.txt",
+        "inc\\2_bin_template.txt", "inc\\3_boot_template.txt"
+    };
+    char path[MUE_MAXP];
+    return mue_read_file(mue_home_path(path, sizeof path, rel[which & 3]));
+}
+
+static const char *template_fallback(void)
+{
+    return "; You may customize this and other start-up templates;\n"
+           "; The location of this template is c:\\emu8086\\inc\\0_com_template.txt\n"
+           "\n"
+           "org 100h\n"
+           "\n"
+           "; add your code here\n"
+           "\n"
+           "ret\n";
+}
+
+static void editor_new_from(int which)
+{
+    char *body = template_read(which);
+    editor_text->set_text(body ? body : template_fallback());
+    free(body);
+    source_path[0] = 0;
+    guest_src[0] = 0;
+    editor_window->copy_label("edit: untitled.asm");
+    build_src_map();
+    refresh_all();
+}
+
+static void cb_new(Fl_Widget *, void *)
+{
+    editor_new_from(0);
+}
+
+static void cb_open(Fl_Widget *, void *)
+{
+    static char start[MUE_MAXP];
+    const char *p = fl_file_chooser("open source", "*.asm\tassembly sources",
+                                    mue_home_path(start, sizeof start, "examples\\"));
+    if (p) load_file(p);
+    refresh_all();
+}
+
+static const char *untitled_path(void)
+{
+    static char buf[MUE_MAXP];
+    return mue_home_path(buf, sizeof buf, "MySource\\untitled.asm");
+}
+
+static void cb_save(Fl_Widget *, void *)
+{
+    const char *p = source_path[0] ? source_path
+        : fl_file_chooser("save source", "*.asm\tassembly sources",
+                          untitled_path());
+    if (!p) return;
+    FILE *f = fopen(p, "wb");
+    if (!f) return;
+    fputs(editor_text->text().c_str(), f);
+    fclose(f);
+    snprintf(source_path, sizeof source_path, "%s", p);
+    char title[600];
+    snprintf(title, sizeof title, "edit: %s", p);
+    editor_window->copy_label(title);
+}
+
+static void cb_save_as(Fl_Widget *, void *)
+{
+    const char *p = fl_file_chooser("save source as", "*.asm\tassembly sources",
+                                    untitled_path());
+    if (!p) return;
+    FILE *f = fopen(p, "wb");
+    if (!f) return;
+    fputs(editor_text->text().c_str(), f);
+    fclose(f);
+    snprintf(source_path, sizeof source_path, "%s", p);
+    char title[600];
+    snprintf(title, sizeof title, "edit: %s", p);
+    editor_window->copy_label(title);
+}
+
+static void cb_example(Fl_Widget *w, void *data)
+{
+    const char *p = (const char *)data;
+    if (w && w->user_data()) p = (const char *)w->user_data();
+    if (p) { load_file(p); refresh_all(); }
+}
+
+static void cb_quit(Fl_Widget *, void *) { exit(0); }
+
+static void cb_step(Fl_Widget *, void *);
+static void cb_step_back(Fl_Widget *, void *);
 
 static void cb_emulate(Fl_Widget *, void *)
 {
-    /* Emulating is what brings the emulator window up - it is not shown at
-     * startup. */
-    if (emu_window && !emu_window->shown()) {
-        emu_window->show();
-        /* A window built while hidden has never been laid out, so its
-         * children still have their construction positions and nothing has
-         * been drawn. resize() forces the layout pass, redraw() then paints
-         * every child. Without both the window came up blank. */
-        emu_window->resize(emu_window->x(), emu_window->y(),
-                           emu_window->w(), emu_window->h());
-        emu_window->redraw();
-        Fl::check();
-        Fl::flush();
+    char err[1024];
+    int trace = getenv("MUE_TRACE") != 0;
+    clock_t t0 = clock(), t1, t2, t3, t4, t5;
+    snapshot_source();
+    t1 = clock();
+    int ok = core_load(guest_src, source_path, err, sizeof err);
+    t2 = clock();
+    if (!ok) {
+        dlg_assembler_status(err);
+        return;
     }
-    if (!editor_text) return;
-
-    snprintf(guest_src, sizeof guest_src, "%s",
-             editor_text->text().c_str());
-    {
-        char err[512];
-        if (!core_load(guest_src, err, sizeof err)) {
-            if (status_emul) {
-                status_emul->copy_label(err[0] ? err : "assembly failed");
-                status_emul->redraw();
-            }
-            if (status_editor) {
-                status_editor->copy_label(err[0] ? err : "assembly failed");
-                status_editor->redraw();
-            }
-            return;
-        }
-    }
-
+    loaded = 1;
+    follow = 1;
+    core_regs(cur.r, cur.sr, &cur.ip, &cur.flags, &cur.icount);
+    /* The load just reset the CPU, so the fresh values are the baseline:
+     * nothing is "changed" until the first instruction runs. */
     prev = cur;
-    core_run(4000000);
-    state_from_core(&cur);
-    refresh_state();
-    refresh_views();
-    if (status_editor) {
-        status_editor->copy_label("emulated");
-        status_editor->redraw();
-    }
-}
-
-static void cb_open_calc(Fl_Widget *, void *)  { tools_open_calculator(); }
-static void cb_open_conv(Fl_Widget *, void *)  { tools_open_convertor(); }
-static void cb_open_opts(Fl_Widget *, void *)  { tools_open_options(); }
-
-/* Shared close handler for the windows the emulator can open: hide rather
- * than destroy, so reopening is cheap and keeps the last contents. */
-static void cb_close_window(Fl_Widget *w, void *)
-{
-    w->hide();
-}
-
-/* ---- the `stack` window ----------------------------------------------
- * emu8086's tooltip for cmdStack is "memory at SS:SP from bottom to top", so
- * this is a memory view anchored at the stack pointer and read upward - NOT a
- * call trace.  It shows the physical address, the word, and the byte pair, so
- * a pushed return address can be followed without doing the arithmetic. */
-static void fill_stack(void)
-{
-    char buf[8192];
-    int o = 0, i;
-    unsigned short r8[8], sr4[4], ip, flags;
-    long ic;
-
-    if (!stack_area) return;
-    if (!core_loaded()) {
-        stack_area->value("no program loaded");
-        stack_area->redraw();
-        return;
-    }
-    core_regs(r8, sr4, &ip, &flags, &ic);
+    build_src_map();
+    t3 = clock();
+    /* emu8086 names the emulator after the image it just built, e.g.
+     * "emulator: hello.com_" (re/FILESYSTEM.md section 2). */
     {
-        uint32_t base = ((uint32_t)sr4[SS] << 4) + r8[SP];
-        uint16_t ss = sr4[SS], sp = r8[SP];
-
-        o += snprintf(buf + o, sizeof buf - o,
-                      "SS:SP = %04X:%04X   physical %05X\n\n", ss, sp, base);
-        o += snprintf(buf + o, sizeof buf - o,
-                      "addr   word   bytes\n");
-        for (i = 0; i < 24 && o < (int)sizeof buf - 40; i++) {
-            uint16_t w = core_peek16(base + (uint32_t)i * 2);
-            o += snprintf(buf + o, sizeof buf - o,
-                          "%05X  %04X   %02X %02X\n",
-                          base + (uint32_t)i * 2, w,
-                          w & 0xFF, w >> 8);
-        }
+        char title[300];
+        snprintf(title, sizeof title, "emulator: %s", build_image_name());
+        emu_window->copy_label(title);
     }
-    stack_area->value(buf);
-    stack_area->redraw();
+    emu_window->show();
+    emu_window->take_focus();
+    t4 = clock();
+    refresh_regs();
+    refresh_panes();
+    dlg_refresh();
+    t5 = clock();
+    if (trace)
+        fprintf(stderr, "emulate: snapshot %ld load %ld map %ld show %ld panes %ld total %ld ms\n",
+                (long)((t1 - t0) * 1000 / CLOCKS_PER_SEC),
+                (long)((t2 - t1) * 1000 / CLOCKS_PER_SEC),
+                (long)((t3 - t2) * 1000 / CLOCKS_PER_SEC),
+                (long)((t4 - t3) * 1000 / CLOCKS_PER_SEC),
+                (long)((t5 - t4) * 1000 / CLOCKS_PER_SEC),
+                (long)((t5 - t0) * 1000 / CLOCKS_PER_SEC));
 }
 
-static void cb_show_stack(Fl_Widget *, void *)
+/* Compile's Save-As box, as emu8086 shows it: the install's MyBuild folder,
+ * the source's stem plus the image extension, and the "binary executable
+ * files (*.com)" filter.  Returns 0 when the user cancels. */
+static int ask_binary_path(char *out, int outsz)
 {
-    if (!stack_window) {
-        stack_window = new Fl_Double_Window(300, 380, "stack");
-        stack_area = new Fl_Multiline_Output(6, 6, 288, 368);
-        stack_area->box(FL_DOWN_BOX);
-        stack_area->color(FL_WHITE);
-        stack_area->textcolor(C_TEXT);
-        stack_area->textfont(FL_COURIER_BOLD);
-        stack_area->textsize(13);
-        stack_window->end();
-        stack_window->callback(cb_close_window, &stack_window);
-    }
-    fill_stack();
-    stack_window->show();
+#ifdef _WIN32
+    OPENFILENAMEA ofn;
+    char file[512];
+    char stem[128];
+    const char *b = strrchr(source_path, '\\');
+    const char *dot;
+    static char filter[] =
+        "binary executable files (*.com)\0*.com\0all files (*.*)\0*.*\0";
+
+    b = b ? b + 1 : source_path;
+    snprintf(stem, sizeof stem, "%s", b);
+    dot = strrchr(stem, '.');
+    if (dot) stem[dot - stem] = 0;
+    if (!stem[0]) snprintf(stem, sizeof stem, "untitled");
+    snprintf(file, sizeof file, "%s.%s", stem, core_image_ext());
+
+    memset(&ofn, 0, sizeof ofn);
+    ofn.lStructSize = sizeof ofn;
+    ofn.hwndOwner = editor_window ? (HWND)fl_xid(editor_window) : NULL;
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = sizeof file;
+    ofn.lpstrInitialDir = mue_dir_build();
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetSaveFileNameA(&ofn)) return 0;
+    snprintf(out, outsz, "%s", ofn.lpstrFile);
+    return 1;
+#else
+    (void)out; (void)outsz;
+    return 1;
+#endif
 }
-
-/* ---- the `source` window ---------------------------------------------
- * cmdShowActualSource's tooltip is "original source code": this shows the
- * program the user wrote, not a disassembly.  The highlighting is the same
- * tokeniser the editor uses, so the window reads like the editor pane. */
-static void cb_show_source(Fl_Widget *, void *)
-{
-    if (!source_window) {
-        source_window = new Fl_Double_Window(560, 460, "original source code");
-        source_area = new Fl_Multiline_Output(6, 6, 548, 448);
-        source_area->box(FL_DOWN_BOX);
-        source_area->color(FL_WHITE);
-        source_area->textcolor(C_TEXT);
-        source_area->textfont(FL_COURIER_BOLD);
-        source_area->textsize(13);
-        source_window->end();
-        source_window->callback(cb_close_window, &source_window);
-    }
-    source_area->value(guest_src[0] ? guest_src : "no program loaded");
-    source_window->show();
-    source_area->redraw();
-}
-
-/* ---- the remaining three panels -------------------------------------- */
-
-/* `screen` just brings the always-visible screen panel to the front: in
- * emu8086 the button re-shows the panel when the window is tall enough for
- * it, and it is the same screen the program draws into. */
-static void cb_show_screen_panel(Fl_Widget *, void *)
-{
-    if (screen_area) {
-        refresh_views();
-        screen_area->redraw();
-    }
-}
-
-/* `vars` - cmdVars.  The clone has no symbol table in the core yet, so this
- * shows the data segment itself: DS:0000 upward, which is where a .COM
- * program's `db`/`dw` variables actually live.  That is the real memory, and
- * naming it plainly is better than inventing a symbol list we cannot fill. */
-static void fill_vars(void)
-{
-    char buf[8192];
-    int o = 0, i;
-    unsigned short r8[8], sr4[4], ip, flags;
-    long ic;
-
-    if (!vars_area) return;
-    if (!core_loaded()) {
-        vars_area->value("no program loaded");
-        vars_area->redraw();
-        return;
-    }
-    core_regs(r8, sr4, &ip, &flags, &ic);
-    {
-        uint32_t base = (uint32_t)sr4[DS] << 4;
-
-        o += snprintf(buf + o, sizeof buf - o,
-                      "DS = %04X   (variables live here)\n"
-                      "no symbol table in this build - raw data segment:\n\n"
-                      "addr   +0 +1 +2 +3 +4 +5 +6 +7\n", sr4[DS]);
-        for (i = 0; i < 32 && o < (int)sizeof buf - 64; i++) {
-            int k;
-            o += snprintf(buf + o, sizeof buf - o, "%05X ", base + (uint32_t)i * 8);
-            for (k = 0; k < 8; k++)
-                o += snprintf(buf + o, sizeof buf - o, " %02X",
-                              core_peek8(base + (uint32_t)i * 8 + (uint32_t)k));
-            o += snprintf(buf + o, sizeof buf - o, " \n");
-        }
-    }
-    vars_area->value(buf);
-    vars_area->redraw();
-}
-
-static void cb_show_vars(Fl_Widget *, void *)
-{
-    if (!vars_window) {
-        vars_window = new Fl_Double_Window(340, 620, "variables");
-        vars_area = new Fl_Multiline_Output(6, 6, 328, 608);
-        vars_area->box(FL_DOWN_BOX);
-        vars_area->color(FL_WHITE);
-        vars_area->textcolor(C_TEXT);
-        vars_area->textfont(FL_COURIER_BOLD);
-        vars_area->textsize(13);
-        vars_window->end();
-        vars_window->callback(cb_close_window, &vars_window);
-    }
-    fill_vars();
-    vars_window->show();
-}
-
-/* `debug` - cmdLog, captioned `log and debug.exe emulation`.  It records what
- * has run: the instruction count and the last few executed instructions, the
- * way debug.exe's trace does. */
-static void fill_debug(void)
-{
-    char buf[8192];
-    int o = 0;
-    unsigned short r8[8], sr4[4], ip, flags;
-    long ic;
-
-    if (!debug_area) return;
-    if (!core_loaded()) {
-        debug_area->value("no program loaded");
-        debug_area->redraw();
-        return;
-    }
-    core_regs(r8, sr4, &ip, &flags, &ic);
-    o += snprintf(buf + o, sizeof buf - o,
-                  "instructions executed: %ld\n"
-                  "CS:IP = %04X:%04X   halted: %s\n\n"
-                  "registers\n"
-                  "AX=%04X BX=%04X CX=%04X DX=%04X\n"
-                  "SI=%04X DI=%04X BP=%04X SP=%04X\n"
-                  "DS=%04X ES=%04X SS=%04X CS=%04X  flags=%04X\n\n"
-                  "upcoming\n",
-                  ic, sr4[CS], ip, core_halted() ? "yes" : "no",
-                  r8[AX], r8[BX], r8[CX], r8[DX],
-                  r8[SI], r8[DI], r8[BP], r8[SP],
-                  sr4[DS], sr4[ES], sr4[SS], sr4[CS], flags);
-    {
-        char tmp[96];
-        int len = 0;
-
-        /* core_disasm_at() decodes at CS:IP; the log shows the instruction
-         * that is about to execute. */
-        if (core_disasm_at(tmp, &len)) {
-            o += snprintf(buf + o, sizeof buf - o, "%04X:%04X  %s\n",
-                          sr4[CS], ip, tmp);
-        }
-    }
-    debug_area->value(buf);
-    debug_area->redraw();
-}
-
-static void cb_show_debug(Fl_Widget *, void *)
-{
-    if (!debug_window) {
-        debug_window = new Fl_Double_Window(420, 460,
-                                            "debug log - debug.exe emulation");
-        debug_area = new Fl_Multiline_Output(6, 6, 408, 448);
-        debug_area->box(FL_DOWN_BOX);
-        debug_area->color(FL_WHITE);
-        debug_area->textcolor(C_TEXT);
-        debug_area->textfont(FL_COURIER_BOLD);
-        debug_area->textsize(13);
-        debug_window->end();
-        debug_window->callback(cb_close_window, &debug_window);
-    }
-    fill_debug();
-    debug_window->show();
-}
-
-/* `flags` - cmdFlags, tooltip `show flags register`.  The emulator already
- * shows the flag cells in its own window; this is the standalone view the
- * original opens, listing each flag by name with its state. */
-static void fill_flags(void)
-{
-    static const char *nm[NFLAG] = { "CF", "PF", "AF", "ZF",
-                                     "SF", "TF", "IF", "DF", "OF" };
-    char buf[2048];
-    int o = 0, i;
-
-    if (!flags_area) return;
-    if (!core_loaded()) {
-        flags_area->value("no program loaded");
-        flags_area->redraw();
-        return;
-    }
-    o += snprintf(buf + o, sizeof buf - o, "flags register = %04X\n\n",
-                  cur.flags);
-    for (i = 0; i < NFLAG; i++) {
-        int set = (cur.flags & (1 << i)) != 0;
-        o += snprintf(buf + o, sizeof buf - o, "  %s = %d%s\n",
-                      nm[i], set, set ? "   set" : "   clear");
-    }
-    flags_area->value(buf);
-    flags_area->redraw();
-}
-
-static void cb_show_flags(Fl_Widget *, void *)
-{
-    if (!flags_window) {
-        flags_window = new Fl_Double_Window(220, 280, "flags");
-        flags_area = new Fl_Multiline_Output(6, 6, 208, 268);
-        flags_area->box(FL_DOWN_BOX);
-        flags_area->color(FL_WHITE);
-        flags_area->textcolor(C_TEXT);
-        flags_area->textfont(FL_COURIER_BOLD);
-        flags_area->textsize(13);
-        flags_window->end();
-        flags_window->callback(cb_close_window, &flags_window);
-    }
-    fill_flags();
-    flags_window->show();
-}
-
 
 static void cb_compile(Fl_Widget *, void *)
 {
-    if (status_editor) {
-        const char *t = editor_text ? editor_text->text().c_str() : "";
-        status_editor->copy_label(t && t[0] ? "compiled" : "nothing to compile");
-        status_editor->redraw();
+    char err[1024];
+    char out[MUE_MAXP];
+    char base[600];
+    clock_t t0 = clock();
+    double secs;
+
+    /* The order is emu8086's, seen live: clicking compile assembles at once
+     * and raises the assembler status window WITH its messages, then the
+     * Save-As box asks where the .bin goes.  Cancel leaves the messages and
+     * appends "executable file is not created!". */
+    snapshot_source();
+    if (!core_assemble(guest_src, source_path, err, sizeof err)) {
+        dlg_assembler_status(err);
+        return;
+    }
+    secs = (double)(clock() - t0) / CLOCKS_PER_SEC;
+    snprintf(base, sizeof base,
+             "%s"
+             "Assembled in 3 passes. Time spent: %.3f seconds.\n"
+             "%s",
+             core_code_after_end(guest_src)
+                 ? "any code after 'END' directive is ignored.\n" : "",
+             secs,
+             core_image_ext()[0] == 'c'
+                 ? "entry point is ignored for .com files.\n" : "");
+    dlg_assembler_status(base);
+    dlg_status_run_enabled(0);
+    Fl::flush();
+
+    if (ask_binary_path(out, sizeof out)) {
+        char msg[1600];
+        core_save_image(out);
+        snprintf(msg, sizeof msg,
+                 "%s"
+                 "\"%s\" is assembled successfully into %d bytes.\n"
+                 "\n"
+                 "Listing is saved: \"%s.list\"\n"
+                 "Symbol table is saved: \"%s.symbol\"",
+                 base, build_image_name(), core_last_size(),
+                 build_image_name(), build_image_name());
+        dlg_assembler_status(msg);
+        dlg_status_run_enabled(1);
+    } else {
+        char msg[1400];
+        snprintf(msg, sizeof msg,
+                 "%s"
+                 "executable file is not created!\n", base);
+        dlg_assembler_status(msg);
+        dlg_status_run_enabled(0);
     }
 }
 
 static void cb_reset(Fl_Widget *, void *)
 {
-    memset(&cur, 0, sizeof cur);
-    memset(&prev, 0, sizeof prev);
-    if (screen_area) screen_area->value("");
-    if (dis_area) dis_area->value("");
-    for (int i = 0; i < NGEN; i++) {
-        regh[i]->copy_label("00"); regh[i]->color(C_FIELD); regh[i]->redraw();
-        regl[i]->copy_label("00"); regl[i]->color(C_FIELD); regl[i]->redraw();
-    }
-    for (int i = 0; i < NSEG; i++) {
-        segbox[i]->copy_label("0000"); segbox[i]->color(C_FIELD);
-        segbox[i]->redraw();
-    }
-    for (int i = 0; i < NFLAG; i++) if (flagcell[i]) flagcell[i]->value(0);
-    refresh_state();
-    if (status_emul) { status_emul->copy_label("reset"); status_emul->redraw(); }
+    if (!loaded) return;
+    char err[1024];
+    core_load(guest_src, source_path, err, sizeof err);
+    follow = 1;
+    running = 0;
+    state_from_core();
+    prev = cur;
+    refresh_regs();
+    refresh_panes();
 }
 
-/* One instruction, with the panels updated afterwards - this is the whole
- * point of linking the core into the UI rather than scraping the CLI. */
+static void stop_run(void)
+{
+    running = 0;
+}
+
+static void cb_stop(Fl_Widget *, void *) { stop_run(); }
+
 static void cb_step(Fl_Widget *, void *)
 {
-    if (!core_loaded()) {
-        /* Nothing loaded yet: load and run nothing, so a user who steps
-         * first gets a sensible starting state rather than a dead button. */
-        cb_emulate(0, 0);
-        return;
-    }
-    prev = cur;
-    if (!core_step()) {
-        if (status_emul) {
-            status_emul->copy_label(core_halted() ? "halted"
-                                                  : "cannot step further");
-            status_emul->redraw();
-        }
-        return;
-    }
-    state_from_core(&cur);
-    refresh_state();
-    refresh_views();
-    if (status_emul) {
-        char b[96];
-        snprintf(b, sizeof b, "step %ld", cur.icount);
-        status_emul->copy_label(b);
-        status_emul->redraw();
-    }
+    if (!loaded) { cb_emulate(0, 0); return; }
+    int trace = getenv("MUE_TRACE") != 0;
+    clock_t t0 = clock();
+    if (!core_step()) { refresh_all(); return; }
+    clock_t t1 = clock();
+    state_from_core();
+    refresh_regs();
+    refresh_panes();
+    if (trace)
+        fprintf(stderr, "step: exec %ld refresh %ld total %ld ms\n",
+                (long)((t1 - t0) * 1000 / CLOCKS_PER_SEC),
+                (long)((clock() - t1) * 1000 / CLOCKS_PER_SEC),
+                (long)((clock() - t0) * 1000 / CLOCKS_PER_SEC));
 }
 
-/* Continuous run: step on a timer so the screen and registers stay live
- * instead of freezing until the program ends. */
-static void run_timer(void *)
+static void cb_step_back(Fl_Widget *, void *)
 {
-    if (!core_loaded() || core_halted()) {
-        if (status_emul) {
-            status_emul->copy_label(core_halted() ? "halted" : "stopped");
-            status_emul->redraw();
-        }
-        return;
+    if (!core_step_back()) return;
+    state_from_core();
+    refresh_regs();
+    refresh_panes();
+}
+
+static void run_tick(void *)
+{
+    if (!running) return;
+    int n = 0;
+    while (n < 400 && !core_halted() && n < 1 + step_delay * 30) {
+        if (!core_step()) break;
+        n++;
     }
-    prev = cur;
-    core_run(run_fast ? 20000 : 1000);
-    state_from_core(&cur);
-    refresh_state();
-    refresh_views();
-    if (status_emul) {
-        char b[96];
-        snprintf(b, sizeof b, "%ld instructions executed", cur.icount);
-        status_emul->copy_label(b);
-        status_emul->redraw();
-    }
-    if (!core_halted()) Fl::repeat_timeout(0.05, run_timer);
-    else if (status_emul) {
-        status_emul->copy_label("halted");
-        status_emul->redraw();
-    }
+    state_from_core();
+    refresh_regs();
+    refresh_panes();
+    if (running && !core_halted())
+        Fl::repeat_timeout(0.02, run_tick);
+    else
+        running = 0;
 }
 
 static void cb_run(Fl_Widget *, void *)
 {
-    if (!core_loaded()) { cb_emulate(0, 0); return; }
-    if (core_halted()) return;
-    Fl::add_timeout(0.05, run_timer);
+    if (!loaded) { cb_emulate(0, 0); return; }
+    if (running) { stop_run(); return; }
+    running = 1;
+    Fl::add_timeout(0.01, run_tick);
 }
 
-static const char *zero_memory_disasm(void)
+static void cb_delay(Fl_Widget *w, void *)
 {
-    static char buf[2048];
-    int i, n = 0;
-    buf[0] = 0;
-    for (i = 0; i < 20; i++) {
-        n += snprintf(buf + n, sizeof buf - n, "ADD [BX + SI], AL\n");
-        if (n >= (int)sizeof buf - 32) break;
+    /* MueSlider draws its own caption, so the only job here is to record the
+     * new delay; redraw() comes from the widget itself. */
+    step_delay = ((MueSlider *)w)->value();
+}
+
+/* ---- register editing -------------------------------------------------- */
+
+static void cb_reg(Fl_Widget *w, void *)
+{
+    MueField *f = (MueField *)w;
+    int id = (int)(intptr_t)w->user_data();
+    unsigned v = parse_hex(f->value());
+
+    if (id < 100) {                     /* byte field: id = row*2 + half */
+        int row = id / 2, half = id % 2;
+        int idx = BYTE_REG[row];
+        unsigned word = cur.r[idx];
+        if (half == 0) word = (word & 0x00FF) | ((v & 0xFF) << 8);
+        else           word = (word & 0xFF00) | (v & 0xFF);
+        core_write_reg(idx, (unsigned short)word);
+    } else {
+        int i = id - 100;
+        core_write_reg(WORD_REG[i], (unsigned short)v);
     }
-    strncat(buf, "...", sizeof buf - strlen(buf) - 1);
-    return buf;
+    state_from_core();
+    refresh_regs();
+    refresh_panes();
+}
+
+/* ---- address fields ---------------------------------------------------- */
+
+static void parse_addr(const char *s, unsigned short *seg, unsigned short *off,
+                       int *ok)
+{
+    const char *c = strchr(s, ':');
+    *ok = 0;
+    if (!c) return;
+    *seg = (unsigned short)strtoul(s, 0, 16);
+    *off = (unsigned short)strtoul(c + 1, 0, 16);
+    *ok = 1;
+}
+
+static void cb_mem_addr(Fl_Widget *w, void *)
+{
+    unsigned short seg, off;
+    int ok;
+    parse_addr(((MueField *)w)->value(), &seg, &off, &ok);
+    if (!ok) return;
+    follow = 0;
+    mem_list->base(phys_of(seg, off));
+    mem_list->selection_phys(phys_of(cur.sr[CS], cur.ip),
+                             core_insn_len_at(cur.sr[CS], cur.ip));
+}
+
+static void cb_dis_addr(Fl_Widget *w, void *)
+{
+    unsigned short seg, off;
+    int ok;
+    parse_addr(((MueField *)w)->value(), &seg, &off, &ok);
+    if (!ok) return;
+    follow = 0;
+    dis_list->anchor(seg, off);
+}
+
+static void mem_picked(unsigned phys, void *)
+{
+    char b[16];
+    snprintf(b, sizeof b, "%05X:", phys);
+    (void)b;
+    unsigned short seg = (unsigned short)(phys >> 4);
+    unsigned short off = (unsigned short)(phys & 0xF);
+    set_addr_field(mem_addr, seg, off);
+    follow = 0;
+}
+
+static void dis_picked(unsigned short seg, unsigned short off, void *)
+{
+    set_addr_field(dis_addr, seg, off);
+    dis_list->selection(seg, off);
 }
 
 /* ====================================================================== */
-/* window 1: the main editor                                               */
+/* editor window                                                           */
+
+static Fl_Menu_Bar *make_editor_menu(int W);
+
+static void cb_gutter_toggle(Fl_Widget *w, void *)
+{
+    if (!editor_text) return;
+    editor_text->gutter(editor_text->gutter() ? 0 : 1);
+    editor_text->redraw();
+    if (w) w->redraw();
+}
+
+static void cb_help_doc(Fl_Widget *, void *)
+{
+#ifdef _WIN32
+    /* ShellExecute hands the file to its registered handler directly. Going
+     * through `system("start ...")` spawned a shell, which took a visible
+     * fraction of a second on every click. */
+    char page[MUE_MAXP];
+    ShellExecuteA(NULL, "open",
+                  mue_home_path(page, sizeof page, "documentation\\index.html"),
+                  NULL, NULL, SW_SHOWNORMAL);
+#endif
+}
 
 static Fl_Double_Window *build_editor(void)
 {
-    const int W = 1000, H = 640;
-    Fl_Double_Window *win = new Fl_Double_Window(W, H,
-                                     "mue - 8086 assembler and emulator");
-    win->color(C_BG);
+    const int W = 722, H = 747;
+    Fl_Double_Window *win = new Fl_Double_Window(W, H, "edit: untitled.asm");
+    win->color(mue_face());
+    win->size_range(480, 360);
 
-    /* The eight menus of the real application, lowercase. */
-    Fl_Menu_Bar *mb = new Fl_Menu_Bar(0, 0, W, 24);
-    mb->textfont(FL_HELVETICA);
-    mb->textsize(12);
-    mb->add("file/new", 0, 0, 0, 0);
-    mb->add("file/open...", 0, 0, 0, 0);
-    mb->add("file/save", 0, 0, 0, 0);
-    mb->add("file/exit", 0, 0, 0, FL_MENU_DIVIDER);
-    mb->add("edit/undo", 0, 0, 0, 0);
-    mb->add("edit/cut", 0, 0, 0, 0);
-    mb->add("edit/copy", 0, 0, 0, 0);
-    mb->add("edit/paste", 0, 0, 0, 0);
-    mb->add("bookmarks/set bookmark", 0, 0, 0, 0);
-    mb->add("bookmarks/clear bookmarks", 0, 0, 0, 0);
-    mb->add("assembler/compile", 0, cb_compile, 0, 0);
-    mb->add("emulator/emulate", 0, cb_emulate, 0, 0);
-    mb->add("emulator/single step", 0, cb_step, 0, 0);
-    mb->add("emulator/reset", 0, cb_reset, 0, 0);
-    mb->add("math/calculator", 0, cb_open_calc, 0, 0);
-    mb->add("math/base convertor", 0, cb_open_conv, 0, 0);
-    mb->add("ascii codes/table", 0, 0, 0, 0);
-    mb->add("help/about", 0, 0, 0, 0);
+    Fl_Menu_Bar *mb = make_editor_menu(W);
+    (void)mb;
 
-    /* Toolbar: icon above label, four groups split by separators. */
-    Fl_Group *tb = new Fl_Group(0, 24, W, 48);
+    /* Toolbar. Measured in cap4/win2.png: the strip is 35px tall, the icons
+     * are 16px, the labels are Helvetica 9, and the group rules sit at
+     * x = 269, 333, 391 and 521. Button edges are derived from the measured
+     * icon and label centres. */
+    Fl_Group *tb = new Fl_Group(0, 24, W, 35);
     tb->box(FL_FLAT_BOX);
-    tb->color(C_TOOLBAR);
-    struct Btn { const char *n; Fl_Callback *cb; Fl_Image *ic; int drop; }
+    tb->color(mue_face());
+    struct { const char *n; int x, w; Fl_Image *ic; Fl_Callback *cb; int drop; }
     btns[] = {
-        {"new",      0,          icon_new(),     0},
-        {"open",     0,          icon_open(),    0},
-        {"examples", 0,          icon_star(),    1},   /* has a dropdown  */
-        {"save",     0,          icon_save(),    1},   /* has a dropdown  */
-        {"compile",  cb_compile, icon_compile(), 0},
-        {"emulate",  cb_emulate, icon_run(),     0},
-        {"calculator", cb_open_calc, icon_calc(),    0},
-        {"convertor",  cb_open_conv, icon_convert(), 0},
-        {"options",    cb_open_opts, icon_options(), 0},
-        {"help",     0,          icon_help(),    0},
-        {"about",    0,          icon_about(),   0},
+        { "new",         0, 58, icon_new(),      cb_new,       0 },
+        { "open",       58, 58, icon_open(),     cb_open,      0 },
+        { "examples",  116, 72, icon_star(),     cb_open,      1 },
+        { "save",      188, 70, icon_save(),     cb_save,      1 },
+        { "compile",   269, 64, icon_compile(),  cb_compile,   0 },
+        { "emulate",   333, 58, icon_run(),      cb_emulate,   0 },
+        { "calculator",391, 67, icon_calc(),     cb_open_calc, 0 },
+        { "convertor", 458, 63, icon_convert(),  cb_open_conv, 0 },
+        { "options",   521, 64, icon_options(),  cb_open_opts, 0 },
+        { "help",      585, 55, icon_help(),     cb_help_doc,  0 },
+        { "about",     640, 60, icon_about(),    cb_about,     0 },
     };
-    const int nbtn = (int)(sizeof btns / sizeof btns[0]);
-    int bx = 8;
-    for (int i = 0; i < nbtn; i++) {
-        if (i == 4 || i == 6 || i == 8) {           /* group separators */
-            /* A 1px vertical line, not a 6px down-box: the box rendered as
-             * a small rounded button instead of a separator. */
-            Fl_Box *sp = new Fl_Box(bx, 30, 1, 40);
-            sp->box(FL_FLAT_BOX);
-            sp->color(FL_DARK3);
-            bx += 8;
-        }
-        Fl_Button *b = make_tool(bx, 28, 74, 46, btns[i].n, btns[i].ic);
-        if (btns[i].drop) {                 /* small black down-arrow */
-            Fl_Box *ar = new Fl_Box(bx + 60, 30, 12, 10, "@2>>");
-            ar->box(FL_NO_BOX);
-            ar->labelsize(8);
-            ar->labelcolor(FL_BLACK);
-        }
-        if (btns[i].cb) b->callback(btns[i].cb);
-        bx += 78;
+    for (unsigned i = 0; i < sizeof btns / sizeof btns[0]; i++) {
+        MueTool *b = new MueTool(btns[i].x, 24, btns[i].w, 35,
+                                 btns[i].n, btns[i].ic, btns[i].drop, 0, 9);
+        b->callback(btns[i].cb);
+    }
+    /* group separators, full height of the strip */
+    int seps[] = { 269, 333, 391, 521 };
+    for (int i = 0; i < 4; i++) {
+        Fl_Box *sp = new Fl_Box(seps[i], 26, 1, 32);
+        sp->box(FL_FLAT_BOX);
+        sp->color(mue_gutter_line());
     }
     tb->end();
 
-    /* Editor: gutter, line numbers, text, scrollbar - the dominant area. */
-    Fl_Box *gutter = new Fl_Box(0, 72, 26, 520);
-    gutter->box(FL_FLAT_BOX);
-    gutter->color(C_GUTTER);
+    /* Editor band, measured in the original's client pixels (the clone's
+     * 24px menu adds 24 to every y):
+     * toolbar 0..35, text 36..681, hscroll 682..696, status 697..718. */
+    Fl_Box *rail = new Fl_Box(2, 60, 24, 646);
+    rail->box(FL_FLAT_BOX);
+    rail->color(mue_rail());
 
+    editor_text = new SourceView(26, 60, 677, 646);
+    editor_text->box(FL_DOWN_FRAME);
+    editor_text->color(FL_WHITE);
+    editor_text->font_size(13);
+    editor_text->gutter(1);
     {
-        LineGutter *nums = new LineGutter(26, 72, 34, 520);
-        nums->color(C_NUMCOL);
+        char *body = template_read(0);
+        editor_text->set_text(body ? body : template_fallback());
+        free(body);
     }
 
-    /* SourceView, not Fl_Text_Editor. FLTK's per-character style table is
-     * accepted but never consulted when drawing in this build, so the editor
-     * draws its own tokenised runs (see mue_source.h). */
-    {
-        editor_text = new SourceView(60, 72, 924, 520);
-        editor_text->box(FL_DOWN_FRAME);
-        editor_text->color(C_FIELD);
-        editor_text->font_size(14);
-        editor_text->set_text(
-            "org 100h\n"
-            "; a small demo of the editor\n"
-            "mov ax,1234h\n"
-            "mov bx,5678h\n"
-            "mov cx,9ABCh\n"
-            "mov dx,0DEF0h\n"
-            "ret\n");
-    }
+    ed_vscroll = new Fl_Scrollbar(703, 60, 17, 646);
+    ed_vscroll->type(FL_VERTICAL);
+    ed_hscroll = new Fl_Scrollbar(2, 706, 701, 15);
+    ed_hscroll->type(FL_HORIZONTAL);
 
-    status_editor = new Fl_Box(0, H - 22, W, 20, "drag a file here to open");
-    status_editor->box(FL_THIN_DOWN_BOX);
-    status_editor->color(C_BG);
-    status_editor->selection_color(C_BG);
-    status_editor->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
-    status_editor->labelsize(11);
+    ed_status = new MueStatus(0, 721, 722, 22);
 
     win->end();
+    win->callback(cb_quit);
+    win->resizable(editor_text);
     return win;
 }
 
 /* ====================================================================== */
-/* the emulator window                                                     */
+/* emulator window                                                         */
 
-/* Put a group's title on its frame border, as the original does, instead of
- * inside the group where it collides with the first child. */
-/* A group title sitting IN the top border line, the way the original draws
- * it: a short run of the border is blanked and the text drawn there, with a
- * little clearance on each side so it does not touch the frame.
- *
- * FL_ALIGN_TOP alone is not enough - it puts the label above the widget, so
- * the text floats over whatever is above the group and reads as stray
- * writing. This subclass paints the notch and the text itself. */
-class TitledFrame : public Fl_Group {
-public:
-    TitledFrame(int x, int y, int w, int h, const char *t)
-        : Fl_Group(x, y, w, h, t)
-    {
-        box(FL_ENGRAVED_FRAME);
-        color(C_BG);
-        label(t);
-        labelfont(FL_HELVETICA);
-        labelsize(11);
-        labelcolor(C_TEXT);
-        align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
-        /* FLTK draws the group's own label inside the box as part of
-         * Fl_Group::draw(), and would then draw a second copy on the border.
-         * Take the text out of FLTK's hands: keep it in `title_` and clear the
-         * widget label, so exactly one copy is drawn, on the border. */
-        title_ = t && *t ? strdup(t) : NULL;
-        label("");
-    }
-    ~TitledFrame() { free((void *)title_); }
-    void draw() {
-        Fl_Group::draw();
-        draw_leaders();
-    }
-    /* FLTK's label slot stays empty; this is the only text drawn. */
-    void draw_leaders() {
-        const char *t = title_;
-        if (!t || !*t) return;
-        fl_font(labelfont(), labelsize());
-        int tw = 0, th = 0;
-        fl_measure(t, tw, th, 0);
-        int tx = x() + 8;
-        /* Centre the glyph block on the border band, which is y()+1.
-         * fl_draw() with FL_ALIGN_INSIDE re-centres inside the given box and
-         * applies box padding, so it cannot be aimed at a single row - that
-         * is what kept the title ~10px low.  Drawing by BASELINE is exact:
-         * the baseline sits at the band plus half the cap height. */
-        int band = y() + 1;
-        int asc = (int)fl_height() - (int)fl_descent();
-        int baseline = band + asc / 2;
-        fl_color(parent() ? parent()->color() : color());
-        fl_rectf(tx - 3, band - asc / 2 - 1, tw + 6, asc + 3);
-        /* The frame's interior is the theme's light face, so the notch must
-         * match it - painting with color() alone was not enough because the
-         * group sits over the window face, not its own fill. */
-        fl_color(FL_BACKGROUND_COLOR);
-        fl_rectf(tx - 3, band - asc / 2 - 1, tw + 6, asc + 3);
-        fl_color(labelcolor());
-        fl_draw(t, tx, baseline);
-    }
-private:
-    const char *title_;
-};
+static Fl_Menu_Bar *make_emu_menu(int W);
+
+static void reg_label_at(int x, int y, const char *t)
+{
+    Fl_Box *b = new Fl_Box(x, y, 26, 20, t);
+    b->box(FL_NO_BOX);
+    b->labelfont(FL_HELVETICA);
+    b->labelsize(11);
+    b->labelcolor(FL_BLACK);
+    b->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+}
+
+static void cb_screen_win(Fl_Widget *, void *);
+static void cb_source_win(Fl_Widget *, void *);
+static void cb_vars_win(Fl_Widget *, void *);
+static void cb_debug_win(Fl_Widget *, void *);
+static void cb_stack_win(Fl_Widget *, void *);
+static void cb_flags_win(Fl_Widget *, void *);
+
+static Fl_Menu_Button *aux_menu;
+
+static void cb_close_emu(Fl_Widget *w, void *);
+static void cb_show_emulator(Fl_Widget *, void *);
+
+static void cb_aux(Fl_Widget *w, void *)
+{
+    /* Fl_Menu_Button::popup() with box()==FL_NO_BOX pops at the current
+     * pointer position, which is exactly what the "aux" button wants. */
+    aux_menu->popup();
+}
 
 static Fl_Double_Window *build_emulator(void)
 {
-    const int M = 6, W = 812, H = 812;
-    /* All bands are derived from the one above, never hard-coded, and the
-     * assertion below aborts if they ever overlap. */
-    const int PANEL_Y = 86, PANEL_H = 384;
-    const int FLAGS_Y = PANEL_Y + PANEL_H + 4, FLAGS_H = 96;
-    const int BTN_Y = FLAGS_Y + FLAGS_H + 8, BTN_H = 26;
-    const int SCREEN_Y = BTN_Y + BTN_H + 8;
-    const int SCREEN_H = H - SCREEN_Y - 34;
+    const int W = 565, H = 408;
+    Fl_Double_Window *win = new Fl_Double_Window(W, H, "emulator");
+    win->color(mue_face());
+    win->size_range(520, 360);
 
-    if (!(FLAGS_Y >= PANEL_Y + PANEL_H &&
-          BTN_Y >= FLAGS_Y + FLAGS_H &&
-          SCREEN_Y >= BTN_Y + BTN_H && SCREEN_H > 40)) {
-        fprintf(stderr, "mue_ui: layout bands overlap\n");
-        abort();
-    }
-    fprintf(stderr, "mue_ui bands: PANEL %d..%d FLAGS %d..%d BTN %d..%d "
-            "SCREEN %d..%d H=%d\n",
-            PANEL_Y, PANEL_Y + PANEL_H, FLAGS_Y, FLAGS_Y + FLAGS_H,
-            BTN_Y, BTN_Y + BTN_H, SCREEN_Y, SCREEN_Y + SCREEN_H, H);
+    make_emu_menu(W);
 
-    Fl_Double_Window *win = new Fl_Double_Window(W, H,
-                                     "8086 microprocessor emulator");
-    win->color(C_BG);
+    /* ---- toolbar (measured: 45px strip; five 78px bordered buttons with
+     * 5px gaps, at client x 3/86/170/253/336, y 4, h 38; delay control at the
+     * right) ---- */
+    Fl_Group *tb = new Fl_Group(0, 24, W, 45);
+    tb->box(FL_FLAT_BOX);
+    tb->color(mue_face());
 
-    /* Its own menu bar, different from the editor's. */
-    Fl_Menu_Bar *mb = new Fl_Menu_Bar(0, 0, W, 24);
-    mb->textfont(FL_HELVETICA);
-    mb->textsize(12);
-    mb->add("file/load", 0, 0, 0, 0);
-    mb->add("file/save", 0, 0, 0, 0);
-    mb->add("math/base convertor", 0, cb_open_conv, 0, 0);
-    mb->add("math/calculator", 0, cb_open_calc, 0, 0);
-    mb->add("debug/single step", 0, 0, 0, 0);
-    mb->add("debug/run", 0, 0, 0, 0);
-    mb->add("view/memory", 0, 0, 0, 0);
-    mb->add("virtual devices/screen", 0, 0, 0, 0);
-    mb->add("help/about", 0, 0, 0, 0);
+    MueTool *load = new MueTool(3, 28, 78, 38, "Load", icon_open(), 0, 1);
+    load->callback(cb_emulate);
+    MueTool *reload = new MueTool(86, 28, 78, 38, "reload", icon_reload(), 0, 1);
+    reload->callback(cb_reset);
+    step_back_btn = new MueTool(170, 28, 78, 38, "step back",
+                                icon_step_back(), 0, 1);
+    step_back_btn->callback(cb_step_back);
+    MueTool *single = new MueTool(253, 28, 78, 38, "single step",
+                                  icon_step(), 0, 1);
+    single->callback(cb_step);
+    MueTool *run = new MueTool(336, 28, 78, 38, "run", icon_ffwd(), 0, 1);
+    run->callback(cb_run);
 
-    /* ---- toolbar: load, reload, step back, single step, run + delay ---- */
-    {
-        Fl_Group *tb = new Fl_Group(0, 24, W, 54);
-        tb->box(FL_FLAT_BOX);
-        tb->color(C_TOOLBAR);
-        static const char *nm[] = { "load", "reload", "step back",
-                                    "single step", "run" };
-        Fl_Image *ic[] = { icon_reload(), icon_reload(), icon_step_back(),
-                           icon_step(), icon_run() };
-        /* step back is disabled in the original until something has run, so
-         * it is greyed here too rather than silently doing nothing. */
-        for (int i = 0; i < 5; i++) {
-            Fl_Button *b = make_tool(6 + i * 88, 28, 84, 46, nm[i], ic[i]);
-            if (i == 3) b->callback(cb_step);
-            if (i == 4) b->callback(cb_run);
-            if (i == 2) { b->deimage(icon_grayed(icon_step_back())); b->deactivate(); }
-        }
-        Fl_Slider *sl = new Fl_Slider(6 + 5 * 88 + 14, 38, 190, 16, "");
-        sl->type(FL_HOR_NICE_SLIDER);
-        sl->color(C_BG);
-        sl->selection_color(FL_DARK2);
-        sl->range(0, 10);
-        sl->value(0);
-        Fl_Box *slb = new Fl_Box(6 + 5 * 88 + 8, 24, 200, 14,
-                                 "step delay");
-        slb->labelsize(10);
-        slb->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
-        tb->end();
+    delay_slider = new MueSlider(424, 26, 130, 39);
+    delay_slider->range(10);
+    delay_slider->value(0);
+    delay_slider->callback(cb_delay);
+    delay_slider->when(FL_WHEN_CHANGED);
+    tb->end();
+
+    /* ---- registers group (content 3,45..116,376) ---- */
+    MueGroup *rg = new MueGroup(3, 69, 114, 331, "registers");
+
+    Fl_Box *hh = new Fl_Box(50, 84, 24, 12, "H");
+    Fl_Box *ll = new Fl_Box(79, 84, 24, 12, "L");
+    for (Fl_Box *b : { hh, ll }) {
+        b->box(FL_NO_BOX);
+        b->labelfont(FL_HELVETICA);
+        b->labelsize(11);
+        b->align(FL_ALIGN_CENTER | FL_ALIGN_INSIDE);
     }
 
-    /* ---- registers: AX..DX as H/L byte pairs, then the nine segments ---- */
-    {
-        TitledFrame *g = new TitledFrame(M, PANEL_Y, 178, PANEL_H,
-                                         "registers");
-        g->box(FL_ENGRAVED_FRAME);
-        g->color(C_BG);
-        int y = PANEL_Y + 26;
-        /* H and L are COLUMN headers, drawn once above the byte-pair columns
-         * - not per row.  They used to be created inside the loop just above
-         * each register, which stamped a stray "h" over every row.
-         * The rows start 10px lower so the header band has room and does not
-         * collide with the frame's title notch. */
-        {
-            Fl_Box *hh = new Fl_Box(M + 46, PANEL_Y + 13, 34, 12, "h");
-            hh->labelsize(9);
-            hh->labelfont(FL_HELVETICA_BOLD);
-            hh->align(FL_ALIGN_CENTER | FL_ALIGN_INSIDE);
-            Fl_Box *ll = new Fl_Box(M + 84, PANEL_Y + 13, 34, 12, "l");
-            ll->labelsize(9);
-            ll->labelfont(FL_HELVETICA_BOLD);
-            ll->align(FL_ALIGN_CENTER | FL_ALIGN_INSIDE);
-        }
-        for (int i = 0; i < NGEN; i++) {
-            Fl_Box *lbl = new Fl_Box(M + 8, y + 4, 34, 20, GENREGS[i]);
-            lbl->labelsize(12);
-            lbl->labelfont(FL_HELVETICA_BOLD);
-            lbl->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
-            regh[i] = new Fl_Box(M + 46, y, 34, 26, "00");
-            regl[i] = new Fl_Box(M + 84, y, 34, 26, "00");
-            Fl_Box *rn[2] = { regh[i], regl[i] };
-            for (int k = 0; k < 2; k++) {
-                rn[k]->box(FL_DOWN_BOX);
-                rn[k]->color(C_FIELD);
-                rn[k]->labelfont(FL_COURIER_BOLD);
-                rn[k]->labelsize(14);
-            }
-            y += 27;
-        }
-        y += 6;
-        for (int i = 0; i < NSEG; i++) {
-            Fl_Box *lbl = new Fl_Box(M + 8, y + 3, 34, 20, SEGREGS[i]);
-            lbl->labelsize(12);
-            lbl->labelfont(FL_HELVETICA_BOLD);
-            lbl->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
-            segbox[i] = new Fl_Box(M + 46, y, 70, 26, "0000");
-            segbox[i]->box(FL_DOWN_BOX);
-            segbox[i]->color(C_FIELD);
-            segbox[i]->labelfont(FL_COURIER_BOLD);
-            segbox[i]->labelsize(14);
-            y += 27;
-        }
-        g->end();
-    }
-
-    /* ---- memory: address box, list, proportional scrollbar ---- */
-    {
-        TitledFrame *mp = new TitledFrame(M + 190, PANEL_Y, 300, PANEL_H,
-                                          "memory");
-        mp->box(FL_ENGRAVED_FRAME);
-        mp->color(C_BG);
-        Fl_Input *maddr = new Fl_Input(M + 190 + 60, 96, 130, 28, "");
-        maddr->box(FL_DOWN_BOX);
-        maddr->value("0050:0000");
-        maddr->textfont(FL_COURIER_BOLD);
-        maddr->textsize(14);
-
-        HexList *hl = new HexList(M + 196, 130, 272, PANEL_H - 52);
-        hl->nrows = hl->rows_that_fit();
-        mem_list = hl;
-        Fl_Scrollbar *sb = new Fl_Scrollbar(M + 190 + 274, 130, 16,
-                                            PANEL_H - 52);
-        sb->linesize(1);
-        sb->range(0, 65536 - hl->nrows);
-        /* thumb proportional to how much is visible, as in the original */
-        sb->slider_size((double)hl->nrows / 65536.0);
-        mp->end();
-    }
-
-    /* ---- disassembly ---- */
-    {
-        TitledFrame *dp = new TitledFrame(M + 498, PANEL_Y, W - 2 * M - 498,
-                                          PANEL_H, "disassembly");
-        dp->box(FL_ENGRAVED_FRAME);
-        dp->color(C_BG);
-        Fl_Input *daddr = new Fl_Input(M + 498 + 90, 96, 130, 28, "");
-        daddr->box(FL_DOWN_BOX);
-        daddr->value("0050:0000");
-        daddr->textfont(FL_COURIER_BOLD);
-        daddr->textsize(14);
-
-        dis_area = new Fl_Multiline_Output(M + 504, 130,
-                                           W - 2 * M - 498 - 28,
-                                           PANEL_H - 52);
-        dis_area->box(FL_DOWN_BOX);
-        dis_area->color(C_FIELD);
-        dis_area->textfont(FL_COURIER_BOLD);
-        dis_area->textsize(13);
-        dis_area->value(zero_memory_disasm());
-        Fl_Scrollbar *sb = new Fl_Scrollbar(W - M - 18, 130, 16, PANEL_H - 52);
-        sb->linesize(16);
-        sb->range(0, 4096);
-        sb->slider_size(0.35);
-        dp->end();
-    }
-
-    /* ---- flags ---- */
-    {
-        TitledFrame *g = new TitledFrame(M, FLAGS_Y, 182, FLAGS_H, "flags");
-        g->box(FL_ENGRAVED_FRAME);
-        g->color(C_BG);
-        for (int i = 0; i < NFLAG; i++) {
-            int cx = M + 8 + (i % 5) * 34;
-            int cy = FLAGS_Y + 12 + (i / 5) * 36;
-            flagcell[i] = new FlagCell(cx, cy, 34, 36, FLAGDEFS[i].n, FLAGDEFS[i].m);
-        }
-        g->end();
-    }
-
-    /* ---- the eight bottom buttons ----
-     * The identifiers and tooltips come from emu8086 itself (see
-     * re/UI_CONTROLS.md): cmdShowMemory/DOS, cmdShowActualSource, cmdReset,
-     * cmdALU, cmdVars, cmdLog, cmdStack, cmdFlags.  Each opens the window its
-     * tooltip describes rather than an invented panel. */
-    {
-        static const char *nm[] = { "screen", "source", "reset", "aux",
-                                    "vars", "debug", "stack", "flags" };
-        for (int i = 0; i < 8; i++) {
-            Fl_Button *b = new Fl_Button(M + i * 88, BTN_Y, 84, BTN_H, nm[i]);
-            b->box(FL_UP_BOX);
-            b->labelsize(11);
-            switch (i) {
-            case 0: b->callback(cb_show_screen_panel); break;
-            case 1: b->callback(cb_show_source);       break;
-            case 2: b->callback(cb_reset);             break;
-            case 3: b->callback(cb_open_calc);         break;  /* aux tools */
-            case 4: b->callback(cb_show_vars);         break;
-            case 5: b->callback(cb_show_debug);        break;
-            case 6: b->callback(cb_show_stack);        break;
-            case 7: b->callback(cb_show_flags);        break;
-            }
+    static const char *byte_names[4] = { "AX", "BX", "CX", "DX" };
+    static const int byte_y[4] = { 104, 128, 151, 174 };
+    for (int r = 0; r < 4; r++) {
+        int y = byte_y[r];
+        reg_label_at(23, y, byte_names[r]);
+        for (int h = 0; h < 2; h++) {
+            byte_f[r][h] = new MueField(50 + h * 29, y, 24, 17, 1);
+            byte_f[r][h]->maximum_size(2);
+            byte_f[r][h]->value("00");
+            byte_f[r][h]->callback(cb_reg);
+            byte_f[r][h]->user_data((void *)(intptr_t)(r * 2 + h));
+            byte_f[r][h]->when(FL_WHEN_ENTER_KEY | FL_WHEN_RELEASE);
         }
     }
-    /* The buttons are created before the screen panel so that they paint on
-     * top of it; creating them after left them hidden behind the panel. */
-    {
-        TitledFrame *g = new TitledFrame(M, SCREEN_Y, W - 2 * M, SCREEN_H, "screen");
-        screen_area = new Fl_Multiline_Output(M + 6, SCREEN_Y + 16,
-                                              W - 2 * M - 12, SCREEN_H - 22);
-        screen_area->box(FL_DOWN_BOX);
-        screen_area->color(FL_BLACK);
-        screen_area->textcolor(FL_GREEN);
-        screen_area->textfont(FL_COURIER_BOLD);
-        screen_area->textsize(13);
-        screen_area->value("");
-        g->end();
+
+    static const char *word_names[9] = {
+        "CS", "IP", "SS", "SP", "BP", "SI", "DI", "DS", "ES"
+    };
+    for (int i = 0; i < 9; i++) {
+        int y = 200 + i * 22;
+        reg_label_at(23, y, word_names[i]);
+        word_f[i] = new MueField(57, y, 41, 17, 1);
+        word_f[i]->maximum_size(4);
+        word_f[i]->value("0000");
+        word_f[i]->callback(cb_reg);
+        word_f[i]->user_data((void *)(intptr_t)(100 + i));
+        word_f[i]->when(FL_WHEN_ENTER_KEY | FL_WHEN_RELEASE);
+    }
+    rg->end();
+
+    /* ---- memory pane (address field measured 107x22 at content y 54) ---- */
+    mem_addr = new MueField(156, 78, 107, 22, 1);
+    mem_addr->value("0100:0100");
+    mem_addr->callback(cb_mem_addr);
+    mem_addr->when(FL_WHEN_ENTER_KEY | FL_WHEN_RELEASE);
+
+    mem_list = new MemList(121, 104, 198, 269);
+    mem_list->base(0x1100);
+    mem_list->pick_fn(mem_picked);
+
+    mem_scroll = new Fl_Scrollbar(319, 104, 17, 269);
+    mem_scroll->type(FL_VERTICAL);
+
+    /* ---- disassembly pane ---- */
+    dis_addr = new MueField(376, 78, 107, 22, 1);
+    dis_addr->value("0100:0100");
+    dis_addr->callback(cb_dis_addr);
+    dis_addr->when(FL_WHEN_ENTER_KEY | FL_WHEN_RELEASE);
+
+    dis_list = new DisasmList(341, 104, 203, 269);
+    dis_list->anchor(0x0100, 0x0100);
+    dis_list->pick_fn(dis_picked);
+
+    dis_scroll = new Fl_Scrollbar(547, 104, 17, 269);
+    dis_scroll->type(FL_VERTICAL);
+
+    /* ---- bottom row (measured: content y 347..382, buttons 121..545) ----
+     * Unlike the editor toolbar these are ordinary raised buttons: 35px
+     * tall with a 4-5px gap between neighbours.  Drawing them 26px tall and
+     * flush made them read as one flat strip. */
+    struct { const char *t; int x, w; Fl_Callback *cb; } bb[] = {
+        { "screen", 121, 55, cb_screen_win },
+        { "source", 180, 47, cb_source_win },
+        { "reset",  232, 47, cb_reset },
+        { "aux",    283, 47, cb_aux },
+        { "vars",   334, 48, cb_vars_win },
+        { "debug",  386, 48, cb_debug_win },
+        { "stack",  439, 51, cb_stack_win },
+        { "flags",  494, 51, cb_flags_win },
+    };
+    for (int i = 0; i < 8; i++) {
+        MueButton *b = new MueButton(bb[i].x, 377, bb[i].w, 30, bb[i].t);
+        b->callback(bb[i].cb);
     }
 
-    status_emul = new Fl_Box(0, H - 22, W, 20, "ready");
-    status_emul->box(FL_THIN_DOWN_BOX);
-    status_emul->color(C_BG);
-    status_emul->selection_color(C_BG);
-    status_emul->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
-    status_emul->labelsize(11);
+    aux_menu = new Fl_Menu_Button(-100, -100, 10, 10);
+    aux_menu->box(FL_NO_BOX);
+    aux_menu->add("memory", 0, cb_ram, 0, 0);
+    aux_menu->add("ALU - arithmetic & logic unit", 0, cb_alu, 0, 0);
+    aux_menu->add("FPU", 0, cb_fpu, 0, 0);
+    aux_menu->add("stop on condition", 0, cb_stop_condition, 0, 0);
+    aux_menu->add("symbol table", 0, cb_symbol_table, 0, 0);
+    aux_menu->add("listing", 0, cb_listing, 0, 0);
 
+    (void)mem_hdr_keepalive;
     win->end();
+    win->callback(cb_close_emu);
+    win->resizable(mem_list);
     return win;
+}
+
+static void cb_close_emu(Fl_Widget *w, void *)
+{
+    ((Fl_Window *)w)->hide();
+}
+
+/* ====================================================================== */
+/* menus                                                                   */
+
+static void add_mru(Fl_Menu_Bar *mb, const char *base) { (void)mb; (void)base; }
+
+/* The examples menu is curated: the original names ten programs and maps each
+ * onto a file in examples\ (re/FILESYSTEM.md section 5).  Paths are resolved
+ * against the install root once, when the menus are built. */
+static char ex_buf[16][MUE_MAXP];
+
+static void *ex(const char *name)
+{
+    static int slot;
+    char *p = ex_buf[slot++ % 16];
+    snprintf(p, MUE_MAXP, "%s\\examples\\%s", mue_home(), name);
+    return p;
+}
+
+static Fl_Menu_Bar *make_editor_menu(int W)
+{
+    Fl_Menu_Bar *mb = new Fl_Menu_Bar(0, 0, W, 24);
+    mb->box(FL_FLAT_BOX);
+    mb->color(mue_face());
+    mb->textfont(FL_HELVETICA);
+    mb->textsize(11);
+    mb->textcolor(FL_BLACK);
+    mb->down_box(FL_FLAT_BOX);
+
+    mb->add("file/new",           0, cb_new, 0, 0);
+    mb->add("file/examples/Hello, world", 0, cb_example, ex("hello.asm"), 0);
+    mb->add("file/examples/add / subtract", 0, cb_example, ex("1_sample.asm"), 0);
+    mb->add("file/examples/calculate sum", 0, cb_example,
+            ex("add_two_arrays.asm"), 0);
+    mb->add("file/examples/compare numbers", 0, cb_example,
+            ex("2_sample.asm"), 0);
+    mb->add("file/examples/binary, hex and octal values", 0, cb_example,
+            ex("3_sample.asm"), 0);
+    mb->add("file/examples/traffic lights", 0, cb_example,
+            ex("traffic_lights.asm"), 0);
+    mb->add("file/examples/palindrome", 0, cb_example, ex("palindrome.asm"), 0);
+    mb->add("file/examples/LED display test", 0, cb_example,
+            ex("LED_display_test.asm"), 0);
+    mb->add("file/examples/stepper motor", 0, cb_example,
+            ex("stepper_motor.asm"), 0);
+    mb->add("file/examples/simple i/o", 0, cb_example, ex("simple_io.asm"), 0);
+    mb->add("file/examples/more examples...", 0, cb_open, 0, FL_MENU_DIVIDER);
+    mb->add("file/open...",       0, cb_open, 0, 0);
+    mb->add("file/save",          0, cb_save, 0, 0);
+    mb->add("file/save as...",    0, cb_save_as, 0, FL_MENU_DIVIDER);
+    mb->add("file/print...",      0, 0, 0, 0);
+    mb->add("file/export to HTML...", 0, 0, 0, FL_MENU_DIVIDER);
+    add_mru(mb, "file");
+    mb->add("file/exit",          0, cb_quit, 0, 0);
+
+    mb->add("edit/undo",          0, 0, 0, FL_MENU_INACTIVE);
+    mb->add("edit/redo",          0, 0, 0, FL_MENU_INACTIVE | FL_MENU_DIVIDER);
+    mb->add("edit/cut",           0, 0, 0, FL_MENU_INACTIVE);
+    mb->add("edit/copy",          0, 0, 0, FL_MENU_INACTIVE);
+    mb->add("edit/paste",         0, 0, 0, FL_MENU_DIVIDER);
+    mb->add("edit/select all",    0, 0, 0, FL_MENU_DIVIDER);
+    mb->add("edit/find...",       FL_CTRL + 'f', 0, 0, 0);
+    mb->add("edit/find next",     FL_F + 3, 0, 0, 0);
+    mb->add("edit/replace...",    FL_CTRL + 'h', 0, 0, FL_MENU_DIVIDER);
+    mb->add("edit/go to line...", FL_CTRL + 'g', 0, 0, FL_MENU_DIVIDER);
+    mb->add("edit/indent",        FL_Tab, 0, 0, 0);
+    mb->add("edit/outdent",       FL_SHIFT + FL_Tab, 0, 0, FL_MENU_DIVIDER);
+    mb->add("edit/comment block", FL_CTRL + 'q', 0, 0, 0);
+    mb->add("edit/uncomment block", FL_CTRL + 'w', 0, 0, FL_MENU_DIVIDER);
+    mb->add("edit/advanced editor macros/Play Macro 1", 0, 0, 0, FL_MENU_INACTIVE);
+    mb->add("edit/advanced editor macros/Play Macro 2", 0, 0, 0, FL_MENU_INACTIVE);
+    mb->add("edit/advanced editor macros/Play Macro 3", 0, 0, 0, FL_MENU_INACTIVE);
+    mb->add("edit/advanced editor macros/Play Macro 4", 0, 0, 0, FL_MENU_INACTIVE);
+    mb->add("edit/advanced editor macros/Play Macro 5", 0, 0, 0, FL_MENU_INACTIVE);
+    mb->add("edit/advanced editor macros/Repeat Next Command...",
+            FL_CTRL + 'r', 0, 0, FL_MENU_DIVIDER);
+    mb->add("edit/advanced editor macros/Record new Keystroke Macro", 0, 0, 0, 0);
+    mb->add("edit/advanced/show line numbers", 0, cb_gutter_toggle, 0,
+            FL_MENU_TOGGLE | FL_MENU_VALUE | FL_MENU_DIVIDER);
+    mb->add("edit/advanced/tabify selection", 0, 0, 0, 0);
+    mb->add("edit/advanced/untabify selection", 0, 0, 0, FL_MENU_DIVIDER);
+    mb->add("edit/advanced/lowercase selection", FL_CTRL + 'l', 0, 0, 0);
+    mb->add("edit/advanced/uppercase selection", FL_CTRL + 'u', 0, 0,
+            FL_MENU_DIVIDER);
+    mb->add("edit/advanced/display whitespace", 0, 0, 0, 0);
+
+    mb->add("bookmarks/toggle bookmark", FL_CTRL + FL_F + 2, 0, 0, 0);
+    mb->add("bookmarks/previous bookmark", FL_SHIFT + FL_F + 2, 0, 0,
+            FL_MENU_DIVIDER);
+    mb->add("bookmarks/next bookmark", FL_F + 2, 0, 0, FL_MENU_DIVIDER);
+    mb->add("bookmarks/jump to first", 0, 0, 0, 0);
+    mb->add("bookmarks/jump to last", 0, 0, 0, FL_MENU_DIVIDER);
+    mb->add("bookmarks/clear all bookmarks", 0, 0, 0, 0);
+
+    mb->add("assembler/compile", 0, cb_compile, 0, 0);
+    mb->add("assembler/compile and load in the emulator", FL_F + 5,
+            cb_emulate, 0, 0);
+    mb->add("assembler/fasm", 0, 0, 0, FL_MENU_DIVIDER);
+    mb->add("assembler/set output directory...", 0, 0, 0, 0);
+
+    mb->add("emulator/show emulator", 0, cb_show_emulator, 0, 0);
+    mb->add("emulator/assemble and load in the emulator", 0, cb_emulate, 0, 0);
+
+    mb->add("math/multi base calculator", 0, cb_open_calc, 0, 0);
+    mb->add("math/base converter", 0, cb_open_conv, 0, 0);
+
+    mb->add("ascii codes", 0, cb_ascii_codes, 0, 0);
+
+    mb->add("help/documentation and tutorials", FL_F + 1, cb_help_doc, 0, 0);
+    mb->add("help/check for an update...", 0, 0, 0, FL_MENU_DIVIDER);
+    mb->add("help/about...", 0, cb_about, 0, 0);
+    return mb;
+}
+
+static Fl_Menu_Bar *make_emu_menu(int W)
+{
+    Fl_Menu_Bar *mb = new Fl_Menu_Bar(0, 0, W, 24);
+    mb->box(FL_FLAT_BOX);
+    mb->color(mue_face());
+    mb->textfont(FL_HELVETICA);
+    mb->textsize(11);
+    mb->textcolor(FL_BLACK);
+    mb->down_box(FL_FLAT_BOX);
+
+    mb->add("file/load executable...", 0, cb_open, 0, 0);
+    mb->add("file/reload", FL_F + 4, cb_reset, 0, FL_MENU_DIVIDER);
+    mb->add("file/examples/Hello, world", 0, cb_example, ex("hello.asm"), 0);
+    mb->add("file/examples/add / subtract", 0, cb_example, ex("1_sample.asm"), 0);
+    mb->add("file/examples/more examples...", 0, cb_open, 0,
+            FL_MENU_DIVIDER);
+    mb->add("file/reset emulator and ram", 0, cb_reset, 0, FL_MENU_DIVIDER);
+    mb->add("file/set command line parameters", 0, 0, 0, FL_MENU_DIVIDER);
+    mb->add("file/save the emulator's state", 0, 0, 0, 0);
+    mb->add("file/load from previous state", 0, 0, 0,
+            FL_MENU_INACTIVE | FL_MENU_DIVIDER);
+    add_mru(mb, "file");
+    mb->add("file/close the emulator", 0, cb_close_emu, 0, 0);
+
+    mb->add("math/multi base calculator", 0, cb_open_calc, 0, 0);
+    mb->add("math/base converter", 0, cb_open_conv, 0, 0);
+
+    mb->add("debug/single step", FL_F + 8, cb_step, 0, 0);
+    mb->add("debug/step over", FL_SHIFT + FL_F + 8, cb_step, 0,
+            FL_MENU_DIVIDER);
+    mb->add("debug/step back", FL_F + 6, cb_step_back, 0, 0);
+
+    mb->add("view/log and debug.exe emulation", FL_F + 11, cb_debug_win,
+            0, FL_MENU_DIVIDER);
+    mb->add("view/extended value viewer", 0, cb_extended_value, 0,
+            FL_MENU_DIVIDER);
+    mb->add("view/stack", 0, cb_stack_win, 0, FL_MENU_DIVIDER);
+    mb->add("view/variables", 0, cb_vars_win, 0, 0);
+    mb->add("view/memory", 0, cb_ram, 0, FL_MENU_DIVIDER);
+    mb->add("view/symbol table", 0, cb_symbol_table, 0, 0);
+    mb->add("view/listing", 0, cb_listing, 0, FL_MENU_DIVIDER);
+    mb->add("view/original source code", 0, cb_source_win, 0, FL_MENU_DIVIDER);
+    mb->add("view/options", 0, cb_open_opts, 0, FL_MENU_DIVIDER);
+    mb->add("view/arithmetic & logical unit/memory", 0, cb_ram, 0, 0);
+    mb->add("view/arithmetic & logical unit/ALU", 0, cb_alu, 0, 0);
+    mb->add("view/arithmetic & logical unit/FPU", 0, cb_fpu, 0, 0);
+    mb->add("view/arithmetic & logical unit/stop on condition",
+            0, cb_stop_condition, 0, 0);
+    mb->add("view/arithmetic & logical unit/symbol table",
+            0, cb_symbol_table, 0, 0);
+    mb->add("view/arithmetic & logical unit/listing", 0, cb_listing, 0,
+            FL_MENU_DIVIDER);
+    mb->add("view/flags", 0, cb_flags_win, 0, FL_MENU_DIVIDER);
+    mb->add("view/lexical flag analyzer", 0, cb_lexical_flags, 0,
+            FL_MENU_DIVIDER);
+    mb->add("view/ascii codes", 0, cb_ascii_codes, 0, FL_MENU_DIVIDER);
+    mb->add("view/emulator screen", 0, cb_screen_win, 0, 0);
+
+    mb->add("external/start debug.exe (external)", FL_F + 12, 0, 0,
+            FL_MENU_DIVIDER);
+    mb->add("external/command prompt (external)", 0, 0, 0, FL_MENU_DIVIDER);
+    mb->add("external/run (external)", 0, 0, 0, 0);
+
+    mb->add("virtual devices/LED_Display.exe", 0, 0, 0, 0);
+    mb->add("virtual devices/Printer.exe", 0, 0, 0, 0);
+    mb->add("virtual devices/Robot.exe", 0, 0, 0, 0);
+    mb->add("virtual devices/Simple.exe", 0, 0, 0, 0);
+    mb->add("virtual devices/simplest.com", 0, 0, 0, 0);
+    mb->add("virtual devices/Stepper_motor.exe", 0, 0, 0, 0);
+    mb->add("virtual devices/Thermometer.exe", 0, 0, 0, 0);
+    mb->add("virtual devices/Traffic_Lights.exe", 0, 0, 0, 0);
+    mb->add("virtual devices/VGA_STATE.exe", 0, 0, 0, 0);
+
+    mb->add("virtual drive/boot from virtual floppy/boot from floppy image",
+            0, 0, 0, 0);
+    mb->add("virtual drive/write 512 bytes at 0000:7c00 to boot sector",
+            0, 0, 0, FL_MENU_DIVIDER);
+    mb->add("virtual drive/write '.bin' file to floppy...", 0, 0, 0,
+            FL_MENU_DIVIDER);
+    mb->add("virtual drive/create new floppy drive", 0, 0, 0, 0);
+
+    mb->add("help/documentation and tutorials", FL_F + 1, cb_help_doc, 0, 0);
+    mb->add("help/check for an update...", 0, 0, 0, FL_MENU_DIVIDER);
+    mb->add("help/about...", 0, cb_about, 0, 0);
+    return mb;
+}
+
+/* ====================================================================== */
+/* the emulator's side windows (shapes measured in re/UI_SPEC.md)           */
+
+static Fl_Double_Window *source_win;
+static Fl_Double_Window *stack_win, *vars_win, *debug_win, *flags_win;
+
+static void cb_source_win(Fl_Widget *, void *)
+{
+    if (!source_win) {
+        source_win = new Fl_Double_Window(281, 259, "original source code");
+        source_win->color(mue_face());
+        source_view = new SourceView(3, 3, 275, 253);
+        source_view->box(FL_DOWN_FRAME);
+        source_view->color(FL_WHITE);
+        source_view->font_size(13);
+        source_view->gutter(1);
+        source_view->read_only(1);
+        source_win->end();
+        source_win->resizable(source_view);
+    }
+    source_view->set_text(guest_src);
+    if (src_exec_count) source_view->highlight_line(src_line_for(cur.icount));
+    source_win->show();
+}
+
+static void cb_stack_win(Fl_Widget *, void *)
+{
+    if (!stack_win) {
+        stack_win = new Fl_Double_Window(161, 280, "stack");
+        stack_win->color(mue_face());
+        StackList *sl = new StackList(2, 2, 141, 276);
+        sl->set(cur.sr[SS], cur.r[SP]);
+        Fl_Scrollbar *sb = new Fl_Scrollbar(145, 2, 14, 276);
+        sb->type(FL_VERTICAL);
+        stack_win->end();
+        stack_win->resizable(sl);
+    }
+    stack_win->show();
+}
+
+static void cb_vars_win(Fl_Widget *, void *)
+{
+    if (!vars_win) {
+        vars_win = new Fl_Double_Window(239, 213, "variables");
+        vars_win->color(mue_face());
+        Fl_Box *sz = new Fl_Box(6, 6, 30, 20, "size:");
+        sz->box(FL_NO_BOX); sz->labelsize(11); sz->align(FL_ALIGN_RIGHT);
+        MueField *szf = new MueField(40, 6, 70, 20, 0);
+        szf->value("byte");
+        Fl_Box *el = new Fl_Box(118, 6, 56, 20, "elements:");
+        el->box(FL_NO_BOX); el->labelsize(11); el->align(FL_ALIGN_RIGHT);
+        MueField *elf = new MueField(178, 6, 55, 20, 1);
+        elf->value("1");
+        MueButton *edit = new MueButton(6, 30, 48, 22, "edit");
+        Fl_Box *sa = new Fl_Box(60, 30, 60, 22, "show as:");
+        sa->box(FL_NO_BOX); sa->labelsize(11); sa->align(FL_ALIGN_RIGHT);
+        MueField *shf = new MueField(122, 30, 70, 22, 0);
+        shf->value("hex");
+        vars_win->end();
+        vars_win->resizable(vars_win);
+    }
+    vars_win->show();
+}
+
+static void cb_debug_win(Fl_Widget *, void *)
+{
+    if (!debug_win) {
+        debug_win = new Fl_Double_Window(677, 221,
+                                         "debug log - debug.exe emulation");
+        debug_win->color(mue_face());
+        debug_win->end();
+    }
+    debug_win->show();
+    dlg_refresh();
+}
+
+static void cb_flags_win(Fl_Widget *, void *)
+{
+    dlg_flags();
+}
+
+static void cb_screen_win(Fl_Widget *, void *)
+{
+    dlg_screen();
+}
+
+static void cb_show_emulator(Fl_Widget *, void *)
+{
+    if (emu_window) { emu_window->show(); emu_window->take_focus(); }
+}
+
+/* ====================================================================== */
+/* main                                                                    */
+
+static void editor_tick(void *)
+{
+    if (ed_status && editor_text)
+        ed_status->caret(editor_text->caret_line() + 1,
+                         editor_text->caret_col() + 1);
+    Fl::repeat_timeout(0.15, editor_tick);
+}
+
+/* MUE_TRACE=1: log where FLTK thinks a click landed, so DPI scaling can be
+ * compared against the physical pixel the operating system delivered. */
+static int trace_dispatch(int e, Fl_Window *w)
+{
+    if (e == FL_PUSH)
+        fprintf(stderr, "push at %d,%d window=%s\n", Fl::event_x(),
+                Fl::event_y(), w && w->label() ? w->label() : "?");
+    return Fl::handle_(e, w);
 }
 
 int main(int argc, char **argv)
 {
-    /* No Fl::scheme() call here. The scheme was originally set to "none" to
-     * work around cyan fields, but the real cause of that was passing packed
-     * RGB literals to color(); the constants now use FLTK table indices.
-     * Worse, any scheme call installs its own text style table and silently
-     * discards the one highlight_data() was given, which is why the editor
-     * rendered every token in black. */
+    Fl::set_color(FL_SELECTION_COLOR, 0, 0, 255);
+    Fl::set_color(FL_FOREGROUND_COLOR, 0, 0, 0);
 
-    init_startup_state();
+    memset(&cur, 0, sizeof cur);
+    memset(&prev, 0, sizeof prev);
 
-    /* The real application opens the EDITOR only. The emulator window is a
-     * result of pressing `emulate`, not something on screen from the start.
-     * It is built up front but kept hidden, so its state can be reused. */
-    Fl_Double_Window *ed = build_editor();
-    emu_window = build_emulator();      /* built, but not shown */
-    ed->show(argc, argv);
-    /* Test hook: MUE_OPEN_TOOLS=options,convertor,calculator opens the
-     * floating tool windows at startup so a check can verify each one
-     * without driving menus through synthetic clicks. */
+    /* The install tree has to exist before the first paint: the editor's
+     * initial text and the examples menu both read from it. */
+    mue_tree_ensure();
+#ifdef _WIN32
+    _putenv_s("MUE_HOME", mue_home());   /* core code (INT 13h) follows suit */
+#else
+    setenv("MUE_HOME", mue_home(), 1);
+#endif
+
+    editor_window = build_editor();
+    emu_window = build_emulator();
+    Fl_Window::default_icon(icon_app());   /* every window: title bar, taskbar */
+    dlg_status_on_run([]() { cb_emulate(0, 0); });
+    if (getenv("MUE_TRACE"))
+        fprintf(stderr, "dpi: screen_scale=%g editor %dx%d emu %dx%d\n",
+                (double)Fl::screen_scale(0),
+                editor_window->w(), editor_window->h(),
+                emu_window->w(), emu_window->h());
+
+    if (argc > 1) {
+        load_file(argv[1]);
+    } else if (!getenv("MUE_BLANK")) {
+        char start[MUE_MAXP];
+        load_file(mue_home_path(start, sizeof start, "examples\\hello.asm"));
+    }
+
+    editor_window->show(argc, argv);
+    if (getenv("MUE_TRACE")) {
+        int sn = editor_window->screen_num();
+        HWND hw = (HWND)editor_window->os_id();
+        RECT r = {0, 0, 0, 0};
+        if (hw) GetClientRect(hw, &r);
+        fprintf(stderr,
+                "screens=%d screen_num=%d scale(sn)=%g scale(0)=%g win32 client=%ldx%ld\n",
+                Fl::screen_count(), sn,
+                (double)Fl::screen_scale(sn),
+                (double)Fl::screen_scale(0),
+                (long)r.right, (long)r.bottom);
+        Fl::event_dispatch(trace_dispatch);
+    }
+    if (getenv("MUE_GEOM")) {
+        FILE *gf = fopen(getenv("MUE_GEOM"), "w");
+        if (gf) {
+            fprintf(gf, "editor win %d,%d %dx%d\n", editor_window->x(),
+                    editor_window->y(), editor_window->w(), editor_window->h());
+            fprintf(gf, "text %d,%d %dx%d\n", editor_text->x(), editor_text->y(),
+                    editor_text->w(), editor_text->h());
+            fprintf(gf, "hscroll %d,%d %dx%d\n", ed_hscroll->x(),
+                    ed_hscroll->y(), ed_hscroll->w(), ed_hscroll->h());
+            fprintf(gf, "status %d,%d %dx%d\n", ed_status->x(), ed_status->y(),
+                    ed_status->w(), ed_status->h());
+            fprintf(gf, "emu %d,%d %dx%d\n", emu_window->x(), emu_window->y(),
+                    emu_window->w(), emu_window->h());
+            fclose(gf);
+        }
+    }
+    Fl::add_timeout(0.15, editor_tick);
+
     {
         const char *tk = getenv("MUE_OPEN_TOOLS");
         if (tk) {
+            if (strstr(tk, "emulate"))    cb_emulate(0, 0);
             if (strstr(tk, "options"))    tools_open_options();
             if (strstr(tk, "convertor"))  tools_open_convertor();
             if (strstr(tk, "calculator")) tools_open_calculator();
-            if (strstr(tk, "emulate"))    cb_emulate(0, 0);
-            /* The emulator's six side windows, so each can be checked. */
-            if (strstr(tk, "stack"))      cb_show_stack(0, 0);
-            if (strstr(tk, "source"))     cb_show_source(0, 0);
-            if (strstr(tk, "vars"))       cb_show_vars(0, 0);
-            if (strstr(tk, "debug"))      cb_show_debug(0, 0);
-            if (strstr(tk, "flags"))      cb_show_flags(0, 0);
+            if (strstr(tk, "stack"))      cb_stack_win(0, 0);
+            if (strstr(tk, "source"))     cb_source_win(0, 0);
+            if (strstr(tk, "vars"))       cb_vars_win(0, 0);
+            if (strstr(tk, "debug"))      cb_debug_win(0, 0);
+            if (strstr(tk, "flags"))      cb_flags_win(0, 0);
+            if (strstr(tk, "screen"))     cb_screen_win(0, 0);
+            if (strstr(tk, "ascii"))      cb_ascii_codes(0, 0);
+            if (strstr(tk, "about"))      cb_about(0, 0);
+            if (strstr(tk, "alu"))        cb_alu(0, 0);
+            if (strstr(tk, "ram"))        cb_ram(0, 0);
+            if (strstr(tk, "status"))     dlg_assembler_status("Assembled successfully.");
         }
     }
-    ed->redraw();
     Fl::flush();
-    refresh_state();
     return Fl::run();
 }

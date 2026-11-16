@@ -92,6 +92,28 @@ int      add_label(asm_t *a, const char *name, uint16_t value, int size, int is_
 int  split_operands(char *s, char **out, int max);
 int  eval_expr(asm_t *a, const char *s, int *ok);
 
+/* ---- listing / symbol-table sidecars -----------------------------------
+ *
+ * emu8086 writes five files per build, and two of them are reports rather than
+ * images: `<name>.<ext>_.list` (machine code beside the source) and
+ * `<name>.<ext>_.symbol`.  Both come straight out of the assembler's own
+ * tables, so the last successful assembly hands them over instead of the UI
+ * trying to reconstruct them from the binary. */
+#define ASM_MAX_LIST_LINES 16384
+
+typedef struct {
+    int line;   /* merged-source line number, 1-based */
+    int addr;   /* address the line starts at (org + offset) */
+    int off;    /* offset in the emitted image */
+    int len;    /* bytes the line emitted (0 for comments/directives) */
+} asm_lineinfo;
+
+const asm_lineinfo *asm_last_lines(int *count);
+const char         *asm_last_source(int line);   /* 1-based; NULL past end */
+int                 asm_last_nsource(void);
+int                 asm_last_org(void);
+const label_t      *asm_last_labels(int *count);
+
 /* main entries */
 int  asm_assemble_file(const char *path, int want_com, uint8_t **out, int *outlen,
                        char *errbuf, int errbufsz);
