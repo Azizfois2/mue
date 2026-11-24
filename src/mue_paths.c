@@ -202,8 +202,19 @@ static void resolve_home(void)
         if (is_dir(home)) return;
     }
 
-    /* A shipped layout: mue.exe sitting in <root>\ with inc\ next to it. */
+    /* A self-contained package: muei.exe and the whole emu8086-shaped tree
+     * side by side in one build folder.  Checked first so a built copy never
+     * falls through to the developer's C:\mue install. */
     exe_dir(cand, sizeof cand);
+    snprintf(probe, sizeof probe, "%s\\inc", cand);
+    if (is_dir(probe)) {
+        snprintf(home, sizeof home, "%s", cand);
+        normalize(home, sizeof home);
+        return;
+    }
+
+    /* The development layout: the UI binary in src\ and the tree one level
+     * up, mirroring emu8086's own <root>\ + <root>\bin\ arrangement. */
     snprintf(probe, sizeof probe, "%s\\..\\inc", cand);
     if (is_dir(probe)) {
         snprintf(home, sizeof home, "%s\\..", cand);
@@ -548,6 +559,24 @@ void mue_tree_ensure(void)
     }
     snprintf(p, sizeof p, "%s\\tmp", mue_dir_vdrive());
     mue_mkdirs(p);
+
+    /* DEVICES\ is a shipped folder, not a generated one: copy the reference
+     * device set (and its docs) the first time, even on an install whose
+     * mue.ini already exists.  The menu enumerates this folder, so the clone
+     * lists exactly the files the original lists. */
+    {
+        char devdir[MUE_MAXP], probe[MUE_MAXP];
+        mue_home_path(devdir, sizeof devdir, "DEVICES");
+        mue_home_path(probe, sizeof probe, "DEVICES\\_READ_ME.txt");
+        if (!is_file(probe)) {
+            const char *rr = ref_root();
+            if (rr) {
+                char from[MUE_MAXP];
+                snprintf(from, sizeof from, "%s\\DEVICES", rr);
+                copy_tree(from, devdir, 0);
+            }
+        }
+    }
 
     /* Import the stock tree once.  mue.ini is the marker: it is written by the
      * seeding below, so a second run skips straight past the copies. */

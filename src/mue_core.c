@@ -344,6 +344,46 @@ int core_load(const char *src, const char *src_path, char *err, int errsz)
     return 1;
 }
 
+int core_load_binary(const char *path, char *err, int errsz)
+{
+    FILE *f;
+    uint8_t buf[0xFF00];
+    size_t n;
+    const char *name;
+    if (err && errsz) err[0] = 0;
+    if (!path || !path[0]) return 0;
+    f = fopen(path, "rb");
+    if (!f) {
+        if (err && errsz) snprintf(err, errsz, "cannot open %s", path);
+        return 0;
+    }
+    n = fread(buf, 1, sizeof buf, f);
+    fclose(f);
+
+    memset(MEM, 0, sizeof(MEM));
+    if (n > 0) memcpy(MEM + 0x01100, buf, n);
+    cpu_reset();
+    cpu.sr[CS] = cpu.sr[DS] = cpu.sr[ES] = cpu.sr[SS] = 0x0100;
+    cpu.r[SP]  = 0xFFFE;
+    poke16(P(cpu.sr[SS], 0xFFFE), 0x0000);
+    cpu.ip     = 0x0100;
+    cpu.phys   = P(cpu.sr[CS], cpu.ip);
+    dos_boot_psp();
+
+    name = strrchr(path, '\\');
+    if (!name) name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+    snprintf(last_image_name, sizeof last_image_name, "%s", name);
+    last_src[0] = 0;
+    last_image_len = (int)n;
+    last_image_size = (int)n;
+    if (n > 0) memcpy(last_image, buf, n);
+    loaded = 1;
+    cpu.halted = 0;
+    core_hist_clear();
+    return 1;
+}
+
 int core_save_image(const char *path)
 {
     if (!path || !path[0] || last_image_len <= 0) return 0;

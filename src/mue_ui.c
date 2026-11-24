@@ -44,6 +44,7 @@
 #include "mue_paths.h"
 #include "mue_tools.h"
 #include "mue_dialogs.h"
+#include "mue_devices.h"
 #include "cpu.h"
 
 /* ====================================================================== */
@@ -423,6 +424,10 @@ static void cb_emulate(Fl_Widget *, void *)
         dlg_assembler_status(err);
         return;
     }
+    /* Each load is a fresh machine: reset every virtual device, then start
+     * the ones the source names in a comment or string (#start=...). */
+    devices_reset();
+    devices_scan_source(guest_src);
     loaded = 1;
     follow = 1;
     core_regs(cur.r, cur.sr, &cur.ip, &cur.flags, &cur.icount);
@@ -726,6 +731,110 @@ static void cb_help_doc(Fl_Widget *, void *)
 #endif
 }
 
+/* ---- folder actions ---------------------------------------------------
+ * emu8086's "more examples..." is an Explorer window, not a file dialog, and
+ * the virtual-drive commands operate on vdrive\<letter>\ rather than a single
+ * flat folder.  Keeping those actions here means the menu and the dialogs
+ * agree with the tree in re/FILESYSTEM.md. */
+static void open_folder(const char *dir)
+{
+#ifdef _WIN32
+    ShellExecuteA(NULL, "open", dir, NULL, NULL, SW_SHOWNORMAL);
+#else
+    (void)dir;
+#endif
+}
+
+static void cb_more_examples(Fl_Widget *, void *)
+{
+    open_folder(mue_dir_examples());
+}
+
+/* The emulator's own Open is for built images, not for assembly sources:
+ * emu8086 starts in MyBuild\ and filters for executable files. */
+static void cb_load_exe(Fl_Widget *, void *)
+{
+    static char start[MUE_MAXP];
+    snprintf(start, sizeof start, "%s", mue_dir_build());
+    const char *p = fl_file_chooser("load executable",
+                                    "*.com\t*.bin\tbinary executable files",
+                                    start);
+    if (!p) return;
+    char err[1024];
+    if (!core_load_binary(p, err, sizeof err)) {
+        fl_alert("%s", err);
+        return;
+    }
+    devices_reset();
+    loaded = 1;
+    follow = 1;
+    core_regs(cur.r, cur.sr, &cur.ip, &cur.flags, &cur.icount);
+    prev = cur;
+    {
+        char title[300];
+        snprintf(title, sizeof title, "emulator: %s", build_image_name());
+        emu_window->copy_label(title);
+    }
+    emu_window->show();
+    refresh_regs();
+    refresh_panes();
+    dlg_refresh();
+}
+
+static int dir_exists(const char *p)
+{
+#ifdef _WIN32
+    DWORD a = GetFileAttributesA(p);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+#else
+    (void)p;
+    return 0;
+#endif
+}
+
+static void cb_vd_new(Fl_Widget *, void *)
+{
+    char p[MUE_MAXP];
+    int c;
+    for (c = 'A'; c <= 'Z'; c++) {
+        snprintf(p, sizeof p, "%s\\%c", mue_dir_vdrive(), c);
+        if (!dir_exists(p)) {
+            mue_mkdirs(p);
+            open_folder(p);
+            return;
+        }
+    }
+}
+
+static void cb_vd_write_bin(Fl_Widget *, void *)
+{
+    static char start[MUE_MAXP];
+    const char *p = fl_file_chooser("write '.bin' file to floppy",
+                                    "*.bin\tbinary files",
+                                    mue_home_path(start, sizeof start, "MyBuild\\"));
+    char dst[MUE_MAXP], dir[MUE_MAXP];
+    const char *name;
+    if (!p) return;
+    name = strrchr(p, '\\');
+    name = name ? name + 1 : p;
+    snprintf(dir, sizeof dir, "%s\\A", mue_dir_vdrive());
+    mue_mkdirs(dir);
+    snprintf(dst, sizeof dst, "%s\\%s", dir, name);
+#ifdef _WIN32
+    CopyFileA(p, dst, FALSE);
+#else
+    (void)dst;
+#endif
+    open_folder(dir);
+}
+
+/* The device menu is generated from DEVICES\ the way emu8086 generates it:
+ * every .exe in the folder, in directory order. */
+static void cb_device(Fl_Widget *, void *data)
+{
+    if (data) devices_open_name((const char *)data);
+}
+
 static Fl_Double_Window *build_editor(void)
 {
     const int W = 722, H = 747;
@@ -1025,7 +1134,8 @@ static Fl_Menu_Bar *make_editor_menu(int W)
     mb->add("file/examples/stepper motor", 0, cb_example,
             ex("stepper_motor.asm"), 0);
     mb->add("file/examples/simple i/o", 0, cb_example, ex("simple_io.asm"), 0);
-    mb->add("file/examples/more examples...", 0, cb_open, 0, FL_MENU_DIVIDER);
+    mb->add("file/examples/more examples...", 0, cb_more_examples, 0,
+            FL_MENU_DIVIDER);
     mb->add("file/open...",       0, cb_open, 0, 0);
     mb->add("file/save",          0, cb_save, 0, 0);
     mb->add("file/save as...",    0, cb_save_as, 0, FL_MENU_DIVIDER);
@@ -1103,11 +1213,11 @@ static Fl_Menu_Bar *make_emu_menu(int W)
     mb->textcolor(FL_BLACK);
     mb->down_box(FL_FLAT_BOX);
 
-    mb->add("file/load executable...", 0, cb_open, 0, 0);
+    mb->add("file/load executable...", 0, cb_load_exe, 0, 0);
     mb->add("file/reload", FL_F + 4, cb_reset, 0, FL_MENU_DIVIDER);
     mb->add("file/examples/Hello, world", 0, cb_example, ex("hello.asm"), 0);
     mb->add("file/examples/add / subtract", 0, cb_example, ex("1_sample.asm"), 0);
-    mb->add("file/examples/more examples...", 0, cb_open, 0,
+    mb->add("file/examples/more examples...", 0, cb_more_examples, 0,
             FL_MENU_DIVIDER);
     mb->add("file/reset emulator and ram", 0, cb_reset, 0, FL_MENU_DIVIDER);
     mb->add("file/set command line parameters", 0, 0, 0, FL_MENU_DIVIDER);
@@ -1156,23 +1266,23 @@ static Fl_Menu_Bar *make_emu_menu(int W)
     mb->add("external/command prompt (external)", 0, 0, 0, FL_MENU_DIVIDER);
     mb->add("external/run (external)", 0, 0, 0, 0);
 
-    mb->add("virtual devices/LED_Display.exe", 0, 0, 0, 0);
-    mb->add("virtual devices/Printer.exe", 0, 0, 0, 0);
-    mb->add("virtual devices/Robot.exe", 0, 0, 0, 0);
-    mb->add("virtual devices/Simple.exe", 0, 0, 0, 0);
-    mb->add("virtual devices/simplest.com", 0, 0, 0, 0);
-    mb->add("virtual devices/Stepper_motor.exe", 0, 0, 0, 0);
-    mb->add("virtual devices/Thermometer.exe", 0, 0, 0, 0);
-    mb->add("virtual devices/Traffic_Lights.exe", 0, 0, 0, 0);
-    mb->add("virtual devices/VGA_STATE.exe", 0, 0, 0, 0);
+    {
+        int i, n = devices_menu_count();
+        for (i = 0; i < n; i++) {
+            const char *name = devices_menu_name(i);
+            char item[300];
+            snprintf(item, sizeof item, "virtual devices/%s", name);
+            mb->add(item, 0, cb_device, (void *)name, 0);
+        }
+    }
 
     mb->add("virtual drive/boot from virtual floppy/boot from floppy image",
             0, 0, 0, 0);
     mb->add("virtual drive/write 512 bytes at 0000:7c00 to boot sector",
             0, 0, 0, FL_MENU_DIVIDER);
-    mb->add("virtual drive/write '.bin' file to floppy...", 0, 0, 0,
-            FL_MENU_DIVIDER);
-    mb->add("virtual drive/create new floppy drive", 0, 0, 0, 0);
+    mb->add("virtual drive/write '.bin' file to floppy...", 0, cb_vd_write_bin,
+            0, FL_MENU_DIVIDER);
+    mb->add("virtual drive/create new floppy drive", 0, cb_vd_new, 0, 0);
 
     mb->add("help/documentation and tutorials", FL_F + 1, cb_help_doc, 0, 0);
     mb->add("help/check for an update...", 0, 0, 0, FL_MENU_DIVIDER);
@@ -1309,10 +1419,13 @@ int main(int argc, char **argv)
     setenv("MUE_HOME", mue_home(), 1);
 #endif
 
+    devices_boot();                        /* IN/OUT hook + device timer */
     editor_window = build_editor();
     emu_window = build_emulator();
     Fl_Window::default_icon(icon_app());   /* every window: title bar, taskbar */
     dlg_status_on_run([]() { cb_emulate(0, 0); });
+    if (getenv("MUE_TRACE"))
+        fprintf(stderr, "home: %s\n", mue_home());
     if (getenv("MUE_TRACE"))
         fprintf(stderr, "dpi: screen_scale=%g editor %dx%d emu %dx%d\n",
                 (double)Fl::screen_scale(0),
@@ -1376,6 +1489,14 @@ int main(int argc, char **argv)
             if (strstr(tk, "alu"))        cb_alu(0, 0);
             if (strstr(tk, "ram"))        cb_ram(0, 0);
             if (strstr(tk, "status"))     dlg_assembler_status("Assembled successfully.");
+            if (strstr(tk, "led"))        devices_open(DEV_LED);
+            if (strstr(tk, "traffic"))    devices_open(DEV_TRAFFIC);
+            if (strstr(tk, "stepper"))    devices_open(DEV_STEPPER);
+            if (strstr(tk, "thermo"))     devices_open(DEV_THERMO);
+            if (strstr(tk, "robot"))      devices_open(DEV_ROBOT);
+            if (strstr(tk, "printer"))    devices_open(DEV_PRINTER);
+            if (strstr(tk, "simple"))     devices_open(DEV_SIMPLE);
+            if (strstr(tk, "vga"))        devices_open(DEV_VGA);
         }
     }
     Fl::flush();

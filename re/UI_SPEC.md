@@ -907,3 +907,26 @@ consequences are: builds go to `\MyBuild`, new sources default to
 `\MySource`, the virtual drive is `\vdrive\<letter>\`, and templates and
 includes live in `\inc`.
 
+## 13. Virtual devices
+
+The `virtual devices` menu is generated at start-up by enumerating
+`DEVICES\*.exe` (emu8086's documented behaviour), not from a hard-coded
+list. Built-in models answer for `LED_Display.exe`, `Traffic_Lights.exe`,
+`Stepper_motor.exe`, `Thermometer.exe`, `Robot.exe`, `Printer.exe`,
+`Simple.exe` and `VGA_STATE.exe`; any other file found in the folder is
+launched with `ShellExecute`, exactly as the original does.
+
+Each device is an in-process FLTK window driven by the shared port hook in
+`src/io.c` (see `re/DEVICES.md` for protocols, measured panels and the
+reason for the black background). Selecting a device from the menu opens it;
+assembling a source that mentions a device file name also opens it, after
+all device state has been reset. The thermometer and robot advance on a
+200 ms timer; the printer, LED display and traffic lights redraw on `OUT`.
+
+The `file/examples/more examples...` action opens `examples\` in Explorer,
+and `virtual drive/write '.bin' file to floppy...` copies a chosen image into
+`vdrive\A\` before opening that folder. `virtual drive/create new floppy
+drive` creates the next unused lettered folder. The emulator's
+`file/load executable...` starts in `MyBuild\` with a `.com`/`.bin` filter
+and loads the image at 0100h.
+

@@ -24,6 +24,10 @@ extern "C" {
  * Returns 1 on success; on failure `err` holds the assembler diagnostic. */
 int core_load(const char *src, const char *src_path, char *err, int errsz);
 
+/* Load an already-built .com/.bin from `path` straight into memory at 0100h.
+ * This backs the emulator's "file/load executable..." menu item. */
+int core_load_binary(const char *path, char *err, int errsz);
+
 /* Assemble and load exactly like core_load, but write nothing: Compile shows
  * the assembler status window before emu8086's Save-As box asks where the
  * image goes, and Emulate never writes files. */

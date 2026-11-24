@@ -132,6 +132,24 @@ own colour; that is why the highlighting works.
 
     make                # -> src/mue.exe
     make ui             # -> src/mueui.exe   (needs FLTK 1.4 + windres)
+    make package        # -> build/muei.exe + a complete emu8086-shaped tree
+
+`make package` copies the stock install tree next to the UI binary, so the
+result is a portable folder that mirrors emu8086:
+
+```
+build/
+  muei.exe             the graphical front end (renamed from src/mueui.exe)
+  mue.exe              the CLI
+  DEVICES/ examples/ inc/ Options/ documentation/ fasm/ vdrive/
+  MyBuild/ MySource/   empty, as in a fresh emu8086 install
+  ReadMe.txt LICENSE.txt mue.ini
+```
+
+`mue_paths.c` treats the executable's own directory as the install root when
+it contains `inc\`, so the packaged copy never touches the developer's
+`C:\mue` tree. `MUE_PACKAGE_SRC` overrides the folder to copy; by default the
+packager uses `C:\mue`, then `C:\emu8086`, then `install\`.
 
 The UI binary carries the program icon from `src/mue.ico` through `mue.rc`;
 regenerate the icon from the About button's artwork with

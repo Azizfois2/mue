@@ -45,7 +45,7 @@ SKIPOK = $(PYTHON) -c "import subprocess,sys; r=subprocess.run([sys.argv[1]]+sys
 UIBIN   := src/mueui$(EXE)
 UISRC   := src/mue_ui.c src/mue_icons.c src/mue_highlight.c \
            src/mue_source.cpp src/mue_tools.c \
-           src/mue_widgets.cpp src/mue_dialogs.cpp
+           src/mue_widgets.cpp src/mue_dialogs.cpp src/mue_devices.cpp
 CORE_C  := src/exec.c src/mem.c src/alu.c src/io.c src/dos.c \
            src/asm_main.c src/asm_sup.c src/asm_ops.c src/exe.c src/screen.c \
            src/mue_core.c src/mue_paths.c
@@ -132,6 +132,14 @@ examples: $(BIN)
 
 # Static FLTK link, so the binary runs without the toolchain's DLLs present.
 ui: $(UIBIN)
+
+# A runnable, self-contained build folder: build\muei.exe plus the whole
+# emu8086-shaped filesystem beside it (DEVICES, examples, inc, ...).
+# MUE_PACKAGE_SRC overrides where the stock tree is copied from.
+package: ui
+	@$(PYTHON) tools/package.py build
+
+.PHONY: package
 
 # The Windows icon resource (Explorer, taskbar, title bar), built from the
 # same pixel art the About button draws.  windres produces a COFF object that

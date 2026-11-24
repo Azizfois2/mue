@@ -293,3 +293,24 @@ and matches to the character; the only intentional differences are the
 program name in the header (`mue assembler`) and `.debug`, which is mue's own
 line-oriented text format instead of emu8086's private binary one.
 
+### Packaged build (`make package`, implemented)
+
+`tools/package.py` produces a portable folder that mirrors emu8086's install
+layout rather than writing into `C:\mue`:
+
+```
+build/
+  muei.exe  mue.exe          UI + CLI
+  DEVICES/ documentation/ examples/ fasm/ inc/ Options/ vdrive/
+  MyBuild/ MySource/         emptied on every package run
+  ReadMe.txt LICENSE.txt mue.ini
+```
+
+`mue_paths.c` resolves the install root in this order: `$MUE_HOME`, then the
+executable's own directory when it contains `inc\`, then the parent directory
+when it contains `inc\`, then `C:\mue`, then `C:\emu8086`.  A packaged
+`build\muei.exe` therefore reads its own `examples\` and `DEVICES\` and writes
+its builds into its own `MyBuild\`.  Verified live: the editor opened
+`build\examples\hello.asm` and the trace logged
+`home: C:\Users\acer\Documents\mue\build`.
+
