@@ -45,9 +45,11 @@ are opened on every assemble/load, after all device state is reset.
 
 ## 3. Measured windows
 
-Each row lists the measured **client** rectangle and the painted panel inside
-it. The VB forms use a black background, so the unpainted right/bottom strip
-is part of the original window - the rebuild keeps it.
+Each row lists the measured **client** rectangle. A fresh live capture of the
+printer form confirms the whole client is painted (no black margin around the
+paper), so the rebuild fills every device client instead of leaving unused
+black space. The LED display is the one intentional exception: its screen is
+black because that is the simulated hardware.
 
 | window title | client | painted panel | notes |
 |---|---|---|---|

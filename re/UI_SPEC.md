@@ -917,8 +917,10 @@ list. Built-in models answer for `LED_Display.exe`, `Traffic_Lights.exe`,
 launched with `ShellExecute`, exactly as the original does.
 
 Each device is an in-process FLTK window driven by the shared port hook in
-`src/io.c` (see `re/DEVICES.md` for protocols, measured panels and the
-reason for the black background). Selecting a device from the menu opens it;
+`src/io.c` (see `re/DEVICES.md` for protocols and measured panels). The client
+is painted all the way to its edges - a live emu8086 capture shows no unused
+black margin; only the LED screen is black by design. Selecting a device from
+the menu opens it;
 assembling a source that mentions a device file name also opens it, after
 all device state has been reset. The thermometer and robot advance on a
 200 ms timer; the printer, LED display and traffic lights redraw on `OUT`.

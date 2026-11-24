@@ -296,9 +296,9 @@ static void draw_traffic()
     unsigned v = traffic_value & 0x0FFF;
     int i;
 
-    fl_color(c_black());
+    fl_color(rgb(248, 248, 248));
     fl_rectf(0, 0, 281, 320);
-    fl_color(c_white());
+    fl_color(rgb(160, 160, 160));
     fl_rect(8, 2, 209, 172);
     fl_color(rgb(248, 248, 248));
     fl_rectf(9, 3, 207, 169);
@@ -372,7 +372,7 @@ static void draw_traffic()
                  (d[0] == '1' ? c_red() : c_blue()));
         fl_draw(d, 48 + i * 8, 221);
     }
-    text_ctr(111, 245, "port 4 (word - 16 bits)", c_white(), 11, 1);
+    text_ctr(111, 245, "port 4 (word - 16 bits)", c_black(), 11, 1);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -386,10 +386,8 @@ static void draw_stepper()
     double ang;
     char s[8];
 
-    fl_color(c_black());
-    fl_rectf(0, 0, 288, 237);
     fl_color(c_white());
-    fl_rectf(0, 0, 231, 184);
+    fl_rectf(0, 0, 288, 237);
 
     /* The pale mounting plate and the ring of eight coils. */
     fl_color(c_face());
@@ -454,10 +452,8 @@ static void draw_thermo()
     int y, i, top;
     int levels[9] = { 120, 100, 80, 60, 40, 20, 0, -20, -40 };
 
-    fl_color(c_black());
-    fl_rectf(0, 0, 411, 666);
     fl_color(c_white());
-    fl_rectf(0, 0, 328, 526);
+    fl_rectf(0, 0, 411, 666);
 
     text_ctr(136, 11, "Thermometer & Heater", c_black(), 11, 1);
     text_ctr(136, 22, "Ports 125 - 127", c_navy(), 10, 1);
@@ -636,10 +632,8 @@ static void draw_robot()
 {
     int r, c;
 
-    fl_color(c_black());
-    fl_rectf(0, 0, 372, 333);
     fl_color(c_white());
-    fl_rectf(0, 0, 297, 261);
+    fl_rectf(0, 0, 372, 333);
     fl_color(rgb(160, 160, 160));
     fl_rect(0, 0, 297, 186);
 
@@ -760,16 +754,18 @@ static void printer_put(unsigned char ch)
 static void draw_printer()
 {
     int i;
-    fl_color(c_black());
+    /* The live emu8086 printer form has a white client all the way to the
+     * bottom edge - there is no black margin around the paper. */
+    fl_color(c_white());
     fl_rectf(0, 0, 333, 425);
     fl_color(c_face());
-    fl_rectf(0, 0, 265, 31);
+    fl_rectf(0, 0, 333, 31);
     /* One grey divider line, then the page immediately: the original has no
      * black gap between the button strip and the paper. */
     fl_color(rgb(128, 128, 128));
-    fl_rectf(0, 31, 264, 1);
+    fl_rectf(0, 31, 333, 1);
     fl_color(c_white());
-    fl_rectf(0, 32, 264, 299);
+    fl_rectf(0, 32, 333, 393);
 
     raised(2, 6, 81, 25);
     text_ctr(42, 24, "new page", c_black(), 11, 0);
@@ -792,10 +788,8 @@ static void draw_printer()
 static void draw_simple()
 {
     char s[32];
-    fl_color(c_black());
-    fl_rectf(0, 0, 337, 206);
     fl_color(c_face());
-    fl_rectf(0, 0, 269, 158);
+    fl_rectf(0, 0, 337, 206);
 
     fl_font(FL_HELVETICA_ITALIC, 10);
     fl_color(c_black());
@@ -827,10 +821,8 @@ static void draw_vga()
 {
     /* The original's status form is only 133x16, so its caption is clipped:
      * a five-pixel grey strip with the tops of "EMULATION" and black below. */
-    fl_color(c_black());
-    fl_rectf(0, 0, 133, 16);
     fl_color(c_face());
-    fl_rectf(0, 0, 133, 5);
+    fl_rectf(0, 0, 133, 16);
     text_c(4, 2, "EMULATION", c_black(), 10, 0);
 }
 
